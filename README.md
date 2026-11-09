@@ -90,9 +90,24 @@ Python 3.12 · FastAPI · React 18 + TS · SQLite / MySQL · 可打包单机运�
 
 ## 界面预览
 
-| 计划与思考 | 提问面板 | 展开的推理 |
-|---|---|---|
-| ![计划与思考](docs/screenshots/plan-and-thinking.png) | ![提问面板](docs/screenshots/ask-user-panel.png) | ![推理](docs/screenshots/thinking-expanded.png) |
+**对话 · 出图**（助手自己生成图片、多图拼看、看本地图自检）
+
+![对话出图](docs/screenshots/chat-imagegen.png)
+
+**对话 · 出音**（批量生成配音 / 音效，行内时间线记录每一步工具调用）
+
+![对话出音](docs/screenshots/chat-audio.png)
+
+**素材库**（按项目归档全部素材，可查看 / 重画 / 删除）
+
+![素材库](docs/screenshots/asset-library.png)
+
+<table>
+<tr>
+<td width="50%"><b>设置 · 个人资料</b><br/><img src="docs/screenshots/settings-profile.png" alt="个人资料"/></td>
+<td width="50%"><b>设置 · 外观</b>（主题 / 主色 / 背景壁纸）<br/><img src="docs/screenshots/settings-appearance.png" alt="外观"/></td>
+</tr>
+</table>
 
 ## 快速开始
 
