@@ -234,4 +234,6 @@ docs/                  # 设计文档与截图
 
 ## License
 
-本项目暂未附带开源许可证。在添加明确许可证之前，默认保留所有权利。
+本项目基于 [Apache License 2.0](LICENSE) 开源发布。
+
+Copyright 2026 lisboy
