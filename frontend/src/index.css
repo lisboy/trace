@@ -1,0 +1,319 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #f1f5f9;
+  color: #0f172a;
+}
+
+/* 细滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* ---------- Markdown 渲染（模型输出 / 运行总结） ---------- */
+.md-body {
+  line-height: 1.65;
+  word-break: break-word;
+}
+.md-body > :first-child { margin-top: 0; }
+.md-body > :last-child { margin-bottom: 0; }
+.md-body p { margin: 0.35em 0; }
+.md-body h1, .md-body h2, .md-body h3, .md-body h4 {
+  font-weight: 600;
+  margin: 0.7em 0 0.35em;
+  line-height: 1.35;
+}
+.md-body h1 { font-size: 1.25em; }
+.md-body h2 { font-size: 1.15em; }
+.md-body h3 { font-size: 1.05em; }
+.md-body ul, .md-body ol { margin: 0.35em 0; padding-left: 1.4em; }
+.md-body ul { list-style: disc; }
+.md-body ol { list-style: decimal; }
+.md-body li { margin: 0.15em 0; }
+.md-body a { color: #2563eb; text-decoration: underline; text-underline-offset: 2px; }
+.md-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.88em;
+  background: rgba(100, 116, 139, 0.12);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+.md-body pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 0.75em 1em;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+.md-body pre code { background: transparent; padding: 0; color: inherit; font-size: 0.85em; }
+.md-body blockquote {
+  border-left: 3px solid #cbd5e1;
+  padding-left: 0.8em;
+  margin: 0.5em 0;
+  color: #475569;
+}
+.md-body table { border-collapse: collapse; margin: 0.5em 0; width: 100%; font-size: 0.92em; }
+.md-body th, .md-body td {
+  border: 1px solid #e2e8f0;
+  padding: 0.3em 0.6em;
+  text-align: left;
+}
+.md-body th { background: #f8fafc; font-weight: 600; }
+.md-body hr { border: 0; border-top: 1px solid #e2e8f0; margin: 0.8em 0; }
+.md-body img { max-width: 100%; border-radius: 6px; }
+
+/* ---------- 用户气泡（品牌底色）内的 Markdown 配色适配 ---------- */
+.md-invert a { color: #fff; }
+.md-invert code { background: rgba(255, 255, 255, 0.18); }
+.md-invert th { background: rgba(255, 255, 255, 0.15); }
+.md-invert blockquote { color: rgba(255, 255, 255, 0.85); border-left-color: rgba(255, 255, 255, 0.5); }
+
+/* ---------- 主题系统（外观设置实时驱动这些变量，见 src/theme.ts） ---------- */
+:root {
+  --brand-50-rgb: 238 246 255;
+  --brand-100-rgb: 217 234 255;
+  --brand-500-rgb: 47 125 223;
+  --brand-400-rgb: 126 174 235;
+  --brand-600-rgb: 31 95 208;
+  --brand-700-rgb: 26 79 168;
+  --ga-panel-rgb: 255 255 255;
+  --ga-panel-alpha: 1;
+  --ga-text: initial;
+  --ga-font-size: 16px;
+}
+/* 字号：根字号驱动所有 rem 尺寸，整体等比缩放 */
+html { font-size: var(--ga-font-size, 16px); }
+
+/* 正文颜色的覆盖规则放在文件末尾（要压过深色模式的字色覆盖），见 ga-text-on 段 */
+
+/* ---------- 深色模式：直接覆盖通用工具类（不动组件源码） ---------- */
+html.dark body { background: #0b1220; color: #e2e8f0; }
+html.dark ::-webkit-scrollbar-thumb { background: #334155; }
+html.dark .bg-white { background-color: #131c2e; }
+html.dark .bg-white\/95 { background-color: rgba(19, 28, 46, 0.95); }
+html.dark .bg-slate-50 { background-color: #0f1729; }
+html.dark .bg-slate-100 { background-color: #182238; }
+html.dark .bg-slate-200 { background-color: #1e2a44; }
+html.dark .text-slate-800 { color: #e2e8f0; }
+html.dark .text-slate-700 { color: #d3dce8; }
+html.dark .text-slate-600 { color: #b9c5d6; }
+html.dark .text-slate-500 { color: #93a3ba; }
+html.dark .text-slate-400 { color: #6b7c95; }
+html.dark .text-slate-300 { color: #55657e; }
+html.dark .border-slate-100,
+html.dark .border-slate-200 { border-color: rgba(148, 163, 184, 0.22); }
+html.dark .border-slate-300 { border-color: rgba(148, 163, 184, 0.32); }
+html.dark .hover\:bg-slate-50:hover { background-color: #1a2540; }
+html.dark .hover\:bg-slate-100:hover { background-color: #202c4a; }
+html.dark .hover\:bg-slate-200:hover { background-color: #263454; }
+/* 状态色：深色下改成暗底亮字 */
+html.dark .bg-amber-50 { background-color: rgba(245, 158, 11, 0.12); }
+html.dark .text-amber-800, html.dark .text-amber-700 { color: #fbbf24; }
+html.dark .text-amber-600 { color: #f59e0b; }
+html.dark .border-amber-100, html.dark .border-amber-200,
+html.dark .border-amber-300 { border-color: rgba(245, 158, 11, 0.3); }
+html.dark .hover\:bg-amber-100:hover { background-color: rgba(245, 158, 11, 0.18); }
+html.dark .bg-red-50, html.dark .hover\:bg-red-50:hover,
+html.dark .hover\:bg-red-100:hover { background-color: rgba(239, 68, 68, 0.14); }
+html.dark .text-red-600, html.dark .text-red-500 { color: #f87171; }
+html.dark .border-red-200, html.dark .border-red-300 { border-color: rgba(239, 68, 68, 0.35); }
+html.dark .bg-green-100 { background-color: rgba(34, 197, 94, 0.16); }
+html.dark .text-green-700 { color: #4ade80; }
+html.dark .bg-emerald-50 { background-color: rgba(16, 185, 129, 0.12); }
+html.dark .text-emerald-700 { color: #34d399; }
+html.dark .border-emerald-100 { border-color: rgba(16, 185, 129, 0.25); }
+/* diff 行与「+N −N」计数（DiffView / RunTraceInline / RunChanges / FileViewer 都用这套
+   emerald/rose 配色）：深色下不覆写就是暗底配 -900 暗字，展开的改动面板整片读不出来
+   （2026-10-29 用户反馈「看不清」）；bg-rose-50 不覆写又会在深色里糊出一块刺眼浅粉。 */
+html.dark .text-emerald-900 { color: #6ee7b7; }
+html.dark .text-emerald-600 { color: #34d399; }
+html.dark .bg-emerald-100 { background-color: rgba(16, 185, 129, 0.18); }
+html.dark .ring-emerald-200 { --tw-ring-color: rgba(16, 185, 129, 0.35); }
+html.dark .hover\:bg-emerald-50:hover { background-color: rgba(16, 185, 129, 0.12); }
+html.dark .bg-rose-50,
+html.dark .hover\:bg-rose-50:hover { background-color: rgba(244, 63, 94, 0.12); }
+html.dark .bg-rose-100 { background-color: rgba(244, 63, 94, 0.18); }
+html.dark .text-rose-900 { color: #fda4af; }
+html.dark .text-rose-700, html.dark .text-rose-600 { color: #fb7185; }
+html.dark .ring-rose-200 { --tw-ring-color: rgba(244, 63, 94, 0.35); }
+html.dark .border-rose-200, html.dark .border-rose-300 { border-color: rgba(244, 63, 94, 0.35); }
+/* diff 行号槽：slate-400 在深色里本来就压暗了，再带 80% 透明度基本看不见 */
+html.dark .text-slate-400\/80 { color: #8fa0b8; }
+/* 主色文字/链接（排队行的「插话」、展开/查看类按钮）：brand-600 是给浅底配的，
+   深色下不提亮一档就是「看不清」（2026-10-29 用户反馈）；色值由用户主色驱动 */
+html.dark .text-brand-600,
+html.dark .text-brand-700,
+html.dark .hover\:text-brand-600:hover { color: rgb(var(--brand-400-rgb)); }
+/* 顶栏品牌字与提醒铃铛：brand-700 是浅底配色，深色顶栏下不换色会整块沉进底色
+   （2026-10-29 用户反馈「显示不明显」）。品牌字不跟主色走——用户可以把主色调成
+   灰蓝（#475569），品牌必须始终可读；颜色锚点交给左侧的产品图标。
+   铃铛：关闭态中性灰（不用 slate-300，深色里近乎隐形，也别用 slate-500——自定义
+   文字颜色会把它染亮，导致「关」比「开」还显眼），开启态用琥珀色，两种主题都清晰。 */
+.ga-brand { color: #0f172a; }
+html.dark .ga-brand { color: #e8eef7; }
+.ga-notify { color: #64748b; }
+html.dark .ga-notify { color: #93a3ba; }
+.ga-notify.on { color: #b45309; }
+html.dark .ga-notify.on { color: #fbbf24; }
+html.dark .bg-sky-100 { background-color: rgba(56, 189, 248, 0.14); }
+html.dark .text-sky-700 { color: #38bdf8; }
+html.dark .bg-blue-100 { background-color: rgba(59, 130, 246, 0.16); }
+html.dark .text-blue-700 { color: #60a5fa; }
+html.dark .bg-orange-100 { background-color: rgba(249, 115, 22, 0.15); }
+html.dark .text-orange-700 { color: #fb923c; }
+html.dark .bg-gray-200 { background-color: #273248; }
+html.dark .text-gray-600 { color: #93a3ba; }
+/* 紫色系（思考面板/配音角色标签）与带透明度的浅底——深色下同样走暗底亮字，
+   否则思考/工具展开面板在深色界面里是一块刺眼的浅色（2026-10-29 用户反馈） */
+html.dark .bg-violet-50 { background-color: rgba(139, 92, 246, 0.14); }
+html.dark .bg-violet-50\/70 { background-color: rgba(139, 92, 246, 0.12); }
+html.dark .bg-violet-100 { background-color: rgba(139, 92, 246, 0.18); }
+html.dark .text-violet-700 { color: #a78bfa; }
+html.dark .text-violet-600 { color: #b39dfb; }
+html.dark .border-violet-300 { border-color: rgba(167, 139, 250, 0.4); }
+html.dark .ring-violet-200 { --tw-ring-color: rgba(167, 139, 250, 0.35); }
+html.dark .bg-slate-100\/80 { background-color: rgba(24, 34, 56, 0.8); }
+/* 带透明度的白/浅灰底（工具结果代码块、提问选项、DiffView/ToolTrace 表头、悬浮按钮等）：
+   不覆写就会浅底配深色模式下被改亮的文字 = 看不清（2026-10-29 用户反馈） */
+html.dark .bg-white\/70 { background-color: rgba(19, 28, 46, 0.72); }
+html.dark .bg-white\/85 { background-color: rgba(19, 28, 46, 0.82); }
+html.dark .bg-slate-50\/60,
+html.dark .bg-slate-50\/70,
+html.dark .bg-slate-50\/80 { background-color: rgba(15, 23, 41, 0.55); }
+html.dark .bg-slate-100\/70 { background-color: rgba(24, 34, 56, 0.7); }
+html.dark .hover\:bg-slate-100\/70:hover { background-color: rgba(32, 44, 74, 0.7); }
+html.dark .bg-orange-50 { background-color: rgba(249, 115, 22, 0.12); }
+/* Markdown 正文里的浅色元素 */
+html.dark .md-body blockquote { color: #93a3ba; border-left-color: rgba(148, 163, 184, 0.3); }
+html.dark .md-body th { background: rgba(148, 163, 184, 0.08); }
+html.dark .md-body th, html.dark .md-body td { border-color: rgba(148, 163, 184, 0.22); }
+html.dark .md-body hr { border-top-color: rgba(148, 163, 184, 0.22); }
+
+/* ---------- 背景壁纸层 ---------- */
+.ga-bg-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+}
+.ga-bg-media {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+/* 开背景后：页面底色让位给壁纸，面板改用半透明（毛玻璃） */
+html.ga-bg-on body { background: #10192b; }
+html.ga-bg-on .ga-app-root { background: transparent; }
+html.ga-bg-on .bg-slate-100 { background-color: transparent; }
+html.ga-bg-on .bg-white {
+  background-color: rgb(var(--ga-panel-rgb) / var(--ga-panel-alpha));
+  backdrop-filter: blur(12px);
+}
+html.ga-bg-on .bg-slate-50 {
+  background-color: rgb(var(--ga-panel-rgb) / calc(var(--ga-panel-alpha) * 0.72));
+  backdrop-filter: blur(10px);
+}
+html.dark { --ga-panel-rgb: 19 28 46; }
+/* 深色 + 壁纸同时开：半透明规则要压过上面的深色实底（同优先级，后写的赢） */
+html.dark .ga-bg-on .bg-white,
+html.dark.ga-bg-on .bg-white { background-color: rgb(var(--ga-panel-rgb) / var(--ga-panel-alpha)); }
+html.dark.ga-bg-on .bg-slate-50 { background-color: rgb(var(--ga-panel-rgb) / calc(var(--ga-panel-alpha) * 0.72)); }
+
+/* ---------- 壁纸下的「一点点底色」----------
+   用户反馈：侧栏空白区和运行轨迹直接压在壁纸上，边界和文字都看不清；
+   但又不想糊成一块实心面板（「要透明一点」）。所以只在开壁纸时补一层很轻的
+   半透明底色 + 更强一点的毛玻璃：能透出壁纸，又能把文字托住。 */
+html.ga-bg-on .ga-session-pane {
+  /* 侧栏保持用户设定的面板不透明度（62%），只把毛玻璃加厚一点让文字更稳；
+     空白区另由 .ga-list-tint 补一层很淡的底色（「加一点点底色」），面板不会变闷 */
+  background-color: rgb(var(--ga-panel-rgb) / var(--ga-panel-alpha));
+  backdrop-filter: blur(22px) saturate(1.05);
+  -webkit-backdrop-filter: blur(22px) saturate(1.05);
+  box-shadow: inset -1px 0 0 rgb(148 163 184 / 0.18);
+}
+html.ga-bg-on .ga-trace {
+  background-color: rgb(var(--ga-panel-rgb) / var(--ga-panel-alpha));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: inset 0 0 0 1px rgb(148 163 184 / 0.16);
+  border-radius: 0.5rem;
+  padding: 0.25rem 0.45rem;
+}
+/* 会话列表内部的空白区：开壁纸时补一层极轻的底色，让「列表到哪里结束」看得出来；
+   不开壁纸时保持原样（纯白侧栏不需要额外底色）。 */
+.ga-list-tint { border-radius: 0.5rem; }
+html.ga-bg-on .ga-list-tint {
+  background-color: rgb(var(--ga-panel-rgb) / calc(var(--ga-panel-alpha) * 0.45));
+  background-image: linear-gradient(180deg, rgb(148 163 184 / 0.10), rgb(148 163 184 / 0.02));
+  box-shadow: inset 0 0 0 1px rgb(148 163 184 / 0.10);
+}
+html.dark.ga-bg-on .ga-list-tint {
+  background-color: rgb(var(--ga-panel-rgb) / calc(var(--ga-panel-alpha) * 0.45));
+  background-image: linear-gradient(180deg, rgb(226 232 240 / 0.06), rgb(226 232 240 / 0.01));
+  box-shadow: inset 0 0 0 1px rgb(148 163 184 / 0.12);
+}
+
+/* ---------- 自定义文字颜色：覆盖全部 slate 字阶（放在深色覆盖之后，两种模式都生效） ----------
+   排除 .ga-log（系统日志终端）：深底终端里的灰阶是刻意的对比度设计，跟正文字色走会看不见。 */
+html.ga-text-on body,
+html.ga-text-on :is(.text-slate-900, .text-slate-800, .text-slate-700, .text-slate-600,
+  .text-slate-500, .text-slate-400, .text-gray-600):not(.ga-log, .ga-log *) {
+  color: var(--ga-text);
+}
+
+/* ---------- 统一按钮体系：primary 主操作 / secondary 常规 / ghost 轻量 / danger 危险 ---------- */
+.ga-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  height: 2rem;
+  padding: 0 0.75rem;
+  border-radius: 0.375rem;
+  border: 1px solid transparent;
+  font-size: 0.875rem;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+}
+.ga-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.ga-btn:focus-visible { outline: 2px solid rgb(var(--brand-500-rgb) / 0.55); outline-offset: 1px; }
+.ga-btn-primary { background: rgb(var(--brand-600-rgb)); color: #fff; }
+.ga-btn-primary:hover:not(:disabled) { background: rgb(var(--brand-700-rgb)); }
+.ga-btn-secondary { background: #fff; border-color: rgba(148, 163, 184, 0.5); color: #1e293b; }
+.ga-btn-secondary:hover:not(:disabled) { background: #f1f5f9; }
+.ga-btn-ghost { background: transparent; color: #475569; }
+.ga-btn-ghost:hover:not(:disabled) { background: rgba(148, 163, 184, 0.16); }
+.ga-btn-danger { background: transparent; border-color: rgba(220, 38, 38, 0.4); color: #dc2626; }
+.ga-btn-danger:hover:not(:disabled) { background: rgba(220, 38, 38, 0.1); }
+.ga-btn-sm { height: 1.75rem; padding: 0 0.55rem; font-size: 0.75rem; }
+.ga-btn-lg { height: 2.25rem; padding: 0 1rem; }
+html.dark .ga-btn-secondary { background: #1c2842; border-color: rgba(148, 163, 184, 0.3); color: #d3dce8; }
+html.dark .ga-btn-secondary:hover:not(:disabled) { background: #243352; }
+html.dark .ga-btn-ghost { color: #b9c5d6; }
+html.dark .ga-btn-ghost:hover:not(:disabled) { background: rgba(148, 163, 184, 0.16); }

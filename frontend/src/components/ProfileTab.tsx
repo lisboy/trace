@@ -1,0 +1,255 @@
+import { useEffect, useRef, useState } from "react";
+import { api } from "../api";
+import { useAuth } from "../store";
+import { navigate } from "../router";
+import Avatar from "./Avatar";
+
+/** 个人资料设置：名称、头像、账号密码都可以在这里自己改。
+ *  保存后同步更新全局 auth store（顶栏/头像即时生效），无需重新登录。 */
+export default function ProfileTab() {
+  const user = useAuth((s) => s.user);
+  const teams = useAuth((s) => s.teams);
+  const currentTeamId = useAuth((s) => s.currentTeamId);
+  const setUser = useAuth((s) => s.setUser);
+  const logout = useAuth((s) => s.logout);
+  const role = teams.find((t) => t.id === currentTeamId)?.role;
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const [name, setName] = useState(user?.display_name || "");
+  const [avatar, setAvatar] = useState<string | null>(user?.avatar || null);
+  const [oldPwd, setOldPwd] = useState("");
+  const [newPwd, setNewPwd] = useState("");
+  const [confirmPwd, setConfirmPwd] = useState("");
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [pwdBusy, setPwdBusy] = useState(false);
+  const [pwdMsg, setPwdMsg] = useState("");
+  const [pwdErr, setPwdErr] = useState("");
+
+  useEffect(() => {
+    setName(user?.display_name || "");
+    setAvatar(user?.avatar || null);
+  }, [user?.display_name, user?.avatar]);
+
+  async function saveProfile() {
+    setMsg("");
+    setErr("");
+    const trimmed = name.trim();
+    if (!trimmed) {
+      setErr("名称不能为空");
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await api.updateMe({ display_name: trimmed, avatar });
+      setUser(r.user);
+      setMsg("个人资料已保存");
+    } catch (e: any) {
+      setErr(e?.message || "保存失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pickAvatar(file: File | null | undefined) {
+    if (!file) return;
+    setMsg("");
+    setErr("");
+    if (!file.type.startsWith("image/")) {
+      setErr("请选择图片文件");
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      setErr("头像不能超过 8MB");
+      return;
+    }
+    try {
+      const r = await api.uploadAvatar(file);
+      setAvatar(r.avatar);
+      // 后端上传时已经落库，但名称可能还没保存：这里只刷新头像
+      const me = await api.me();
+      if (me?.user) setUser(me.user);
+      setMsg("头像已更新");
+    } catch (e: any) {
+      setErr(e?.message || "头像上传失败");
+    } finally {
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  async function removeAvatar() {
+    setMsg("");
+    setErr("");
+    try {
+      const r = await api.updateMe({ avatar: "" });
+      setAvatar(null);
+      setUser(r.user);
+      setMsg("已恢复默认头像");
+    } catch (e: any) {
+      setErr(e?.message || "操作失败");
+    }
+  }
+
+  async function changePwd() {
+    setPwdMsg("");
+    setPwdErr("");
+    if (newPwd.length < 8) {
+      setPwdErr("新密码至少 8 位");
+      return;
+    }
+    if (newPwd !== confirmPwd) {
+      setPwdErr("两次输入的新密码不一致");
+      return;
+    }
+    setPwdBusy(true);
+    try {
+      await api.changePassword(oldPwd, newPwd);
+      setOldPwd("");
+      setNewPwd("");
+      setConfirmPwd("");
+      setPwdMsg("密码已修改，下次登录请使用新密码");
+    } catch (e: any) {
+      setPwdErr(e?.message || "修改密码失败");
+    } finally {
+      setPwdBusy(false);
+    }
+  }
+
+  return (
+    <div className="max-w-2xl space-y-4">
+      <div className="bg-white rounded border border-slate-200 p-4">
+        <div className="text-sm font-medium mb-3">个人资料</div>
+        <div className="flex items-center gap-4">
+          <div className="relative group">
+            <Avatar src={avatar} name={name} size={72} className="ring-2 ring-slate-200" />
+            <button
+              type="button"
+              className="absolute inset-0 rounded-full bg-slate-900/45 text-white text-[11px] opacity-0 group-hover:opacity-100 transition-opacity"
+              onClick={() => fileRef.current?.click()}
+              title="更换头像"
+            >
+              更换
+            </button>
+          </div>
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                className="text-xs px-2.5 py-1.5 rounded border border-slate-200 hover:bg-slate-50"
+                onClick={() => fileRef.current?.click()}
+              >
+                上传新头像
+              </button>
+              {avatar && (
+                <button
+                  type="button"
+                  className="text-xs px-2.5 py-1.5 rounded border border-slate-200 hover:bg-slate-50 text-slate-500"
+                  onClick={removeAvatar}
+                >
+                  恢复默认
+                </button>
+              )}
+            </div>
+            <div className="text-[11px] text-slate-400">支持 JPG / PNG / WebP / GIF，不超过 8MB</div>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => pickAvatar(e.target.files?.[0])}
+            />
+          </div>
+        </div>
+
+        <div className="mt-4 grid grid-cols-[88px_1fr] gap-2 items-center text-sm">
+          <label className="text-slate-500 text-xs">名称</label>
+          <input
+            className="border rounded px-2 py-1.5 max-w-sm"
+            value={name}
+            maxLength={120}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="你的显示名称"
+          />
+          <label className="text-slate-500 text-xs">邮箱</label>
+          <input
+            className="border rounded px-2 py-1.5 max-w-sm bg-slate-50 text-slate-400"
+            value={user?.email || ""}
+            readOnly
+            title="邮箱由账号体系管理，暂不支持自行修改"
+          />
+          <label className="text-slate-500 text-xs">账号</label>
+          <div className="text-xs text-slate-500">
+            角色：{role || "成员"} · 账号 ID：<span className="mono">{user?.id || "-"}</span>
+          </div>
+        </div>
+
+        <div className="mt-3 flex items-center gap-2">
+          <button className="ga-btn ga-btn-primary" disabled={busy} onClick={saveProfile}>
+            {busy ? "保存中…" : "保存资料"}
+          </button>
+          {msg && <span className="text-xs text-green-700">{msg}</span>}
+          {err && <span className="text-xs text-red-600">{err}</span>}
+        </div>
+      </div>
+
+      <div className="bg-white rounded border border-slate-200 p-4">
+        <div className="text-sm font-medium mb-1">修改密码</div>
+        <div className="text-[11px] text-slate-400 mb-3">修改后本账号的登录密码立即生效。</div>
+        <div className="grid grid-cols-[88px_1fr] gap-2 items-center text-sm">
+          <label className="text-slate-500 text-xs">当前密码</label>
+          <input
+            type="password"
+            className="border rounded px-2 py-1.5 max-w-sm"
+            value={oldPwd}
+            autoComplete="current-password"
+            onChange={(e) => setOldPwd(e.target.value)}
+          />
+          <label className="text-slate-500 text-xs">新密码</label>
+          <input
+            type="password"
+            className="border rounded px-2 py-1.5 max-w-sm"
+            value={newPwd}
+            autoComplete="new-password"
+            onChange={(e) => setNewPwd(e.target.value)}
+            placeholder="至少 8 位"
+          />
+          <label className="text-slate-500 text-xs">确认新密码</label>
+          <input
+            type="password"
+            className="border rounded px-2 py-1.5 max-w-sm"
+            value={confirmPwd}
+            autoComplete="new-password"
+            onChange={(e) => setConfirmPwd(e.target.value)}
+          />
+        </div>
+        <div className="mt-3 flex items-center gap-2">
+          <button className="ga-btn ga-btn-primary" disabled={pwdBusy} onClick={changePwd}>
+            {pwdBusy ? "提交中…" : "修改密码"}
+          </button>
+          {pwdMsg && <span className="text-xs text-green-700">{pwdMsg}</span>}
+          {pwdErr && <span className="text-xs text-red-600">{pwdErr}</span>}
+        </div>
+      </div>
+
+      <div className="bg-white rounded border border-slate-200 p-4">
+        <div className="text-sm font-medium mb-1">登录状态</div>
+        <div className="text-[11px] text-slate-400 mb-3">退出后需要重新输入邮箱和密码登录。</div>
+        <button
+          className="text-xs px-2.5 py-1.5 rounded border border-red-200 text-red-600 hover:bg-red-50"
+          onClick={async () => {
+            try {
+              await api.logout();
+            } catch {
+              /* ignore */
+            }
+            logout();
+            navigate("chat");
+          }}
+        >
+          退出登录
+        </button>
+      </div>
+    </div>
+  );
+}

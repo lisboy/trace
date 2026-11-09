@@ -1,0 +1,57 @@
+# ============================================================
+#  循迹（Trace）版本库忽略规则
+#  原则：只提交源码 / 文档 / 打包脚本 / 占位素材；
+#        运行期产物、日志、构建产物、密钥、个人环境全部忽略。
+# ============================================================
+
+# ---- 密钥与本地配置（绝不能进仓库）----
+.env
+.env.local
+*.local.env
+
+# ---- Python 运行期 / 构建产物 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.spec.bak
+
+# ---- Node / 前端构建产物 ----
+node_modules/
+.npm-cache/
+npm-debug.log*
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# ---- 运行期数据目录 / 开发脚手架（非项目源码）----
+.ga-dev/
+.agent/
+.trace/
+.ga-main.out
+.trace_backend.out
+.trace_backend.err
+_tmp_smooth/
+.screenshots/
+.workbuddy/
+.idea/
+shot_rows_after.png
+_restart_backend.ps1
+
+# ---- 打包产物（由 package.cmd 现场生成）----
+dist_exe/
+dist_release/
+packaging/*/payload/
+
+# ---- 数据库迁移导出 / 备份 ----
+backup_db_migration/
+
+# ---- 操作系统 ----
+Thumbs.db
+.DS_Store
