@@ -27,6 +27,7 @@ from game_agent.agents.tools.specialized import (
 )
 from game_agent.agents.tools.plan import update_plan
 from game_agent.agents.tools.question import AskUserStop, ask_user
+from game_agent.agents.tools.spawn import spawn_agents
 from game_agent.agents.tools.web import web_fetch, web_search
 from game_agent.llm.base import ToolSpec
 
@@ -49,6 +50,8 @@ TOOL_IMPLS: dict[str, Callable] = {
     "view_images": view_images,
     # 协作与汇报
     "report_to_user": report_to_user,
+    # 子agent 并行：把互不依赖的调研/核对拆成多个只读子agent并发执行
+    "spawn_agents": spawn_agents,
     # 媒体直连：出图（批量版，支持 items）/ 出音频（voice/sfx/music + 音色设计）/ 出视频
     "generate_image": generate_image_batch, "generate_audio": generate_audio,
     "generate_video": generate_video_batch,
@@ -352,6 +355,22 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "⑤验证证据（编译/单测/截图结论；哪些没验证要如实说）⑥回滚与后续（出问题怎么退、还没做完的项）。"
         "最后一句结论说清能不能用、还要用户做什么。"), "parameters": {
         "type": "object", "properties": {"report": _STR}, "required": ["report"]}},
+    "spawn_agents": {"description": (
+        "并行派发只读子agent 调研/核对，汇总结论返回。"
+        "适用：互不依赖的多条查询/核对（并行查 N 个文件的同一类点、并行查多个资料源、"
+        "并行核对多份文档），一次性发出去、并行跑完再汇总，比主agent 一条条串行查快。"
+        "子agent 只读（read/grep/glob/web/memory/view），不写文件不跑命令；"
+        "items 每项 {name(子任务名), question(要核对的具体问题), note(可选)}，"
+        "一次最多 6 项。真正要改代码/生成素材/跑命令的事不要派给子agent——它们只能查和回答。"),
+        "parameters": {
+            "type": "object", "properties": {
+                "items": {"type": "array", "description": "子任务清单，每项一个独立问题",
+                          "items": {"type": "object", "properties": {
+                              "name": {**_STR, "description": "子任务名（≤40字）"},
+                              "question": {**_STR, "description": "要核对的具体问题（给足路径/关键词/判断标准）"},
+                              "note": {**_STR, "description": "可选：补充约束（如只看某几行）"},
+                          }, "required": ["question"]}},
+            }, "required": ["items"]}},
     "update_plan": {"description": (
         "维护当前任务的待办清单（计划机制，用户界面实时显示勾选进度）。"
         "问题较复杂（≥3 步 / 多文件 / 多角色协作）时，开工前先列出 3-8 项待办（全部 pending，"
@@ -539,4 +558,13 @@ async def execute_tool_with_timeout(name: str, args: dict, t: ToolContext,
                         "通常是外部命令/接口挂死或网络卡住——换一种做法，或如实说明卡在哪一步。")
     finally:
         if not task.done():
+            # 关键：外层被取消（用户点停止 / run 看门狗掐任务）时，这里必须把内层工具任务
+            # 真正 cancel **并 await 它结束**。只 cancel 不 await 的话，内层 run_command 的
+            # `except CancelledError: _kill_tree(proc)` 还没执行到，事件循环就转向收尾——
+            # 子进程（pytest / npm build）会变成孤儿继续跑，甚至把还在用的文件锁住。
+            # 用 wait_for 包一层：万一某个工具吞掉了 CancelledError，也不能把收尾卡死。
             task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - 取消产生的异常无所谓
+                pass

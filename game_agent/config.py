@@ -315,6 +315,12 @@ DEBUG_INSTANCE = _bool("GA_DEBUG_INSTANCE", False)
 # 永久挂在外部调用上，界面不该一直挂「运行中」。30 分钟远大于任何单个正常步骤
 # （单次 LLM 360s / 单张出图 300s / 单条 TTS 600s / 单条命令 300s）。
 RUN_STALE_S = _int("GA_RUN_STALE_S", 1800)
+# 用户点了「停止」（runs.cancel_requested=1）后，最多再等这么久还没落终态，就由看门狗
+# 强制把 run 落成 cancelled。正常的取消是秒级的（取消看门狗 task.cancel() 会立刻掀翻
+# LLM 流 / 现在的 run_command）。但如果卡在一个**不可取消**的 await 上（历史 bug：to_thread
+# 跑同步子进程），cancel 掀不翻，run 就会永远停在 running、界面「停止中」一直转圈。
+# 这条是最后一道兜底：置位取消后超过这么久仍未结束 = 已经僵死，强制收尸成 cancelled。
+CANCEL_GRACE_S = _int("GA_CANCEL_GRACE_S", 60)
 # 并行执行的 run 数 = 进程内 worker 数（每个 worker 一次跑一条 run）。单机 lite 模式是
 # 单进程多协程：几条 run 靠 asyncio 并行 + 各自线程里的阻塞调用跑，不需要起多个进程。
 # 2026-10-30 用户要求「多个会话不需要排队，可以同时开多个对话」：默认从 3 提到 64，

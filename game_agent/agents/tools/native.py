@@ -11,8 +11,8 @@ from pathlib import Path
 
 from game_agent.agents.tools import ToolContext, ToolError
 from game_agent.config import (
-    COMMAND_WHITELIST, DANGEROUS_PATTERNS, PLATFORM, PROTECTED_PREFIXES, SEARCH_TIMEOUT_S,
-    SHELL_POLICY, TOOL_TIMEOUT_S, env_examples,
+    COMMAND_WHITELIST, DANGEROUS_PATTERNS, MAX_CONCURRENT_RUNS, PLATFORM,
+    PROTECTED_PREFIXES, SEARCH_TIMEOUT_S, SHELL_POLICY, TOOL_TIMEOUT_S, env_examples,
 )
 from game_agent.core.skills import SKILL_SCOPE_LABELS
 from game_agent.orchestration import envfacts
@@ -20,8 +20,13 @@ from game_agent.orchestration import envfacts
 MAX_READ = 16000
 MAX_WRITE = 2 * 1024 * 1024  # 2MB
 
-# run_command 串行锁：见 _run_shell_blocking docstring（2026-10-28 两次段错误 mitigation）
-_SHELL_LOCK = threading.Lock()
+# run_command 并发上限（**不是**串行锁）：见 _run_shell_cmd docstring。
+# 历史：2026-10-28 两次 python313 段错误曾被归因为「并发 subprocess」，于是加了一把进程级
+# threading.Lock 把 run_command 整体串行化。后来定位到真正的元凶是 faulthandler 看门狗的
+# 原生线程（已默认关闭，见 main.py），锁已无必要。而且这把全局锁有致命副作用：一条挂死的
+# 子进程会长期占着它，连坐**所有 run** 的 run_command（64 个 worker 共用一个锁）——
+# 2026-11-10 实测就是这样「好几个 run 一起卡死」。改成并发信号量：限流仍在，但不再连坐。
+_SHELL_SEM = asyncio.Semaphore(max(4, min(int(MAX_CONCURRENT_RUNS or 8), 16)))
 
 # 扫描剪枝：这些目录名在任何层级都不进（node_modules 可达十万级文件，同步遍历会冻结事件循环）。
 # 「项目过大后搜索特别慢」的根因就在这——此前只剪了少数几个名字，用户 project 里自带的
@@ -1022,58 +1027,90 @@ def _decode_shell_output(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _run_shell_blocking(cmd: str, cwd: str, timeout_s: float, scan: bool = False) -> tuple[int, str]:
-    """在 worker 线程里同步执行命令。
+async def _run_shell_cmd(cmd: str, cwd: str, timeout_s: float, scan: bool = False) -> tuple[int, str]:
+    """异步执行命令，**可被取消**（取消即杀掉整棵子进程树）。
 
     ⚠️ 不能用 asyncio.create_subprocess_shell：本进程在 Windows 上强制 Selector 事件循环
     （aiomysql 要求，见 main.py），而 SelectorEventLoop 不支持子进程，会抛
-    NotImplementedError —— 表现正是「所有 run_command 一律 启动命令失败」。
+    NotImplementedError —— 表现正是「所有 run_command 一律 启动命令失败」。所以用
+    subprocess.Popen（同步 API）+ 一个专门的读线程抽输出，事件循环侧用轮询等待。
 
-    scan=True 表示这是递归扫描命令（时限更短）：超时文案换成「缩小范围 / 换内置工具」，
-    因为扫描超时的真正原因是范围不对，不是机器慢。
+    为什么不再用 `asyncio.to_thread(_run_shell_blocking, …)`：to_thread 是**不可取消**的。
+    run 被取消（用户点停止 / 看门狗掐任务）时，CancelledError 投不进去，那个线程会一直
+    阻塞在 proc.communicate 上，run 就成了僵尸（status 永远 running、界面「停止中」却
+    还在转）——2026-11-10 实测 `npm build`/`pytest` 卡住就是这样。这里把等待点改成一个
+    `await asyncio.sleep` 轮询，取消能立即生效，并顺手 `_kill_tree` 把子进程真正杀掉，
+    杜绝孤儿 pytest/构建进程继续占资源。
 
-    全程串行锁：2026-10-28 两次服务崩溃（python313.dll 段错误、偏移固定）都发生在
-    planner 并发批量 run_command 的瞬间，fault_dump 快照里正是并发 subprocess+io 线程；
-    两轮并发复现实验（1200+ 次 Popen+communicate）单独跑不崩，说明需要和事件循环的
-    socket/io 混跑才触发。在根因定位前先消掉并发维度——命令都是秒级小命令，
-    排队延迟对动辄数分钟的 planner 轮次可忽略。faulthandler.enable() 已在 main.py
-    兜底：若仍崩，日志里会有崩溃瞬间的全线程栈。
+    scan=True 表示这是递归扫描命令（时限更短）：超时文案换成「缩小范围 / 换内置工具」。
+
+    并发控制：`_SHELL_SEM` 只做并发上限（不是串行锁），一条慢/挂的命令不会连坐别的 run。
     """
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1", "PYTHONUNBUFFERED": "1"}
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-    with _SHELL_LOCK:
+
+    def _timeout_msg(partial: str) -> str:
+        if scan:
+            return (
+                f"递归扫描 {int(timeout_s)}s 内没跑完，已终止（搜索时限 GA_SEARCH_TIMEOUT_S，"
+                "和构建/测试用的 GA_TOOL_TIMEOUT_S 分开算）。整库扫一遍几乎总是范围写错了：\n"
+                "  · 找文件 → glob(pattern=\"**/*.py\")，自动跳过 node_modules/.git/dist/.venv 等；\n"
+                "  · 找内容 → grep(pattern=\"关键词\", path=\"子目录\")，先 list_dir 看上一步该进哪个目录；\n"
+                "  · 确实要扫 shell，也必须限定路径（例：Get-ChildItem web -Recurse …），别从工作区根扫起；\n"
+                "  · 想按修改时间挑文件，用 glob 拿到清单后 read_file 看几个明确路径，别对着全库排序。"
+                + (f"\n[超时前的输出]\n{partial[-2000:]}" if partial else ""))
+        return (
+            f"命令 {int(timeout_s)}s 内没有结束，已被终止。常驻服务（web/dev server、watch、"
+            "游戏进程）不要用 run_command 反复起：改用 start_service 后台启动 → service_logs 看日志 → "
+            "screenshot_page 截图 → stop_service 收掉；如果是测试卡住，缩小范围（跑单个用例）或加超时参数。"
+            + (f"\n[超时前的输出]\n{partial[-2000:]}" if partial else ""))
+
+    async with _SHELL_SEM:
         proc = subprocess.Popen(
             cmd, shell=True, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=env, creationflags=flags, close_fds=True,
         )
+        buf = bytearray()
+
+        def _reader() -> None:
+            try:
+                assert proc.stdout is not None
+                for line in iter(proc.stdout.readline, b""):
+                    buf.extend(line)
+            except Exception:  # noqa: BLE001 - 读线程异常不影响主流程
+                pass
+            finally:
+                try:
+                    if proc.stdout is not None:
+                        proc.stdout.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
         try:
-            out, _ = proc.communicate(timeout=timeout_s)
-        except subprocess.TimeoutExpired as e:
-            # 超时也要把「已经吐出来的输出」交回去：否则模型看不到任何线索，只会原地重跑同一条命令
-            partial = e.output
-            if isinstance(partial, (bytes, bytearray)):
-                partial = _decode_shell_output(partial)
-            partial = (partial or "").strip()
+            while proc.poll() is None:
+                if loop.time() >= deadline:
+                    _kill_tree(proc)
+                    # 给读线程一点时间收尾已吐出的输出，再交还（partial 让模型有线索）
+                    await asyncio.to_thread(reader.join, 5)
+                    partial = _decode_shell_output(bytes(buf)).strip()
+                    raise ToolError(_timeout_msg(partial))
+                await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            # 关键：取消必须真正杀掉子进程，否则 run 僵尸 + 孤儿 pytest/build 继续跑
             _kill_tree(proc)
             try:
-                proc.communicate(timeout=5)
+                await asyncio.to_thread(reader.join, 5)
             except Exception:  # noqa: BLE001
                 pass
-            if scan:
-                raise ToolError(
-                    f"递归扫描 {int(timeout_s)}s 内没跑完，已终止（搜索时限 GA_SEARCH_TIMEOUT_S，"
-                    "和构建/测试用的 GA_TOOL_TIMEOUT_S 分开算）。整库扫一遍几乎总是范围写错了：\n"
-                    "  · 找文件 → glob(pattern=\"**/*.py\")，自动跳过 node_modules/.git/dist/.venv 等；\n"
-                    "  · 找内容 → grep(pattern=\"关键词\", path=\"子目录\")，先 list_dir 看上一步该进哪个目录；\n"
-                    "  · 确实要扫 shell，也必须限定路径（例：Get-ChildItem web -Recurse …），别从工作区根扫起；\n"
-                    "  · 想按修改时间挑文件，用 glob 拿到清单后 read_file 看几个明确路径，别对着全库排序。"
-                    + (f"\n[超时前的输出]\n{partial[-2000:]}" if partial else ""))
-            raise ToolError(
-                f"命令 {int(timeout_s)}s 内没有结束，已被终止。常驻服务（web/dev server、watch、"
-                "游戏进程）不要用 run_command 反复起：改用 start_service 后台启动 → service_logs 看日志 → "
-                "screenshot_page 截图 → stop_service 收掉；如果是测试卡住，缩小范围（跑单个用例）或加超时参数。"
-                + (f"\n[超时前的输出]\n{partial[-2000:]}" if partial else ""))
-        return proc.returncode, _decode_shell_output(out or b"")
+            raise
+        # 进程已退出：读线程读到 EOF 后会自然结束，等它把尾部输出抽干净
+        await asyncio.to_thread(reader.join, 5)
+        return proc.returncode, _decode_shell_output(bytes(buf))
 
 
 async def run_command(args: dict, t: ToolContext) -> str:
@@ -1144,9 +1181,12 @@ async def run_command(args: dict, t: ToolContext) -> str:
     scan = _is_scan_command(cmd)
     budget = float(SEARCH_TIMEOUT_S if scan else TOOL_TIMEOUT_S)
     try:
-        rc, text = await asyncio.to_thread(
-            _run_shell_blocking, cmd, str(t.workspace), budget, scan)
+        rc, text = await _run_shell_cmd(cmd, str(t.workspace), budget, scan)
     except ToolError:
+        raise
+    except asyncio.CancelledError:
+        # 取消（用户点停止 / 看门狗）要一路向上抛，交给 orchestrator 落 cancelled 终态，
+        # 绝不能在这里吞成「启动命令失败」，否则 run 被取消却报成工具错误。
         raise
     except Exception as e:  # noqa: BLE001
         raise ToolError(f"启动命令失败：{type(e).__name__}: {e}")

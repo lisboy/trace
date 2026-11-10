@@ -36,11 +36,22 @@ ROLE_TOOLS: dict[str, list[str]] = {
         "generate_audio", "list_voice_presets", "generate_video",
         # 协作
         "update_plan", "ask_user", "report_to_user",
+        # 子agent 并行：把互不依赖的调研/核对拆成多个只读子任务并发执行
+        "spawn_agents",
+    ],
+    # 子agent（spawn_agents 派出的只读调研角色）：只能读和分析，不能写/跑/生成，
+    # 天然无写锁冲突，适合并行核对多条线索。递归禁止：白名单里没有 spawn_agents。
+    "sub": [
+        "read_file", "list_dir", "glob", "grep", "load_skill", "search_history",
+        "memory_read", "parse_document", "web_search", "web_fetch",
+        "view_image", "view_images",
+        "report_to_user",
     ],
 }
 
 ROLE_LABELS: dict[str, str] = {
     "main": "助手",
+    "sub": "子agent",
     # 旧数据（历史消息里的 agent_key）统一显示成「助手」
     "planner": "助手",
     "artist": "助手",
@@ -49,6 +60,7 @@ ROLE_LABELS: dict[str, str] = {
 
 ROLE_DESCRIPTIONS: dict[str, str] = {
     "main": "唯一面向用户、也是唯一执行的角色：查文件、写代码、编译、起服务、截图验收、汇报；出图/出音频直接调 generate_image / generate_audio。",
+    "sub": "spawn_agents 派出的只读调研子agent：并行核对线索/文件/资料，只读不改，结果回给主agent。",
 }
 
 # 默认系统提示词骨架（Python 项目导向；构建/测试/启动命令由系统注入）
@@ -103,6 +115,13 @@ B. 要音频（cv/台词/配音/音效/bgm）→ 直接调 generate_audio，参�
    要多条用 items/count（最多 6 条）。视频文字不可控、别指望画面写字清晰。
    视频服务由工具内部自动拉起（与出图共用 ComfyUI，互斥语音），你不需要管它。
 C. 要改代码/加功能/修 bug/接素材/调 UI → 自己动手，按第二节走完「改完 + 验完」。
+   先分清用户这句话是「先查清楚」还是「直接改好」：
+   · 「帮我检查/排查/诊断一下……」「看看问题出在哪」「先找出原因」「是什么原因/什么问题」
+     —— 是要一个**结论**，不是让你立刻改：只读代码/日志/配置定位到根因，给出「结论 + 证据
+     （文件:行号/日志原文）+ 建议怎么改」，**本轮不要改文件、不要起服务改配置**；等用户
+     说「那就改吧/修一下」再动手。（系统会把这类按「只读诊断」跑，写工具会被剔除。）
+   · 「帮我修复/改好/解决问题/把 X 弄好/改成 Y」「这有 bug 修掉」—— 直接检查完落地改。
+   一句话里既有「排查」又有「修复/改好」时，按「修复」处理（检查是为了改）。
 D. 纯问答/调研（用户明说只分析）→ 直接回答，别乱改文件。
 一句话能办完的事不要绕路：用户说「删掉 x.wav」就只 delete_file 一步，不要先勘察。
 动手优先于思考：判断完类别就调工具，不要先写一段分析、再逐个文件通读——
@@ -225,4 +244,13 @@ D. 纯问答/调研（用户明说只分析）→ 直接回答，别乱改文件
 6. **回滚与后续**：出问题怎么退（改哪个文件/删哪些产物）；还没做完的项和原因。
 最后一句「结论」：一句话说清现在能不能用、还需要用户做什么。
 没做完就如实写缺什么，不要美化，不要把「不确定」写成「已完成」。""",
+    # 子agent（spawn_agents 派出的只读调研角色）：只读不改、只回结论。递归禁止——
+    # 它的白名单里没有 spawn_agents。
+    "sub": """你是主agent 派出的只读调研子agent，一次只核对一个问题，回答就结束。
+规则：
+- 只用只读工具（read_file/grep/glob/list_dir/parse_document/web_search/web_fetch/memory_read/load_skill/view_image(s)）。
+- 不要写文件、不要跑命令、不要改任何东西；你的结论就是返回值。
+- 结论要具体可引用：给路径、行号、数值、原文摘录；不知道就说不知道，不要编。
+- 输出一段简洁 Markdown 结论（≤400字），不要用 report_to_user 之外的协作工具。
+- 把你负责的那一条说清楚即可，不要扩展开去研究无关内容。""",
 }

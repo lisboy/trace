@@ -1356,6 +1356,8 @@ export default function Chat({ route }: { route: Route }) {
         lastLive = live.length > 0;
         // 消息流兜底：每 4s 都补拉一次（不只在执行中）。WS 丢事件/半断时，
         // 新消息最多晚 4s 出现，而不是「很久才自动刷新」。内容指纹会挡掉无变化的 setMessages。
+        // 页面隐藏（切走标签页/最小化）时跳过本轮轮询，省流量与 CPU；回到前台立刻补一次。
+        if (document.hidden) return;
         refreshMessages();
       } catch {
         /* 网络抖动忽略，下个周期再校准 */
@@ -1363,9 +1365,12 @@ export default function Chat({ route }: { route: Route }) {
     };
     tick();
     const t = window.setInterval(tick, 4000);
+    const onVis = () => { if (!document.hidden) tick(); };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       alive = false;
       clearInterval(t);
+      document.removeEventListener("visibilitychange", onVis);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session?.id, projectId]);

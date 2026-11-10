@@ -77,12 +77,16 @@ async def _seed(session_factory, requirement: str) -> dict[str, str]:
 
 # ---------------------------------------------------------------- 1. wiring
 def test_role_tools_wiring() -> None:
-    """v3 单角色（main）在，且手里真的有"动手"工具（写文件 / 直连生成 / 起服务）。"""
-    assert set(ROLE_TOOLS) == {"main"}
+    """main 角色在（动手工具齐全）；sub 是 spawn_agents 派出的只读子agent（无写/跑/生成权限）。"""
+    assert set(ROLE_TOOLS) == {"main", "sub"}
     main = set(ROLE_TOOLS["main"])
     for tool in ("write_file", "edit_file", "run_command", "start_service",
                  "generate_image", "generate_audio"):
         assert tool in main, f"助手缺少工具 {tool}"
+    # 子agent 只读，不能写/跑/生成，也不能递归派发
+    sub = set(ROLE_TOOLS["sub"])
+    assert not (sub & {"write_file", "edit_file", "run_command", "start_service",
+                       "generate_image", "generate_audio", "spawn_agents"})
 
 
 def test_orchestrator_constructs(session_factory) -> None:

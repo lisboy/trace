@@ -48,10 +48,15 @@ export function useJobPoll(intervalMs = 1200) {
   const timerRef = useRef<number | null>(null);
   const stoppedRef = useRef(false);
   const lastLabel = useRef("");
+  const onVisRef = useRef<(() => void) | null>(null);
 
   const stop = () => {
     stoppedRef.current = true;
     if (timerRef.current != null) { window.clearInterval(timerRef.current); timerRef.current = null; }
+    if (onVisRef.current) {
+      document.removeEventListener("visibilitychange", onVisRef.current);
+      onVisRef.current = null;
+    }
   };
 
   const start = (jobId: string, fetcher: (id: string) => Promise<JobProgress>) => {
@@ -64,7 +69,9 @@ export function useJobPoll(intervalMs = 1200) {
     setLog([]);
     lastLabel.current = "";
     stoppedRef.current = false;
-    const tick = async () => {
+  const tick = async () => {
+      // 页面隐藏时暂停轮询（生成仍在后台跑，恢复可见后立刻补一次）
+      if (document.hidden) return;
       try {
         const p = await fetcher(jobId);
         if (stoppedRef.current) return;
@@ -85,6 +92,10 @@ export function useJobPoll(intervalMs = 1200) {
         }
       } catch { /* 轮询失败不打断生成 */ }
     };
+    // 页面切回前台立刻拉一次，避免「切走几分钟、回来还要等下一个间隔」。
+    const onVis = () => { if (!document.hidden) tick(); };
+    onVisRef.current = onVis;
+    document.addEventListener("visibilitychange", onVis);
     timerRef.current = window.setInterval(tick, intervalMs);
     tick();
   };

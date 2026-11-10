@@ -239,18 +239,20 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, AuthSe
     # 为止），但 worker 死亡、或某次外部调用永久挂起时，事件流会彻底停下来：
     # LLM 往返、工具调用、批量素材的每一条进度都会落事件，正常执行不可能静默半小时。
     from datetime import timedelta
-    from game_agent.config import RUN_STALE_S
+    from game_agent.config import RUN_STALE_S, CANCEL_GRACE_S
     from game_agent.db.models import Event
 
     async def stale_watchdog() -> None:
         while True:
             timed_out: list[dict] = []
+            cancelled: list[dict] = []
             try:
                 now = datetime.now(_tz.utc)
                 async with SessionLocal() as s:
                     live = (await s.execute(select(Run).where(
                         Run.status.in_(("claimed", "running"))))).scalars().all()
                     dead: dict[str, Run] = {}
+                    cancel_stuck: dict[str, Run] = {}
                     for r in live:
                         if r.status == "claimed":
                             # 领了活却 5 分钟没跑起来（worker 崩了 / 加载上下文报错）
@@ -259,6 +261,14 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, AuthSe
                             continue
                         last = (await s.execute(select(func.max(Event.created_at)).where(
                             Event.run_id == r.id))).scalar() or r.claimed_at or r.created_at
+                        # ① 用户已点「停止」但迟迟没落终态：正常的取消是秒级的，超过宽限期
+                        #    仍在 running = 卡在不可取消的 await 上，强制收成 cancelled，
+                        #    让「停止中」不再无限转圈（这是 2026-11-10 那个「停止无效」的兜底）。
+                        if getattr(r, "cancel_requested", False) and \
+                                now - last > timedelta(seconds=CANCEL_GRACE_S):
+                            cancel_stuck[str(r.id)] = r
+                            continue
+                        # ② 一般静默超时（没人管 / 外部调用永久挂起）
                         if now - last > timedelta(seconds=RUN_STALE_S):
                             dead[str(r.id)] = r
                     if dead:
@@ -269,13 +279,25 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, AuthSe
                             Run.id.in_([r.id for r in dead.values()])).values(
                             status="failed", error=f"{RUN_STALE_S // 60} 分钟没有任何执行动静，已中止",
                             finished_at=now))
-                        await s.commit()
                         log.warning("watchdog failed %s silent run(s)", len(timed_out))
+                    if cancel_stuck:
+                        cancelled = [{"run_id": rid, "session_id": r.session_id,
+                                      "team_id": r.team_id, "project_id": r.project_id}
+                                     for rid, r in cancel_stuck.items()]
+                        await s.execute(update(Run).where(
+                            Run.id.in_([r.id for r in cancel_stuck.values()])).values(
+                            status="cancelled", finished_at=now))
+                        log.warning("watchdog force-cancelled %s stuck run(s)", len(cancelled))
+                    if dead or cancel_stuck:
+                        await s.commit()
                 # 会话里补提示：否则该会话只剩用户那句话，聊天页看起来是空白的
                 for d in timed_out:
                     await post_session_notice(
                         text=f"本次执行已 {RUN_STALE_S // 60} 分钟没有任何动静（服务端判定为卡死，"
                              "已中止），请重新发起。", **d)
+                for d in cancelled:
+                    await post_session_notice(
+                        text="已按你的要求取消本次执行（该任务卡住未能自行退出，服务端已强制中止）。", **d)
             except Exception:  # noqa: BLE001
                 pass
             await asyncio.sleep(60)

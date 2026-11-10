@@ -819,6 +819,18 @@ def _one_line(s: str, limit: int) -> str:
     return one[:limit] + ("…" if len(one) > limit else "")
 
 
+def _tail_head(s: str, limit: int, head: int = 80) -> str:
+    """尾部优先截断：前 head 字作锚点 + 尾部主体（续跑摘要用）。
+
+    模型/工具的关键结论多在尾部，旧逻辑取头会把根因/行号丢掉，续跑时二次丢失。
+    """
+    one = _one_line(s, limit * 4)
+    if len(one) <= limit:
+        return one
+    tail = one[-(limit - head):]
+    return one[:head] + "…[中略]…" + tail
+
+
 async def _touched_files_brief(s, run_id) -> str:
     """上次 run 已经读过/改过的文件清单。
 
@@ -889,12 +901,14 @@ async def _findings_brief(s, run_id) -> str:
         body = _one_line(p.get("result"), _RESULT_CHARS)
         if len(body) < _RESULT_MIN_LEN or body in seen:
             continue
+        # 工具结果尾部优先：错误码/行号/关键输出多在中后部，取尾部更接近「结论」
+        body = _tail_head(p.get("result"), _RESULT_CHARS)
         seen.add(body)
         facts.append(f"- {when} {p.get('tool') or '?'}：{body}")
     for e in reversed(think_rows):
         p = e.payload_json or {}
         when = str(e.created_at or "")[11:19]
-        body = _one_line(p.get("reasoning"), _THINKING_CHARS)
+        body = _tail_head(p.get("reasoning"), _THINKING_CHARS)
         if len(body) >= _THINKING_MIN_LEN:
             think.append(f"- {when}：{body}")
     facts, think = facts[-40:], think[-3:]

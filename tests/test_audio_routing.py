@@ -255,4 +255,6 @@ def test_generate_audio_exposes_voice_design_params() -> None:
     # 助手手里必须有 generate_audio（配音是直连工具，没有独立「配音角色」了）
     from game_agent.agents.roles import ROLE_TOOLS
     assert "generate_audio" in ROLE_TOOLS["main"]
-    assert set(ROLE_TOOLS) == {"main"}
+    # main 负责动手，sub 是 spawn_agents 派出的只读子agent，两者并存
+    assert set(ROLE_TOOLS) == {"main", "sub"}
+    assert not (set(ROLE_TOOLS["sub"]) & {"write_file", "run_command", "generate_audio"})

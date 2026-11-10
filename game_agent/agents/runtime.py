@@ -11,6 +11,7 @@ import itertools
 import json
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from game_agent.agents.tools import ToolContext, ToolResult, is_scratch_path
 from game_agent.agents.tools.registry import (
@@ -41,6 +42,63 @@ _SOURCES_EVENT_CAP = 4000
 _SOURCES_MARK = "[Sources]"
 
 
+def _sig_arg(arg: Any) -> Any:
+    """死循环签名用的参数归一化：数字/时间戳/随机段不参与签名，路径取 basename。
+
+    同一实质操作换了个绝对路径或时间戳，签名应保持一致；不同文件/不同命令
+    仍能区分（basename 保留）。
+    """
+    import re as _re
+    if isinstance(arg, dict):
+        return {k: _sig_arg(v) for k, v in arg.items()}
+    if isinstance(arg, list):
+        return [_sig_arg(v) for v in arg]
+    if isinstance(arg, bool):
+        return arg
+    if isinstance(arg, (int, float)):
+        return "#num"
+    s = str(arg)
+    # 长随机串要先于数字归一：像 token-0123456789abcdef… 这种「数字+字母」混合串，
+    # 若先替换数字会被 #num 切断，[\w-]{20,} 就再也匹配不上，随机段参与签名。
+    s = _re.sub(r"[A-Za-z0-9_]{20,}", "#rand", s)   # 纯字母/数字/下划线长串（hex token 等）
+    if "/" not in s and "\\" not in s:
+        # 带连字符的长串（UUID 等，≥20）。只在非路径字符串上做：相对路径里的
+        # 长横杠目录名要原样保留，不能被归一成 #rand。
+        s = _re.sub(
+            r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,}",
+            lambda m: "#rand" if len(m.group()) >= 20 else m.group(),
+            s,
+        )
+    s = _re.sub(r"\d{4,}", "#num", s)          # 年份/时间戳/长数字
+    s = _re.sub(r"\d+", "#num", s)             # 短数字
+    s = s.replace("\\", "/")
+    # 绝对路径只保留最后一段；相对路径保留原样（不同文件名仍可区分）
+    if s.startswith("/") or (len(s) > 2 and s[1] == ":"):
+        s = s.rsplit("/", 1)[-1]
+    return s
+
+
+def _call_signature(name: str, args: Any) -> str:
+    try:
+        return f"{name}:{json.dumps(_sig_arg(args), sort_keys=True, ensure_ascii=False)}"
+    except Exception:  # noqa: BLE001 - 参数不可序列化时退回工具名
+        return name
+
+
+def _tail_keep_head(text: str, limit: int, head: int = 80) -> str:
+    """超长文本尾部优先截断：保留开头一小段作锚点 + 末尾主体。
+
+    模型/工具的关键结论（根因、行号、下一步）多在中后部；旧逻辑 [:limit] 取头
+    把最值钱的部分丢了。这里统一为「前 head 字 + …[中略]… + 尾部主体」，
+    供思考落库、工具结果展示、续跑摘要复用。
+    """
+    if len(text) <= limit:
+        return text
+    keep = max(limit - head, 0)
+    tail = text[-keep:]
+    return (text[:head] + "\n…[中略]…\n" + tail).strip()
+
+
 def _tail_with_sources(text: str) -> str:
     """截断工具结果用于事件展示，但保证末尾的 [Sources] 来源清单完整保留。
 
@@ -56,7 +114,7 @@ def _tail_with_sources(text: str) -> str:
     body = text[:idx].rstrip()
     sources = text[idx:]
     if len(body) > cap:
-        body = body[:cap]
+        body = _tail_keep_head(body, cap)
     out = body + "\n\n" + sources
     if len(out) > _SOURCES_EVENT_CAP:
         # 来源块本身超长（极少见）：只保留来源块，避免被正文挤掉
@@ -188,6 +246,43 @@ _BATCH_WORDS = ("所有角色", "全部角色", "每个角色", "批量", "全�
 # 收尾守卫（orchestrator._needs_action）用同一份词表，别再抄一份。
 ANALYZE_ONLY_WORDS = ("只分析", "不要改", "别改", "先别动", "不用改", "只看看", "别动代码")
 
+# 「只检查/只排查/先诊断」这类意图：用户要的是**一个结论（哪里有问题）**，不是立刻改。
+# 它们常带「检查/排查/诊断」等动词，会被误判成「动手改代码」——于是过程刹车刚开跑就催改、
+# 收尾时没改动就判 failed / 强制重做。这里单独识别：这一类走「先出结论、要动手等你点头」。
+# ⚠️ 只认明确的「只/先/别动」话术；裸「检查一下 X」仍按可能动手处理，避免把「检查完顺手修好」
+# 的需求误判成纯勘察（那会变得一样啰嗦）。
+INSPECT_ONLY_WORDS = (
+    "只检查", "仅检查", "只排查", "仅排查", "只诊断", "仅诊断",
+    "检查一下", "检查下", "排查一下", "排查下", "诊断一下", "诊断下",
+    "先检查", "先排查", "先诊断", "先定位", "找一下原因", "找出原因", "排查一下原因",
+    "检查一下原因", "定位一下", "帮我定位", "帮我找出", "先看看问题", "看看问题出在哪",
+    "检查问题", "排查问题", "看看什么问题", "什么问题", "是什么原因", "什么原因",
+    # 「帮我查一下/确认」这类口语化诊断：要的是原因，不是马上动手。
+    # 注意不收「帮我看看/看看为什么」——太宽泛，且与既有语义（「帮我看看为什么白屏」按动手指令）冲突。
+    "帮我查一下", "帮我查查", "帮我确认", "帮我核实", "帮我查下", "查一下为什么",
+    "在哪里", "在哪", "哪一块", "哪里出",
+)
+# 同一句里出现这些「明确让我改/修」的话术时，即便有检查/排查字样也按动手指令处理。
+_IMPERATIVE_FIX_WORDS = ("修复", "修好", "修一下", "帮我修", "给我修", "改好", "改一下",
+                         "帮我改", "给我改", "解决", "搞定", "弄好", "直接改", "直接修",
+                         "改成", "改为",
+                         "优化", "重构", "实现", "新增", "接入", "接上", "补上", "调整",
+                         "删掉", "加上", "换成", "换掉",
+                         "加个", "加一个", "加一下", "搞个", "做个", "做个", "写个", "建个",
+                         "去掉", "移除", "改成", "怎么改", "怎么加", "怎么弄")
+
+
+def wants_inspect_only(text: str) -> bool:
+    """用户只要「先检查/排查/诊断出问题」，而不是马上动手改。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if any(w in t for w in ANALYZE_ONLY_WORDS):
+        return True
+    if any(w in t for w in _IMPERATIVE_FIX_WORDS):
+        return False
+    return any(w in t for w in INSPECT_ONLY_WORDS)
+
 # 2026-10-28 会话「首页为啥还有滚动条」：疑问句里一个 _FIX_WORDS 都没有，刹车整段没
 # 启用，模型连着查了 84 轮、产品代码一行没改。用户问「为啥还有 X」不是在做学术提问，
 # 是在说 X 不该存在、把它弄掉。
@@ -287,7 +382,8 @@ def _is_fix_task(instruction: str) -> bool:
     tail = (instruction or "").strip()[-400:]
     if any(w in tail for w in _BATCH_WORDS):
         return False
-    if any(w in tail for w in ANALYZE_ONLY_WORDS):
+    # 只分析 / 只检查（要一个结论，不是马上改）：过程刹车不该催它动手。
+    if wants_inspect_only(tail):
         return False
     return any(w in tail for w in _FIX_WORDS) or is_symptom_complaint(tail)
 
@@ -1025,7 +1121,7 @@ class AgentRuntime:
             total_usage["calls"] += 1
             if resp.reasoning:
                 self._emit("agent_thinking", {"agent_key": self.role, "round": rnd,
-                                              "reasoning": resp.reasoning[:4000]})
+                                              "reasoning": _tail_keep_head(resp.reasoning, 4000)})
             if resp.text:
                 self._emit("agent_message", {"agent_key": self.role, "text": resp.text})
             if not resp.tool_calls:
@@ -1279,7 +1375,7 @@ class AgentRuntime:
             for tc in resp.tool_calls:
                 if tc.arguments_error:  # 混合轮里的坏调用：不参与死循环签名
                     continue
-                recent_sigs.append(f"{tc.name}:{json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)}")
+                recent_sigs.append(_call_signature(tc.name, tc.arguments))
             if len(recent_sigs) >= 3 and recent_sigs[-1] == recent_sigs[-2] == recent_sigs[-3]:
                 log.info("loop detected (3x identical tool call), finalizing early",
                          extra={"run_id": self.tctx.run_ctx.run_id})
@@ -1377,7 +1473,7 @@ class AgentRuntime:
         await self._record_llm_call(resp)
         if resp.reasoning:
             self._emit("agent_thinking", {"agent_key": self.role, "round": -1,
-                                          "reasoning": resp.reasoning[:4000]})
+                                          "reasoning": _tail_keep_head(resp.reasoning, 4000)})
         total_usage["prompt_tokens"] += resp.usage.get("prompt_tokens", 0)
         total_usage["completion_tokens"] += resp.usage.get("completion_tokens", 0)
         total_usage["cached_tokens"] += int(resp.usage.get("cached_tokens") or 0)

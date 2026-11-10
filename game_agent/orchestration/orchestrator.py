@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from game_agent.core.registry import get_agent_config
 from game_agent.agents.roles import ROLE_TOOLS
 from game_agent.agents.runtime import (
-    AgentResult, ANALYZE_ONLY_WORDS, is_symptom_complaint,
+    AgentResult, ANALYZE_ONLY_WORDS, is_symptom_complaint, wants_inspect_only,
 )
 from game_agent.agents.tools.question import AskUserStop
 from game_agent.config import (AUTO_CONTINUE_MAX, COMFYUI_BASE_URL, LOCK_TTL_S, LOCK_WAIT_S,
@@ -244,6 +244,9 @@ class Orchestrator:
         self._summaries: dict[str, str] = {}
         # 已落成聊天消息的回复（run_id, 正文）→ 幂等去重：同一段回复绝不重复落两条。
         self._posted_replies: set[tuple[str, str]] = set()
+        # 结构扫描缓存：workspace -> 指纹对应的纯结构块（不含技能块）。
+        # 指纹变了才重扫，避免每个 run 都全量递归列目录（P0 快赢，见 DESIGN-OPTIMIZATION §4.1）。
+        self._structure_cache: dict[str, str] = {}
 
     # ---------- 「只勘察不动手」守卫 ----------
     @staticmethod
@@ -253,6 +256,10 @@ class Orchestrator:
         if len(t) < 2:
             return False
         if any(k in t for k in _NO_ACTION_WORDS):
+            return False
+        # 「只检查/只排查/先诊断」这类意图：用户要的是一个结论（问题在哪），不是马上改。
+        # 不豁免它，就会被当成动手指令——只勘察后判 failed / 强制重做，越守规矩越被误伤。
+        if wants_inspect_only(t):
             return False
         if any(k in t for k in _READ_ONLY_MARKS):
             return False
@@ -385,16 +392,25 @@ class Orchestrator:
         elif continue_brief:
             # 无触发消息的续跑：从续跑说明里取回「上次请求原文」，用于素材意图/计划提示
             latest = self._brief_original_request(continue_brief)
-        hint = self._intent_hint(latest)
-        ask_hint = self._ask_hint(requirement_text=latest, full=requirement)
-        if hint:
-            requirement = f"{hint}\n\n---\n{requirement}"
-        elif ask_hint:
-            requirement = f"{ask_hint}\n\n---\n{requirement}"
+        # 只检查/只排查/先诊断：把这一轮按「只读诊断」跑——先给结论，要动手等用户点头。
+        # 只按 run_type==analyze 走才生效；用户显式要求修复/修改时 wants_inspect_only 为 False。
+        # 优先级高于素材预判：否则「检查一下配音为什么没声音」会被 _intent_hint 误路由成
+        # generate_audio（见 _AUDIO_WORDS 含「配音/语音」）。
+        inspect_only = (run.run_type != "analyze" and wants_inspect_only(latest))
+        if inspect_only:
+            run.run_type = "analyze"
+            requirement = f"{self._inspect_hint()}\n\n---\n{requirement}"
         else:
-            plan_hint = self._plan_hint(latest)
-            if plan_hint:
-                requirement = f"{plan_hint}\n\n---\n{requirement}"
+            hint = self._intent_hint(latest)
+            ask_hint = self._ask_hint(requirement_text=latest, full=requirement)
+            if hint:
+                requirement = f"{hint}\n\n---\n{requirement}"
+            elif ask_hint:
+                requirement = f"{ask_hint}\n\n---\n{requirement}"
+            else:
+                plan_hint = self._plan_hint(latest)
+                if plan_hint:
+                    requirement = f"{plan_hint}\n\n---\n{requirement}"
 
         run_ctx = RunContext(
             run_id=run_id, team_id=run.team_id, project_id=run.project_id,
@@ -417,7 +433,8 @@ class Orchestrator:
         usage: dict = {}  # 本轮已消耗的 token/延迟（收尾写 runs.usage_json）
         try:
             if run.run_type == "analyze":
-                await repo.update_run(run_id, status="running", worker_id=self.worker_id)
+                _extra = {"run_type": "analyze"} if inspect_only else {}
+                await repo.update_run(run_id, status="running", worker_id=self.worker_id, **_extra)
                 await self._emit(run_ctx, "status", {"status": "running"})
                 result = await self.run_agent("main", None, requirement, run_ctx, images=images)
                 usage = _merge_usage(usage, getattr(result, "usage", None))
@@ -1121,6 +1138,22 @@ class Orchestrator:
                     "生成一张", "生成图片", "抠图", "重绘", "海报", "美术资源")
 
     @classmethod
+    def _inspect_hint(cls) -> str:
+        """「只检查/只排查/先诊断」意图的前置硬提示。
+
+        用户要的是「问题在哪、为什么」这个结论，不是马上改。真跑起来后模型常会顺手改代码，
+        而这一轮被按 analyze（只读）跑——于是要么改不动、要么把半截改动留在工作区。
+        这里明确「只查不改、最后给结论与建议」，跟静默只读白名单呼应。
+        """
+        return (
+            "## 意图判定（系统预判，优先级最高）：本轮只排查、先不改\n"
+            "用户要的是**一个结论**（问题在哪、为什么、建议怎么改），不是立刻动手改。\n"
+            "本轮：只读代码/日志/配置，定位到根因，最后给出「结论 + 证据（文件:行号/日志原文）+ 建议改法」，"
+            "本轮**不要**修改任何文件、不要起服务改配置。\n"
+            "如果用户接着让你修，下一轮再动手改。"
+        )
+
+    @classmethod
     def _intent_hint(cls, text: str) -> str:
         """按用户这句话预判素材意图，生成前置硬提示（只放行"该生成就生成"）。
 
@@ -1638,11 +1671,41 @@ class Orchestrator:
 
     async def _structure_block(self, workspace, session_skills: list[str] | None = None) -> str:
         """实时扫描工作区生成项目代码结构摘要（不落库，永远新鲜），
-        注入编排上下文，让模型延续既有目录组织、技术栈与代码风格。"""
+        注入编排上下文，让模型延续既有目录组织、技术栈与代码风格。
+
+        缓存按「目录指纹」失效：顶层条目名 + 各子目录首层条目名 + 关键清单文件
+        的 (mtime,size)。子目录内部变化时顶层 mtime 不一定变，所以不能只看根 mtime；
+        同时扫描只列两级、代价很小，指纹比内容便宜一个数量级。
+        """
         import json as _json
         from pathlib import Path
 
         ws = Path(workspace)
+
+        def _fingerprint() -> str:
+            """顶层 + 各子目录首层条目名 + 关键文件 (mtime,size)。"""
+            try:
+                top = [(p.name, p.is_dir()) for p in ws.iterdir()]
+            except OSError:
+                return ""
+            parts = sorted(f"{n}:{1 if d else 0}" for n, d in top)
+            try:
+                for p in sorted(ws.iterdir(), key=lambda x: x.name.lower()):
+                    if not p.is_dir() or p.name.startswith(".") or p.name in _NOISE_DIRS:
+                        continue
+                    subs = [c.name for c in sorted(p.iterdir(), key=lambda c: c.name.lower())
+                            if not c.name.startswith(".") and c.name not in _NOISE_DIRS][:8]
+                    parts.append(f"{p.name}/[{','.join(subs)}]")
+            except OSError:
+                pass
+            for key in ("package.json", "requirements.txt", "pyproject.toml"):
+                f = ws / key
+                try:
+                    st = f.stat()
+                    parts.append(f"{key}:{st.st_mtime_ns}:{st.st_size}")
+                except OSError:
+                    parts.append(f"{key}:-")
+            return "|".join(parts)
 
         def _scan() -> list[str]:
             lines: list[str] = []
@@ -1698,12 +1761,30 @@ class Orchestrator:
             out.extend(lines)
             return out
 
-        try:
-            lines = await asyncio.to_thread(_scan)
-        except Exception:  # noqa: BLE001 - 结构注入失败不阻塞 run
-            log.exception("扫描项目结构失败")
-            lines = []
+        # 纯结构块按指纹缓存；技能块（下方）可能因 session_skills 或磁盘技能变化而不同，
+        # 每次都即时追加，不混进缓存值，避免「技能清空后仍返回旧技能」这类污染。
+        structure = ""
+        if ws.is_dir():
+            try:
+                fp = await asyncio.to_thread(_fingerprint)
+            except Exception:  # noqa: BLE001
+                fp = ""
+            cached = self._structure_cache.get(fp) if fp else None
+            if cached is not None:
+                structure = cached
+            else:
+                try:
+                    lines = await asyncio.to_thread(_scan)
+                except Exception:  # noqa: BLE001 - 结构注入失败不阻塞 run
+                    log.exception("扫描项目结构失败")
+                    lines = []
+                if lines:
+                    structure = "\n".join(lines) + "\n\n"
+                if fp:
+                    self._structure_cache[fp] = structure
+
         # 显式名单（含空名单）优先；默认提供项目技能和内置文档解析技能。
+        sk = ""
         if session_skills is not None:
             sk = await self._attached_skills_block(workspace, session_skills)
         else:
@@ -1713,9 +1794,7 @@ class Orchestrator:
                       if proj_skills else "")
             except Exception:  # noqa: BLE001
                 sk = ""
-        if sk:
-            lines = (lines or []) + [sk]
-        return ("\n".join(lines) + "\n\n") if lines else ""
+        return (structure or "") + (("\n" + sk + "\n") if sk else "")
 
     async def _memory_block(self, project_id: str, limit: int = 20) -> str:
         """项目记忆注入块（渐进式披露）：只给标题索引，正文让 agent 用 memory_read 取。

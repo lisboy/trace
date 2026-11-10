@@ -376,6 +376,7 @@ export default function ContextTrace({ runId, running }: { runId: string; runnin
     let alive = true;
     async function pull() {
       try {
+        if (document.hidden) return; // 页面隐藏时跳过轮询，回前台由 visibilitychange 立即补一次
         const r = await api.runTranscripts(runId);
         if (!alive) return;
         const items: TranscriptRound[] = r?.rounds || [];
@@ -391,9 +392,12 @@ export default function ContextTrace({ runId, running }: { runId: string; runnin
     setLoading(true);
     pull().finally(() => alive && setLoading(false));
     const timer = setInterval(pull, running ? 3000 : 15000);
+    const onVis = () => { if (!document.hidden) pull(); };
+    document.addEventListener("visibilitychange", onVis);
     return () => {
       alive = false;
       clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVis);
     };
   }, [runId, running]);
 

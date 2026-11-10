@@ -646,6 +646,9 @@ function WaitBadge({ at, stalled, waitingYou }: {
 function ThinkRowBase({ agent, text }: { agent: string; text: string }) {
   const [open, setOpen] = useState(false);
   const who = ROLE_LABEL[agent] || agent;
+  // 长思考折叠：摘要只显示前 200 字，避免一行把整段思考全铺开；细节点开再看全文。
+  const THINK_COLLAPSE = 200;
+  const long = text.length > THINK_COLLAPSE * 1.6;
   return (
     <div>
       <Line
@@ -656,7 +659,7 @@ function ThinkRowBase({ agent, text }: { agent: string; text: string }) {
       >
         <span className="font-medium text-violet-700">思考</span>
         <span className="text-slate-400"> · </span>
-        <span className="text-slate-600">{oneLine(text, 600)}</span>
+        <span className="text-slate-600">{oneLine(text, long ? THINK_COLLAPSE : 600)}</span>
       </Line>
       {open && (
         <Detail tone="think">
