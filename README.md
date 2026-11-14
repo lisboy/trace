@@ -111,6 +111,10 @@ AI 助手就会像一名真正的开发者那样**从读到写、从改到验**�
 
 ## 快速开始
 
+> 不想装环境？直接到 [Releases](https://github.com/lisboy/trace/releases/latest) 下载最新版的打包产物：
+> Windows 选 `Trace-win64-exe-*.zip`（内置运行时，解压双击 `start.cmd` 即用），
+> 已有 Python 3.12+ 的选 `Trace-lite-*` 精简包。
+
 ### 方式一：Windows 一键启动（lite）
 
 最简单的方式，无需手动装依赖：
@@ -197,11 +201,20 @@ package.cmd
 
 | 产物 | 目标环境 |
 |---|---|
-| `Trace-win64-exe-<ver>.zip` | Windows 单文件 exe，零安装（PyInstaller） |
-| `Trace-win64-lite-<ver>.zip` | Windows 便携版，目标机需 Python 3.12+ |
-| `Trace-lite-linux-<ver>.tar.gz` | Linux 便携包（bash 脚本启停） |
+| `Trace-win64-exe-<ver>-<时间戳>.zip` | Windows 免安装版，内置 Python 运行时，解压双击 `start.cmd` 即用（PyInstaller） |
+| `Trace-lite-win64-<ver>-<时间戳>.zip` | Windows 便携版，目标机需 Python 3.12+ |
+| `Trace-lite-linux-<ver>-<时间戳>.tar.gz` | Linux 便携包（bash 脚本启停），目标机需 Python 3.12+ |
 
 前端会在打包时统一构建一次，供三套产物复用。
+
+打好的包请上传到 GitHub Releases（`gh release create` 或 Releases 页面手动上传），
+每个包配同名 `.sha256`：
+
+```bat
+certutil -hashfile dist_release\Trace-win64-exe-<ver>-<时间戳>.zip SHA256
+```
+
+Windows 用户可用 `certutil -hashfile <包> SHA256`，Linux 用户用 `sha256sum -c <包>.sha256` 核对。
 
 ## 项目结构
 
