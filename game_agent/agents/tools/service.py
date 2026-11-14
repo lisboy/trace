@@ -347,20 +347,29 @@ def _persist_shot(p: Path, t: ToolContext) -> str:
 _REPEAT_VIEW_GAP = 4
 
 
-def _view_note(t: ToolContext, key: str) -> str:
-    """记下「这张图在第几次工具调用看过」，重复查看时改成一句节流提示。
+def _view_note(t: ToolContext, key: str, stamp: tuple[int, int] | None = None
+               ) -> tuple[str, bool]:
+    """记下「这张图在第几次工具调用看过」，重复查看时返回节流提示并标记 repeat。
 
-    每张回灌图都会留在后续所有轮次的上下文里，反复看同一张既不省钱也不出结论；
-    布局类判断本来有数值口径（溢出量是几个像素，不是"看着好像有一点点滚动条"）。
+    返回 (提示文本, 是否重复查看)。repeat=True 时调用方应**不再重复回灌像素**：上一轮
+    的图仍在上下文里（expire_viewback 保留最新一张），再灌一遍只是白烧一次 base64 编码
+    与一次往返，模型还会因为「又看到一张图」继续原地打转。stamp=(mtime_ns,size) 用于
+    判断文件是否真的变了——重建/重新出图后允许重看。
     """
     prev = t.last_view.get(key)
-    t.last_view[key] = t.call_seq
-    if prev is None or t.call_seq - prev >= _REPEAT_VIEW_GAP:
-        return ""
-    return (f"\n[这张图 {t.call_seq - prev} 次工具调用前刚看过。像素不会留到下一轮："
+    t.last_view[key] = t.call_seq if stamp is None else (t.call_seq, stamp)  # type: ignore[assignment]
+    if prev is None:
+        return "", False
+    prev_seq, prev_stamp = prev if isinstance(prev, tuple) else (prev, None)
+    if t.call_seq - prev_seq >= _REPEAT_VIEW_GAP:
+        return "", False
+    # 文件确实变了（重新出图 / 重新截图）→ 允许重看，不算重复
+    if stamp is not None and prev_stamp is not None and prev_stamp != stamp:
+        return "", False
+    return (f"\n[这张图 {t.call_seq - prev_seq} 次工具调用前刚看过且未变化。像素不会留到下一轮："
             "结论只有写进文件才会留下——美术判断写 .trace/art-review.md（一行一张图），"
             "页面问题用数值判定（run_command 跑一次 scrollHeight/clientHeight 对比），"
-            "别重新打开同一张图。]")
+            "别重新打开同一张图。]", True)
 
 
 def _resolve_local_image(url: str, ws: Path) -> Path | None:
@@ -420,10 +429,18 @@ async def view_image(args: dict, t: ToolContext) -> "ToolResult":
         rel = str(p.relative_to(t.workspace.resolve())).replace("\\", "/")
     except ValueError:
         rel = str(p)
+    note, repeat = _view_note(t, str(p), (p.stat().st_mtime_ns, size))
+    if repeat:
+        # 同一张图刚看过且没变化：不再回灌像素，逼模型基于已有画面下结论，省一次往返
+        return ToolResult(
+            text=(f"这张图（{rel}）刚才已看过且未变化，本次不再重复回灌像素。"
+                  "请直接依据上次看到的画面下结论，并把结论写进正文或 .trace/art-review.md；"
+                  "不要再次查看。" + note),
+            images=[],
+        )
     return ToolResult(
         text=(f"图片已附在本条消息中：{rel}（{size // 1024}KB）。"
-              "直接目视核对，不要靠读源码或猜。" + _view_note(t, str(p))
-              + _persist_shot(p, t)),
+              "直接目视核对，不要靠读源码或猜。" + note + _persist_shot(p, t)),
         images=[_to_data_url(p)],
     )
 
@@ -595,6 +612,6 @@ async def screenshot_page(args: dict, t: ToolContext) -> "ToolResult":
     return ToolResult(
         text=(f"截图已保存：{rel}（{width}x{height}，{size // 1024}KB）；"
               f"图片已附在本条消息中，请直接目视核对页面效果。"
-              + _view_note(t, str(out)) + _persist_shot(out, t)),
+              + _view_note(t, str(out))[0] + _persist_shot(out, t)),
         images=[_to_data_url(out)],
     )

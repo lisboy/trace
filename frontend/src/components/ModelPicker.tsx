@@ -51,7 +51,8 @@ function modelWindow(m: string | { context_window?: number } | null | undefined)
 /**
  * 输入框右下角的模型选择器（图三/图四样式）：
  * 胶囊按钮显示「模型名 + 推理等级」，点开是「模型 / 推理等级」两级面板。
- * 只选对话档位（kind=llm）；选择随会话记忆，没选过就跟随角色绑定的默认档位。
+ * 只选对话档位（kind=llm）；用户手点选择会由 Chat 写回「设置 → 智能体」的默认，
+ * 因此这里显示的「默认」就是角色默认档位与默认推理等级。
  */
 export default function ModelPicker({
   value,
@@ -69,6 +70,8 @@ export default function ModelPicker({
   const [profiles, setProfiles] = useState<ProfileRow[]>([]);
   const [providers, setProviders] = useState<ProviderRow[]>([]);
   const [defaultKey, setDefaultKey] = useState<string>("");
+  /** 角色默认推理等级（agents.params_json.reasoning_effort）：空 = 端点默认 */
+  const [defaultEffort, setDefaultEffort] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [profilesReady, setProfilesReady] = useState(false);
   const [pendingModel, setPendingModel] = useState<string>("");
@@ -87,6 +90,7 @@ export default function ModelPicker({
       setProviders(Array.isArray(pv?.providers) ? pv.providers : []);
       const main = (ag?.agents || []).find((a: any) => a.key === "main");
       setDefaultKey(main?.model_profile_key || "");
+      setDefaultEffort(String(main?.params_json?.reasoning_effort || ""));
     });
   };
 
@@ -114,6 +118,7 @@ export default function ModelPicker({
       setProviders(Array.isArray(pv?.providers) ? pv.providers : []);
       const main = (ag?.agents || []).find((a: any) => a.key === "main");
       setDefaultKey(main?.model_profile_key || "");
+      setDefaultEffort(String(main?.params_json?.reasoning_effort || ""));
     });
     return () => { dead = true; };
   }, [open]);
@@ -141,7 +146,12 @@ export default function ModelPicker({
   const effectiveKey = value.profile || defaultKey;
   const current = llmProfiles.find((p) => p.key === effectiveKey) || null;
   const modelLabel = current?.model || current?.label || (loading ? "加载中…" : "默认模型");
-  const effortLabel = EFFORTS.find((e) => e.v === value.effort)?.t || "Default";
+  const effortText = (v: string) => EFFORTS.find((e) => e.v === v)?.t || "Default";
+  // 没单独选推理等级时不再显示成「Default」：那会让人以为走的是端点默认，
+  // 实际走的是设置页里角色默认的等级（聊天里切换会写回那里）。
+  const effortLabel = value.effort
+    ? effortText(value.effort)
+    : defaultEffort ? `默认（${effortText(defaultEffort)}）` : "Default";
 
   // 供应商/档位被删后，localStorage 里可能还留着旧 key：继续带着它发消息会被后端
   // 以「所选模型档位不存在」拒绝。这里发现档位已不存在就清回「跟随默认」，避免卡死。
@@ -184,6 +194,10 @@ export default function ModelPicker({
   })();
 
   const pick = (patch: Partial<ModelChoice>) => {
+    // Chat 会把这次选择写回角色默认（模型 + 推理等级），这里先本地跟上，
+    // 免得胶囊上的「默认（X）」还停在切换前的旧值。
+    if (patch.profile) setDefaultKey(patch.profile);
+    if (patch.effort !== undefined) setDefaultEffort(patch.effort);
     onChange({ ...value, ...patch });
     setOpen(false);
     setSub(null);
@@ -218,7 +232,7 @@ export default function ModelPicker({
             ? "border-brand-400 bg-brand-50 text-brand-700"
             : "border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100"
         }`}
-        title="选择模型与推理等级（按会话记住）"
+        title="选择模型与推理等级（同时写回「设置 → 智能体」的默认）"
         aria-haspopup="listbox"
         aria-expanded={open}
         disabled={disabled}
@@ -344,14 +358,18 @@ export default function ModelPicker({
                   className={`w-full text-left rounded px-2 py-1.5 text-[12px] hover:bg-white ${value.effort === e.v ? "text-brand-700 font-medium" : "text-slate-600"}`}
                   onClick={() => pick({ effort: e.v })}
                 >
-                  {e.t}
+                  {e.v ? e.t : "Default（不指定，走端点默认）"}
                 </button>
               ))}
+              <div className="px-2 pt-1 text-[10px] text-slate-400">
+                当前角色默认：
+                {defaultEffort ? effortText(defaultEffort) : "未指定（端点默认）"}
+              </div>
             </div>
           )}
 
           <div className="px-2 pt-1 pb-0.5 text-[10px] text-slate-400">
-            选择按会话记住；「Default」= 模型档位自带的推理强度。
+            选完会同步写回「设置 → 智能体」的默认模型与推理等级，没单独选过的会话也跟着生效。
           </div>
         </div>
       )}

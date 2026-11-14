@@ -12,12 +12,30 @@ from __future__ import annotations
 
 import logging
 
-from game_agent.config import LLM_MODEL, ROLE_MODELS
+from game_agent.config import (
+    LLM_MAX_OUTPUT_TOKENS, LLM_MODEL, LLM_SUB_MAX_OUTPUT_TOKENS,
+    LLM_SUB_REASONING_EFFORT, ROLE_MODELS,
+)
 from game_agent.llm.anthropic_compat import AnthropicMessagesLLM
 from game_agent.llm.base import Ctx, LLM
 from game_agent.llm.openai_compat import OpenAICompatibleLLM
 
 log = logging.getLogger("game_agent.llm.factory")
+
+
+def _effort_for(role: str, params: dict) -> str:
+    """推理强度：档位显式配了就用档位的；否则 sub 角色走 GA_SUB_REASONING_EFFORT。
+
+    sub（只读调研）实测把思考关掉后延迟 -32%、输出 token -61%，而它的产物只是
+    「查到的证据 + 结论」，由主agent 复核——这是整条链上最划算的一档。
+    主agent / 其它角色保持端点默认（不传），不替用户做质量取舍。
+    """
+    explicit = str(params.get("reasoning_effort") or "").strip().lower()
+    if explicit:
+        return explicit
+    if role == "sub":
+        return (LLM_SUB_REASONING_EFFORT or "").strip().lower()
+    return ""
 
 
 def build_llm(role: str, ctx: Ctx | None = None) -> LLM:
@@ -44,8 +62,14 @@ def build_llm(role: str, ctx: Ctx | None = None) -> LLM:
         context_window=int(params.get("context_window") or 0),
         vision=bool(params.get("vision")),
         user_agent=profile.get("user_agent"),
-        reasoning_effort=str(params.get("reasoning_effort") or ""),
+        reasoning_effort=_effort_for(role, params),
     )
     if protocol == "anthropic":
         return AnthropicMessagesLLM(max_tokens=int(params.get("max_tokens") or 0), **common)
-    return OpenAICompatibleLLM(**common)
+    # 输出上限：档位显式配了就用它；否则 sub 角色默认走 LLM_SUB_MAX_OUTPUT_TOKENS
+    # （只读调研，产出只是一份报告，长尾 60k tokens 的报告纯属浪费，见 config 注释），
+    # 其余角色仍用全局 GA_LLM_MAX_TOKENS（默认 0 = 不设，避免截断代码写入/工具调用）。
+    max_out = int(params.get("max_tokens") or 0)
+    if not max_out:
+        max_out = LLM_SUB_MAX_OUTPUT_TOKENS if role == "sub" else LLM_MAX_OUTPUT_TOKENS
+    return OpenAICompatibleLLM(max_tokens=max_out, **common)

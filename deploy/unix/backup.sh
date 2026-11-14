@@ -15,10 +15,6 @@ for d in "$PROJECTS_ROOT"/*/; do
   git -C "$d" bundle create "$BACKUP_DIR/${name}-${STAMP}.bundle" --all
 done
 
-echo "[backup] 数据库快照"
-if [ "${GA_MODE:-lite}" = "lite" ]; then
-  cp "${DATA_DIR:-$HOME/.trace}/game_agent.db" "$BACKUP_DIR/game_agent-${STAMP}.db" 2>/dev/null || true
-else
-  pg_dump "${DATABASE_URL}" > "$BACKUP_DIR/game_agent-${STAMP}.sql"
-fi
+echo "[backup] 数据库快照（SQLite）"
+cp "${DATA_DIR:-$HOME/.trace}/game_agent.db" "$BACKUP_DIR/game_agent-${STAMP}.db" 2>/dev/null || true
 echo "[backup] 完成 -> $BACKUP_DIR"

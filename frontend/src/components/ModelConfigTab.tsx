@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { api } from "../api";
 
 /** 模型配置：供应商（地址 + 密钥 + UA）只在这里存一次，
@@ -89,11 +90,12 @@ function modelName(m: string | ProviderModel | null | undefined): string {
   return typeof m === "string" ? m : (m.name || "");
 }
 
-/** 新模型的默认上下文窗口：128k，避免输入框空着、运行时按最小窗口保守压缩 */
-const DEFAULT_WINDOW = 128000;
+/** 新模型的默认上下文窗口：256k（2026-11-14 用户要求所有模型默认 256k），
+ *  避免输入框空着、运行时按更小的窗口保守压缩 */
+const DEFAULT_WINDOW = 256000;
 
-/** 解析窗口输入：接受 128000 这样的原始 token 数，也接受 128k / 256k / 1M / 1.5m 简写。
- *  k=1000、m=1000000（与业界标称的 128k / 1M 对齐）。无法解析返回 NaN。 */
+/** 解析窗口输入：接受 256000 这样的原始 token 数，也接受 256k / 1M / 1.5m 简写。
+ *  k=1000、m=1000000（与业界标称的 256k / 1M 对齐）。无法解析返回 NaN。 */
 function parseWindow(raw: string): number {
   const s = raw.trim().toLowerCase().replace(/[,\s_]/g, "");
   if (!s) return 0;
@@ -104,7 +106,7 @@ function parseWindow(raw: string): number {
   return Math.round(num * mult);
 }
 
-/** 把 token 数回显成简写：128000 → 128k、1000000 → 1M、131072 → 131.07k */
+/** 把 token 数回显成简写：256000 → 256k、1000000 → 1M、131072 → 131.07k */
 function windowText(n: number): string {
   if (!n) return "";
   if (n >= 1_000_000) return `${+(n / 1_000_000).toFixed(2)}M`;
@@ -117,7 +119,7 @@ function windowLabel(n: number): string {
   return `${windowText(n)} 窗口`;
 }
 
-/** 上下文窗口输入框：边输边解析，支持 128000 或 128k / 256k / 1M 简写。
+/** 上下文窗口输入框：边输边解析，支持 256000 或 256k / 1M 简写。
  *  编辑期间不打断用户输入，失焦后再统一回显成简写（如 1.5m → 1.5M）。 */
 function WindowInput({ value, onCommit }: { value: number; onCommit: (n: number) => void }) {
   const [draft, setDraft] = useState(value ? windowText(value) : "");
@@ -131,7 +133,7 @@ function WindowInput({ value, onCommit }: { value: number; onCommit: (n: number)
     <div className="flex items-center gap-1.5 shrink-0">
       <input
         className={`border rounded px-2 py-1 text-xs w-28 ${bad ? "border-red-400 bg-red-50" : ""}`}
-        placeholder="如 128k / 256k / 1M"
+        placeholder="如 256k / 1M"
         value={draft}
         onFocus={() => setEditing(true)}
         onChange={(e) => {
@@ -181,6 +183,9 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
   const [pvErr, setPvErr] = useState("");
   const [pulling, setPulling] = useState("");
   const [pullMsg, setPullMsg] = useState("");
+  const [speedTesting, setSpeedTesting] = useState(false);
+  const [speedRes, setSpeedRes] = useState<Record<string, any>>({});
+  const [speedMsg, setSpeedMsg] = useState("");
   // 模型多的供应商默认只展示前 10 个，可展开看全量目录（「罗列所有可加载模型」）
   const [modelsExpanded, setModelsExpanded] = useState<Record<string, boolean>>({});
   const provFormRef = useRef<HTMLDivElement>(null);
@@ -248,7 +253,7 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
   }
 
   function modelWindowFor(r: LlmProviderRow, m: ProviderModel): number {
-    return Number(m?.context_window) || profileWindowFor(r, modelName(m));
+    return Number(m?.context_window) || profileWindowFor(r, modelName(m)) || DEFAULT_WINDOW;
   }
 
   function modelVisionFor(r: LlmProviderRow, m: ProviderModel): boolean {
@@ -267,6 +272,8 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
 
   function openProvForm(r?: LlmProviderRow) {
     setPvErr("");
+    setSpeedRes({});
+    setSpeedMsg("");
     setProvForm(r ? r.id : "new");
     setPv({
       key: r?.key || "", label: r?.label || "",
@@ -275,7 +282,7 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
       enabled: r ? r.enabled : true, keyHint: r?.has_key ? (r.key_hint || "") : "",
       models: (r?.models || []).map((m) => ({
         name: modelName(m),
-        context_window: Number(m?.context_window) || (r ? profileWindowFor(r, modelName(m)) : 0),
+        context_window: Number(m?.context_window) || (r ? profileWindowFor(r, modelName(m)) : 0) || DEFAULT_WINDOW,
         vision: !!(m as any)?.vision || (r ? profileVisionFor(r, modelName(m)) : false),
       })),
     });
@@ -299,7 +306,9 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
   async function saveProv() {
     setPvErr("");
     const models = pv.models
-      .map((m) => ({ name: (m.name || "").trim(), context_window: Number(m.context_window) || 0, vision: !!m.vision }))
+      // 空窗口按默认 256k 落库（不是 0）：0 会让这一行显示「窗口未设」，
+      // 而运行时又按默认值算预算，两边口径不一致
+      .map((m) => ({ name: (m.name || "").trim(), context_window: Number(m.context_window) || DEFAULT_WINDOW, vision: !!m.vision }))
       .filter((m) => m.name);
     const body: Record<string, any> = {
       // 本产品当前适配 OpenAI 兼容与 Anthropic 两种协议；历史数据里残留的
@@ -340,7 +349,7 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
             base_url: usedBase || cur.base_url,
             models: list.map((m) => ({
               name: modelName(m),
-              context_window: Number(m?.context_window) || Number(old.get(modelName(m))?.context_window) || 0,
+              context_window: Number(m?.context_window) || Number(old.get(modelName(m))?.context_window) || DEFAULT_WINDOW,
               vision: !!(m as any)?.vision || !!old.get(modelName(m))?.vision,
             })),
           };
@@ -354,6 +363,73 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
       setPullMsg(e?.message || "拉取失败");
     } finally {
       setPulling("");
+    }
+  }
+
+  /** 新建表单的拉取：不落库，直接用表单里填的地址/密钥/协议请求端点，结果并进表单 */
+  async function pullPvForm() {
+    if (!pv.base_url.trim()) { setPullMsg("先填 Base URL 再拉取"); return; }
+    setPulling("new");
+    setPullMsg("");
+    try {
+      const res = await api.llmModels({
+        baseUrl: pv.base_url.trim(),
+        apiKey: pv.api_key,
+        protocol: pv.protocol,
+      });
+      const list = (res.models || []) as ProviderModel[];
+      const usedBase: string = res?.base_url || "";
+      const autoFixed = !!usedBase && usedBase.replace(/\/+$/, "") !== pv.base_url.trim().replace(/\/+$/, "");
+      setPv((cur) => {
+        const old = new Map(cur.models.map((m) => [modelName(m), m]));
+        return {
+          ...cur,
+          base_url: usedBase || cur.base_url,
+          key: !cur.key && usedBase ? slugFromUrl(usedBase) : cur.key,
+          models: list.map((m) => ({
+            name: modelName(m),
+            context_window: Number(m?.context_window) || Number(old.get(modelName(m))?.context_window) || DEFAULT_WINDOW,
+            vision: !!(m as any)?.vision || !!old.get(modelName(m))?.vision,
+          })),
+        };
+      });
+      setPullMsg(`已拉取 ${list.length} 个模型`
+        + (autoFixed ? `（地址自动用了可用的 ${usedBase}）` : "")
+        + "（记得点保存）");
+    } catch (e: any) {
+      setPullMsg(e?.message || "拉取失败");
+    } finally {
+      setPulling("");
+    }
+  }
+
+  /** 一键测速：对当前表单目录里的每个模型发短请求，结果标在模型行上 */
+  async function speedTestPv() {
+    const names = pv.models.map((m) => (m.name || "").trim()).filter(Boolean);
+    if (!names.length) { setSpeedMsg("模型目录是空的，先拉取或添加模型"); return; }
+    setSpeedTesting(true);
+    setSpeedMsg("");
+    setSpeedRes(Object.fromEntries(names.map((n) => [n, { pending: true }])));
+    try {
+      const res: any = await api.llmSpeedTest({
+        providerId: provForm !== "new" ? (provForm || undefined) : undefined,
+        baseUrl: pv.base_url.trim(),
+        apiKey: provForm === "new" ? pv.api_key : "",
+        protocol: pv.protocol,
+        models: names,
+      });
+      const map: Record<string, any> = {};
+      for (const r of res.results || []) map[r.model] = r;
+      setSpeedRes(map);
+      const ok = (res.results || []).filter((r: any) => r.ok);
+      setSpeedMsg(ok.length
+        ? `已测 ${ok.length}/${names.length} 个（计时含首字等待；推理模型的思考 token 也算产出）`
+        : (res.results?.[0]?.error || "全部失败"));
+    } catch (e: any) {
+      setSpeedRes({});
+      setSpeedMsg(e?.message || "测速失败");
+    } finally {
+      setSpeedTesting(false);
     }
   }
 
@@ -460,7 +536,8 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
             <div className="col-span-2 flex items-center gap-2">
               <input
                 className="border rounded px-2 py-1 flex-1 mono text-xs"
-                type={showKey ? "text" : "password"}
+                type="text"
+                style={showKey ? undefined : { WebkitTextSecurity: "disc" } as React.CSSProperties}
                 placeholder={pv.keyHint ? `已存 ${pv.keyHint}｜留空不改，粘贴新密钥覆盖`
                   : "API Key（留空=不改；本地无鉴权端点可不填）"}
                 value={pv.api_key}
@@ -506,18 +583,32 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
                 <span className="text-xs font-medium text-slate-700">模型目录</span>
                 <span className="text-[11px] text-slate-400">每个模型单独设上下文窗口；对话里选中即建档位，点模型名可直接编辑窗口</span>
                 <div className="ml-auto flex items-center gap-1.5">
-                  {provForm !== "new" && (
-                    <button type="button" className="ga-btn ga-btn-secondary ga-btn-sm"
-                      onClick={() => { const r = provOf(provForm || ""); if (r) pullFor(r); }}
-                      disabled={pulling === provForm}>
-                      {pulling === provForm ? "拉取中…" : "拉取模型"}
-                    </button>
-                  )}
+                  <button type="button" className="ga-btn ga-btn-secondary ga-btn-sm"
+                    onClick={speedTestPv}
+                    disabled={speedTesting || pv.models.every((m) => !(m.name || "").trim())}
+                    title="给目录里每个模型发一条短请求，测产出速度（tokens/秒）。未保存的供应商也能测（用表单里填的地址和密钥）。">
+                    {speedTesting ? "测速中…" : "一键测速"}
+                  </button>
+                  <button type="button" className="ga-btn ga-btn-secondary ga-btn-sm"
+                    onClick={() => {
+                      if (provForm === "new") { pullPvForm(); return; }
+                      const r = provOf(provForm || "");
+                      if (r) pullFor(r);
+                    }}
+                    disabled={!!pulling}
+                    title={provForm === "new" ? "用表单里填的地址和密钥直接请求端点，拉取模型列表（不落库，保存时才写入）" : undefined}>
+                    {pulling === provForm ? "拉取中…" : "拉取模型"}
+                  </button>
                   <button type="button" className="ga-btn ga-btn-secondary ga-btn-sm" onClick={addPvModel}>
                     + 添加模型
                   </button>
                 </div>
               </div>
+              {(speedMsg || speedTesting) && (
+                <div className={`text-[11px] mb-1 ${speedMsg.includes("失败") || speedMsg.includes("错误") ? "text-red-600" : "text-slate-500"}`}>
+                  {speedTesting ? "正在逐个模型发短请求测速（约几十秒，取决于最慢的模型）…" : speedMsg}
+                </div>
+              )}
               {pv.models.length === 0 && (
                 <div className="text-[11px] text-slate-400 py-1">
                   还没有模型。点「拉取模型」从端点同步，或「+ 添加模型」手填模型名。
@@ -546,6 +637,21 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
                     />
                     看图
                   </label>
+                  {(() => {
+                    const sr = speedRes[(m.name || "").trim()];
+                    if (!sr) return null;
+                    if (sr.pending) return <span className="text-[11px] text-slate-400 shrink-0 w-24 text-right">测速中…</span>;
+                    if (!sr.ok) return (
+                      <span className="text-[11px] text-red-600 shrink-0 max-w-40 truncate" title={sr.error}>失败</span>
+                    );
+                    return (
+                      <span className="text-[11px] shrink-0 w-24 text-right whitespace-nowrap"
+                        title={`${sr.completion_tokens} tokens / ${(sr.latency_ms / 1000).toFixed(1)}s（含首字等待）`}>
+                        <span className="text-emerald-700 font-medium">{sr.tok_per_s} t/s</span>
+                        <span className="text-slate-400"> · {(sr.latency_ms / 1000).toFixed(1)}s</span>
+                      </span>
+                    );
+                  })()}
                   <button type="button" className="ga-btn ga-btn-danger ga-btn-sm shrink-0"
                     onClick={() => removePvModel(i)}>删除</button>
                 </div>
@@ -683,9 +789,10 @@ export default function ModelConfigTab({ profiles, providers, refresh }: Props) 
             <input className="border rounded px-2 py-1" placeholder="音色（voice，可选，如 alloy）" value={pf.voice}
               onChange={(e) => setPf({ ...pf, voice: e.target.value })} />
           )}
-          <input className="border rounded px-2 py-1 col-span-2" placeholder="Base URL（媒体档位必填，如 http://127.0.0.1:8188）"
+          <input className="border rounded px-2 py-1 col-span-2" placeholder="Base URL（媒体档位必填，如 http://127.0.0.1:10188）"
             value={pf.base_url} onChange={(e) => setPf({ ...pf, base_url: e.target.value })} />
-          <input className="border rounded px-2 py-1 col-span-2 mono text-xs" type={showKey ? "text" : "password"}
+          <input className="border rounded px-2 py-1 col-span-2 mono text-xs" type="text"
+            style={showKey ? undefined : { WebkitTextSecurity: "disc" } as React.CSSProperties}
             placeholder="API Key（本地 ComfyUI 不用填）" value={pf.api_key}
             autoComplete="off" spellCheck={false}
             onPaste={(e) => {

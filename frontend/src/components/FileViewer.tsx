@@ -7,7 +7,7 @@
  * 图片/音频/PDF 直接内嵌、Markdown 走 Markdown 渲染、其余文本按纯文本带行号显示。
  * 删掉的文件自动改看「改动前快照」，不会看到 404。
  */
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
 import type { DiffRow } from "../diff";
@@ -73,6 +73,124 @@ function CodeText({ text }: { text: string }) {
   );
 }
 
+/** Markdown 预览 + 左侧目录。
+ *  目录不从源码正则提取，而是渲染后从 DOM 里抓真实 h1~h4（顺序、层级、去重 slug 与正文
+ *  天然一致，代码块里的 # 井号也不会误收）。点击平滑滚动到对应标题；滚动时高亮当前章节。
+ *  没有标题（或只有 1 个）时不显示目录，正文铺满。
+ */
+function MarkdownWithToc({ text }: { text: string }) {
+  const contentRef = useRef<HTMLDivElement>(null);
+  // id -> 标题元素。id 由标题文本生成，可能含中文/引号等，不能走全局 getElementById
+  // （既怕转义出错，也怕和页面其他 DOM 撞 id），直接持有元素引用最稳。
+  const headingEls = useRef<Map<string, HTMLElement>>(new Map());
+  const [headings, setHeadings] = useState<{ id: string; text: string; level: number }[]>([]);
+  const [activeId, setActiveId] = useState("");
+
+  // Markdown 渲染完成后扫一遍标题。依赖 text：内容变了目录跟着重建。
+  useEffect(() => {
+    const root = contentRef.current;
+    if (!root) return;
+    const hs = Array.from(root.querySelectorAll("h1, h2, h3, h4")) as HTMLElement[];
+    const map = new Map<string, HTMLElement>();
+    if (!hs.length) {
+      headingEls.current = map;
+      setHeadings([]);
+      return;
+    }
+    const seen = new Map<string, number>();
+    const items = hs.map((el) => {
+      const base = (el.textContent || "").trim() || "（无标题）";
+      let id = base;
+      // 同名标题去重：-1、-2 递增，保证定位不串
+      const n = seen.get(base) ?? 0;
+      seen.set(base, n + 1);
+      if (n > 0) id = `${base}-${n}`;
+      el.id = id;
+      map.set(id, el);
+      return { id, text: base, level: Number(el.tagName[1]) };
+    });
+    headingEls.current = map;
+    setHeadings(items);
+  }, [text]);
+
+  // 滚动高亮：正文面板自己就是滚动容器（contentRef），找判定线之上最近的一个标题。
+  useEffect(() => {
+    if (!headings.length) return;
+    const scroller = contentRef.current;
+    if (!scroller) return;
+    const onScroll = () => {
+      const top = scroller.getBoundingClientRect().top + 40; // 视觉判定线
+      let cur = "";
+      for (const h of headings) {
+        const el = headingEls.current.get(h.id);
+        if (!el) continue;
+        if (el.getBoundingClientRect().top <= top) cur = h.id;
+      }
+      setActiveId(cur);
+    };
+    onScroll();
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    return () => scroller.removeEventListener("scroll", onScroll);
+  }, [headings]);
+
+  const scrollTo = (id: string) => {
+    const el = headingEls.current.get(id);
+    if (!el) return;
+    setActiveId(id); // 点击即高亮，不等 scroll 事件
+    const panel = contentRef.current;
+    const startY = panel ? panel.scrollTop : 0;
+    el.scrollIntoView({ behavior: "smooth", block: "start" });
+    // 无合成器的环境（headless / 部分远程桌面）里 smooth 会静默不动：
+    // 300ms 后 scrollTop 仍原地就退回瞬时跳转，保证点击目录永远有反应。
+    window.setTimeout(() => {
+      const p = contentRef.current;
+      if (!p) return;
+      if (Math.abs(p.scrollTop - startY) < 4) {
+        el.scrollIntoView({ behavior: "auto", block: "start" });
+      }
+    }, 300);
+  };
+
+  // 结构保持稳定（nav 常驻、空时隐藏），避免「有标题后插入目录栏」导致 React 重建
+  // 正文节点、effect 里抓到的标题元素引用全部失效。
+  return (
+    <div className="flex h-full min-h-0">
+      <nav
+        className={`w-56 shrink-0 overflow-y-auto border-r border-slate-100 bg-slate-50/60 px-2 py-3 ${
+          headings.length ? "" : "hidden"
+        }`}
+      >
+        <div className="px-2 pb-1.5 text-[10.5px] font-medium tracking-wide text-slate-400">
+          目录
+        </div>
+        {headings.map((h) => (
+          <a
+            key={h.id}
+            href={`#${encodeURIComponent(h.id)}`}
+            onClick={(e) => {
+              e.preventDefault();
+              scrollTo(h.id);
+            }}
+            className={`block truncate rounded px-2 py-1 text-[11.5px] leading-snug transition-colors ${
+              activeId === h.id
+                ? "bg-brand-50 font-medium text-brand-700"
+                : "text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+            }`}
+            style={{ paddingLeft: `${(h.level - 1) * 10 + 8}px` }}
+            title={h.text}
+          >
+            {h.text}
+          </a>
+        ))}
+      </nav>
+      {/* 正文：自己就是滚动容器（供滚动高亮监听） */}
+      <div ref={contentRef} className="min-w-0 flex-1 overflow-y-auto p-5">
+        <Markdown text={text} />
+      </div>
+    </div>
+  );
+}
+
 export default function FileViewer({
   runId,
   file,
@@ -96,6 +214,7 @@ export default function FileViewer({
   const [data, setData] = useState<any>(null);
   const [showOrig, setShowOrig] = useState(deleted);
 
+  const [revealErr, setRevealErr] = useState("");
   const rawUrl = useMemo(() => api.runFileRawUrl(runId, file.path), [runId, file.path]);
   const kind: string = data?.kind || file.preview || "text";
   // 图片/音频/PDF 用 blob 取（<img>/<audio>/<iframe> 发不出 Authorization 头，换 cookie 名的
@@ -221,11 +340,7 @@ export default function FileViewer({
       );
     }
     if (kind === "markdown") {
-      return (
-        <div className="p-5">
-          <Markdown text={data.content || ""} />
-        </div>
-      );
+      return <MarkdownWithToc text={data.content || ""} />;
     }
     if (!data.content) {
       return <div className="p-6 text-[12px] text-slate-400">（空文件）</div>;
@@ -257,14 +372,26 @@ export default function FileViewer({
             {STATUS_TEXT[file.status] || file.status}
           </span>
           <div className="min-w-0 flex-1">
-            <div className="mono truncate text-[12.5px] text-slate-800" title={file.path}>
+            <button
+              className="mono block max-w-full truncate text-left text-[12.5px] text-slate-800 hover:text-brand-600 hover:underline"
+              title={`${file.path}（点击在文件管理器中定位）`}
+              onClick={async () => {
+                setRevealErr("");
+                try {
+                  await api.runReveal(runId, file.path);
+                } catch {
+                  setRevealErr("定位失败（文件可能已回滚或不在工作区内）");
+                }
+              }}
+            >
               {file.path}
-            </div>
+            </button>
             <div className="mt-0.5 flex items-center gap-2 text-[11px] text-slate-400">
               {!!file.added && <span className="text-emerald-600">+{file.added}</span>}
               {!!file.deleted && <span className="text-rose-500">−{file.deleted}</span>}
               {!!file.size && <span>{fmtSize(file.size)}</span>}
               <span>{ext(file.path) || "无扩展名"}</span>
+              {revealErr && <span className="text-rose-500">{revealErr}</span>}
             </div>
           </div>
           {onRevert && file.status !== "deleted" && (

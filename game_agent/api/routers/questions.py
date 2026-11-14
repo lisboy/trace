@@ -1,8 +1,10 @@
 ﻿"""提问机制 API：组长「拿不准就问」的问题列表 / 作答。
 
-作答语义：把用户的答案作为一条 **user 消息** 写进同一会话，并重新入队一个 run——
-组长会被带着这条答案重新唤起（会话历史会注入），相当于「从刚才那步继续」。
-这样不会有一个 worker 被"等人回答"长期占住（worker 池只有 3 个）。
+作答语义（2026-11-10 起）：
+- **同一 run 内暂停**（默认）：组长提问后并没有结束本轮，而是在进程内挂起等回答。
+  作答时直接唤醒那个 run，它带着答案接着往下做——计划、轨迹、对话都还在同一条里。
+- **回退路径**（服务重启过 / 多进程 server 模式 / run 已不在）：拿不到进程内等待者，
+  就把答案作为一条 user 消息写进同一会话并重新入队一个 run，组长带着答案重跑续上。
 """
 from __future__ import annotations
 
@@ -113,31 +115,65 @@ async def answer_question(question_id: str, body: AnswerIn,
         q.answered_at = _now()
         sess.last_active = _now()  # 回答也算会话活跃：侧栏排序/相对时间即时刷新
 
-        # 答案作为一条 user 消息写进会话（组长重新被唤起时能在历史里看到）
-        msg = Message(session_id=sess.id, run_id=None, author_type="user",
-                      author_id=_u(ctx.user_id),
-                      content=f"【回答】{text}" if q.question else text,
-                      meta_json={"kind": "answer", "question_id": str(q.id),
-                                 "option_index": idx})
-        s.add(msg)
-        await s.flush()
-        await s.refresh(msg)
+        # 优先走「同一 run 内暂停」：原子地「取走」这个问题的在途 future（避免竞态），
+        # 命中则不新起 run —— 计划、轨迹、对话都留在同一条 run 里（用户 2026-11-10 要求）。
+        fut = None
+        try:
+            orch = state.orchestrator
+            if orch is not None:
+                fut = orch.take_question(str(q.id))
+        except Exception:  # noqa: BLE001 - 探测失败按回退处理
+            fut = None
+        inline = fut is not None
 
-        run = Run(team_id=_u(ctx.team_id), project_id=sess.project_id,
-                  session_id=sess.id, triggered_by=_u(ctx.user_id),
-                  trigger_msg_id=msg.id, run_type=cont_run_type,
-                  # 沿用提问那条 run 的模型/推理等级与能力开关（否则回答后模型悄悄换回默认）
-                  options_json=dict(origin.options_json or {}) if origin else None,
-                  status="queued")
-        s.add(run)
-        await s.commit()
-        await s.refresh(run)
-        run_id = str(run.id)
-        session_id = str(sess.id)
+        if inline:
+            # 同 run 续跑：答案落一条 user 消息挂在该 run 上（轨迹里能看到「我回答了什么」），
+            # 不新建 run。提交后唤醒挂起的协程。
+            msg = Message(session_id=sess.id, run_id=(origin.id if origin else None),
+                          author_type="user", author_id=_u(ctx.user_id),
+                          content=text,
+                          meta_json={"kind": "answer", "question_id": str(q.id),
+                                     "option_index": idx})
+            s.add(msg)
+            run_id = str(origin.id) if origin else None
+            session_id = str(sess.id)
+            await s.commit()
+        else:
+            # 回退路径：起新 run 续跑（服务重启/多进程/旧数据）。答案作为一条 user 消息
+            # 写进会话（组长重新被唤起时能在历史里看到）。
+            msg = Message(session_id=sess.id, run_id=None, author_type="user",
+                          author_id=_u(ctx.user_id),
+                          content=f"【回答】{text}" if q.question else text,
+                          meta_json={"kind": "answer", "question_id": str(q.id),
+                                     "option_index": idx})
+            s.add(msg)
+            await s.flush()
+            await s.refresh(msg)
+            run = Run(team_id=_u(ctx.team_id), project_id=sess.project_id,
+                      session_id=sess.id, triggered_by=_u(ctx.user_id),
+                      trigger_msg_id=msg.id, run_type=cont_run_type,
+                      # 沿用提问那条 run 的模型/推理等级与能力开关（否则回答后模型悄悄换回默认）
+                      options_json=dict(origin.options_json or {}) if origin else None,
+                      status="queued")
+            s.add(run)
+            await s.commit()
+            await s.refresh(run)
+            run_id = str(run.id)
+            session_id = str(sess.id)
+
+    if inline:
+        # 唤醒在途暂停的 run（跨出 DB 会话再操作，避免持锁）。finally 兜底 set_result，
+        # 防止上面任何一步意外抛错导致那条 run 永远挂起。
+        try:
+            fut.set_result(text)
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True, "run_id": run_id, "session_id": session_id,
+                "inline": True, "question": _q_dict(q)}
 
     await state.services.queue.enqueue(run_id, priority=0)
     return {"ok": True, "run_id": run_id, "session_id": session_id,
-            "question": _q_dict(q)}
+            "inline": False, "question": _q_dict(q)}
 
 
 @router.get("/runs/{run_id}/questions")

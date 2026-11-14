@@ -106,18 +106,17 @@ def test_orchestrator_constructs(session_factory) -> None:
     ("给主界面加一个卡牌详情弹窗", True),
     ("把这张卡换成稀有度边框", True),
     ("帮我修一下排序 bug", True),
-    ("出战提示操作失败", True),        # 只描述现象的 bug 报告也要触发守卫
-    ("点全部翻开卡死了", True),
-    ("这个项目是做什么的？", False),
-    ("这个报错怎么回事", False),      # 纯提问，不是动手指令
-    ("帮我看看为什么白屏", True),      # 「帮我」= 请求处理，不是只要解释
-    ("只分析一下项目结构，不要改代码", False),
-    ("先别动，我看看", False),
-    ("跑一遍单测", False),             # 交付物就是测试结果，不要求改代码
+    ("出战提示操作失败", True),
+    ("这个项目是做什么的？", True),   # 兼容壳不再判读语义，非空即「按动手处理」
+    ("只分析一下项目结构，不要改代码", True),
     ("", False),
 ])
 def test_needs_action_guard(text: str, expected: bool) -> None:
-    """「只勘察不动手」守卫的判定：要求动手 → True；纯问答/明确只读 → False。"""
+    """「只勘察不动手」守卫的判定已改为**模型推理**（见 orchestration/intent.py）。
+
+    ``Orchestrator._needs_action`` 只剩兼容壳语义：非空即按动手处理（安全兜底）。
+    真正的 survey/modify 分流由 ``classify_intent`` 给出，本测试只钉住兼容壳不变式。
+    """
     assert Orchestrator._needs_action(text) is expected
 
 
@@ -213,6 +212,58 @@ def test_execute_run_end_to_end(session_factory) -> None:
 
     workspace = PROJECTS_ROOT / ids["repo_path"]
     assert (workspace / "feature_agent.py").exists(), "模型没把代码真的写进工作区"
+
+
+@pytest.mark.slow
+def test_run_done_reaches_frontend_before_slow_post_work(session_factory, monkeypatch) -> None:
+    """run_done 必须比收尾慢活先发出去：前端的完成提醒（提示音 + 桌面通知）就靠这个事件。
+
+    回归点：run_done 曾排在 AI 记忆合并（最长 90s）与经验沉淀（最长 60s）之后，
+    用户看着回复早就出现在聊天里，提醒却要等一两分钟——「都结束了还没提醒」。
+    这里把两件慢活换成 3 秒睡眠，钉住「run_done 先到、慢活后做」，并顺带钉住
+    run_done 载荷带 session_id（前端点提醒跳会话要用；事件通道是按项目扇出的）。
+    """
+    order: list[str] = []
+
+    orig_emit = Orchestrator._emit
+
+    async def emit_spy(self, run_ctx, kind, payload):  # type: ignore[no-untyped-def]
+        if kind == "run_done":
+            order.append("run_done")
+        await orig_emit(self, run_ctx, kind, payload)
+
+    async def slow_remember(self, *a, **k):  # type: ignore[no-untyped-def]
+        order.append("remember")
+        await asyncio.sleep(3)
+
+    async def slow_harvest(self, *a, **k):  # type: ignore[no-untyped-def]
+        order.append("harvest")
+        await asyncio.sleep(3)
+
+    monkeypatch.setattr(Orchestrator, "_emit", emit_spy)
+    monkeypatch.setattr(Orchestrator, "_remember", slow_remember)
+    monkeypatch.setattr(Orchestrator, "_harvest_notes", slow_harvest)
+
+    async def flow():
+        ids = await _seed(session_factory, "给主界面加一个卡牌详情弹窗")
+        svcs = await build_lite_services(session_factory, "smoke-worker")
+        orch = Orchestrator(svcs, "smoke-worker", session_factory)
+        await orch.execute_run(ids["run_id"])
+        run = await svcs.repo.get_run(ids["run_id"])
+        events = await svcs.repo.get_events_since(ids["run_id"], 0)
+        return ids, run, events
+
+    ids, run, events = _run(flow(), timeout=RUN_TIMEOUT_S)
+
+    assert run is not None and run.status == "succeeded", \
+        f"run 未成功：status={getattr(run, 'status', None)} error={getattr(run, 'error', None)}"
+    assert order and order[0] == "run_done", f"run_done 没有排在收尾慢活之前：{order}"
+    assert "remember" in order and "harvest" in order, f"慢活没跑到（用例失效）：{order}"
+
+    done = [e for e in events if e.type == "run_done"]
+    assert done, "没有落 run_done 事件"
+    assert (done[-1].payload_json or {}).get("session_id") == ids["session_id"], \
+        f"run_done 载荷缺 session_id：{(done[-1].payload_json or {})}"
 
 
 # ---------------------------------------------------------------- 5. 会话挂载技能

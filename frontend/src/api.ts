@@ -11,22 +11,14 @@ class ApiError extends Error {
 }
 
 async function request<T = any>(path: string, opts: RequestInit = {}): Promise<T> {
-  const token = useAuth.getState().token;
   const teamId = useAuth.getState().currentTeamId;
   const headers = new Headers(opts.headers);
-  if (token) headers.set("Authorization", `Bearer ${token}`);
   if (teamId) headers.set("X-Team-Id", teamId);
   if (opts.body && !(opts.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   const res = await fetch(BASE + path, { ...opts, headers });
   if (!res.ok) {
-    // token 失效（后端重启换库 / 过期）→ 自动登出回登录页，避免 401 循环
-    if (res.status === 401 && !path.startsWith("/auth/")) {
-      useAuth.getState().logout();
-      location.hash = "#/chat";
-      throw new ApiError("登录已失效，请重新登录", 401);
-    }
     let msg = `${res.status}`;
     try {
       const j = await res.json();
@@ -42,20 +34,7 @@ async function request<T = any>(path: string, opts: RequestInit = {}): Promise<T
 }
 
 export const api = {
-  // ---- auth ----
-  authStatus: () => request<{ initialized: boolean; has_bootstrap_token: boolean }>("/auth/status"),
-  login: (email: string, password: string) =>
-    request("/auth/login", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ email, password }).toString(),
-    }),
-  setup: (payload: {
-    token?: string;
-    email: string;
-    display_name: string;
-    password: string;
-  }) => request("/auth/setup", { method: "POST", body: JSON.stringify(payload) }),
+  // ---- 本机资料（没有登录：这里只是昵称/头像） ----
   me: () => request("/auth/me"),
   updateMe: (body: { display_name?: string; avatar?: string | null }) =>
     request<{ ok: boolean; user: any }>("/auth/me", { method: "PATCH", body: JSON.stringify(body) }),
@@ -64,12 +43,6 @@ export const api = {
     fd.append("file", file);
     return request<{ ok: boolean; avatar: string }>("/auth/me/avatar", { method: "POST", body: fd });
   },
-  changePassword: (old_password: string, new_password: string) =>
-    request<{ ok: boolean }>("/auth/me/password", {
-      method: "POST",
-      body: JSON.stringify({ old_password, new_password }),
-    }),
-  logout: () => request("/auth/logout", { method: "POST" }),
 
   // ---- teams / projects ----
   teams: () => request("/teams"),
@@ -80,6 +53,9 @@ export const api = {
   restoreProject: (id: string) =>
     request(`/projects/${id}/restore`, { method: "POST" }),
   project: (id: string) => request(`/projects/${id}`),
+  /** 在本机文件管理器里打开项目工作区目录（仅 lite 模式） */
+  revealProject: (id: string) =>
+    request(`/projects/${id}/reveal`, { method: "POST" }),
   createProject: (teamId: string, body: any) =>
     request(`/teams/${teamId}/projects`, { method: "POST", body: JSON.stringify(body) }),
   /** 目录浏览：新建工作区时选文件夹（lite 模式可浏览本机任意目录） */
@@ -130,11 +106,14 @@ export const api = {
   runs: (projectId: string) => request(`/projects/${projectId}/runs`),
   runDetail: (id: string) => request(`/runs/${id}`),
   cancelRun: (id: string) => request(`/runs/${id}/cancel`, { method: "POST" }),
+  // 单独停掉一个子agent（主agent 与其它子agent 继续跑，互不影响）
+  cancelTask: (runId: string, taskId: string) =>
+    request(`/runs/${runId}/tasks/${taskId}/cancel`, { method: "POST" }),
   // 插话：并进正在执行的那一轮（不取消任务、不新开 run）。图和附件与聊天发送同一套格式。
   // clientMsgId 是幂等键：连点/重试同一条插话时后端只落一条消息。
   // 传 model 时顺带「运行中切换模型」：后端把这一轮后续的 LLM 换成新档位（下一轮生效）。
   //   model.profile 空串 = 回到「跟随角色默认」；不传 model = 本次不动模型。
-  // 传 settings 时顺带「运行中改运行选项」：能力开关 / 会话权限 / 仅分析，下一轮生效。
+  // 传 settings 时顺带「运行中改运行选项」：会话权限，下一轮生效。
   steerRun: (
     id: string,
     content: string,
@@ -142,7 +121,7 @@ export const api = {
     files: { path: string; name: string; size: number }[] = [],
     clientMsgId = "",
     model?: { profile: string; effort: string },
-    settings?: { caps?: Record<string, boolean>; permission_scope?: string; analyze?: boolean },
+    settings?: { permission_scope?: string },
   ) => request(`/runs/${id}/steer`, {
     method: "POST",
     body: JSON.stringify({
@@ -171,19 +150,22 @@ export const api = {
   /** 同一文件的原样地址（图片 / HTML / PDF 预览用；HTML 里的相对路径会一起加载） */
   runFileRawUrl: (runId: string, path: string) =>
     `${BASE}/runs/${runId}/raw/${path.split("/").map(encodeURIComponent).join("/")}`,
+  /** 在系统文件管理器里定位工作区中的该文件（Windows explorer /select） */
+  runReveal: (runId: string, path: string) =>
+    request(`/runs/${runId}/reveal`, {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }),
   /** run 过程图稳定地址（工具落图另存到 DATA_DIR/run_shots，收尾清工作区也不丢）。
-   *  <img> 发不出 Authorization 头，换 cookie 名的部署只靠 cookie 会 401——所以这里不直接
-   *  把地址塞给 <img>，而是用 fetch 带 Bearer 头取字节，再转 blob: URL 喂给 <img>。 */
+   *  前端统一走 fetchBlobUrl 取字节再转 blob: URL 喂给 <img>（<img> 带不了自定义头）。 */
   runShotUrl: (ref: string, thumb = 0) => {
     const path = ref.startsWith("run-shot/") ? ref : `run-shot/${ref}`;
     return `${BASE}/run-shots?ref=${encodeURIComponent(path)}${thumb ? `&thumb=${thumb}` : ""}`;
   },
-  /** 带登录态取二进制并转 blob: URL（取图用；失败抛错由调用方降级）。 */
+  /** 取二进制并转 blob: URL（取图用；失败抛错由调用方降级）。 */
   fetchBlobUrl: async (url: string): Promise<string> => {
-    const token = useAuth.getState().token;
     const teamId = useAuth.getState().currentTeamId;
     const headers = new Headers();
-    if (token) headers.set("Authorization", `Bearer ${token}`);
     if (teamId) headers.set("X-Team-Id", teamId);
     const res = await fetch(url, { headers });
     if (!res.ok) throw new ApiError(`${res.status}`, res.status);
@@ -293,10 +275,8 @@ export const api = {
   imageGenJob: (jobId: string) =>
     request(`/image-gen/jobs/${encodeURIComponent(jobId)}`),
   imageGenBlob: async (name: string): Promise<string> => {
-    const token = useAuth.getState().token;
     const teamId = useAuth.getState().currentTeamId;
     const headers: Record<string, string> = {};
-    if (token) headers.Authorization = `Bearer ${token}`;
     if (teamId) headers["X-Team-Id"] = teamId;
     const res = await fetch(`${BASE}/image-gen/files/${encodeURIComponent(name)}`, { headers });
     if (!res.ok) throw new ApiError(`加载结果失败 ${res.status}`);
@@ -314,10 +294,8 @@ export const api = {
   videoGenJob: (jobId: string) =>
     request(`/video-gen/jobs/${encodeURIComponent(jobId)}`),
   videoGenBlob: async (name: string): Promise<string> => {
-    const token = useAuth.getState().token;
     const teamId = useAuth.getState().currentTeamId;
     const headers: Record<string, string> = {};
-    if (token) headers.Authorization = `Bearer ${token}`;
     if (teamId) headers["X-Team-Id"] = teamId;
     const res = await fetch(`${BASE}/video-gen/files/${encodeURIComponent(name)}`, { headers });
     if (!res.ok) throw new ApiError(`加载结果失败 ${res.status}`);
@@ -375,6 +353,21 @@ export const api = {
   projectFileRaw: (projectId: string, path: string) =>
     `${BASE}/projects/${projectId}/file?mode=raw&path=${encodeURIComponent(path)}`,
 
+  // ---- 消息通道（钉钉 / 企业微信 / 自定义 Webhook）----
+  // 绑定已改为「直接填群机器人 Webhook」，不再有扫码 / code 接口。
+  channels: () => request("/channels"),
+  channelBind: (channel: string, body: any) =>
+    request(`/channels/${channel}/bind`, { method: "POST", body: JSON.stringify(body) }),
+  unlinkChannel: (id: string) =>
+    request(`/channels/${id}/unlink`, { method: "POST" }),
+  patchChannel: (id: string, body: any) =>
+    request(`/channels/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  testChannel: (id: string) =>
+    request(`/channels/${id}/test`, { method: "POST" }),
+  channelMessages: (limit = 30) => request(`/channels/messages?limit=${limit}`),
+  saveChannelAppConfig: (body: any) =>
+    request("/channels/app-config", { method: "POST", body: JSON.stringify(body) }),
+
   // ---- 项目记忆 ----
   memories: (projectId: string) => request(`/projects/${projectId}/memory`),
   addMemory: (projectId: string, content: string) =>
@@ -388,6 +381,11 @@ export const api = {
   projectNotes: (projectId: string) => request(`/projects/${projectId}/notes`),
   deleteProjectNote: (projectId: string, category: string, key: string) =>
     request(`/projects/${projectId}/notes/${category}/${key}`, { method: "DELETE" }),
+  /** 钉住（keep=true，永不淘汰）/ 标失效（stale=true，不再注入、优先淘汰）；null=不动该标记 */
+  setProjectNoteFlag: (projectId: string, category: string, key: string,
+                       body: { keep?: boolean | null; stale?: boolean | null }) =>
+    request(`/projects/${projectId}/notes/${category}/${key}/flag`,
+            { method: "POST", body: JSON.stringify(body) }),
 
   // ---- mcp servers ----
   mcpServers: (projectId: string) => request(`/projects/${projectId}/mcp`),
@@ -435,22 +433,25 @@ export const api = {
         protocol: arg.protocol || "",
       }),
     }),
+  /** 一键测速：对模型列表逐个发短请求，返回每个模型的 tok/s */
+  llmSpeedTest: (arg: { providerId?: string; baseUrl?: string; apiKey?: string; protocol?: string; models: string[] }) =>
+    request("/llm/speed-test", {
+      method: "POST",
+      body: JSON.stringify({
+        provider_id: arg.providerId || null,
+        base_url: arg.baseUrl || "",
+        api_key: arg.apiKey || "",
+        protocol: arg.protocol || "",
+        models: arg.models,
+      }),
+    }),
   driverSpecs: () => request("/providers/drivers"),
   providers: () => request("/providers"),
   createProvider: (body: any) =>
     request("/providers", { method: "POST", body: JSON.stringify(body) }),
   deleteProvider: (id: string) => request(`/providers/${id}`, { method: "DELETE" }),
 
-  // ---- team ----
-  members: (teamId: string) => request(`/teams/${teamId}/members/detail`),
-  addMember: (teamId: string, body: any) =>
-    request(`/teams/${teamId}/members`, { method: "POST", body: JSON.stringify(body) }),
-  removeMember: (teamId: string, userId: string) =>
-    request(`/teams/${teamId}/members/${userId}`, { method: "DELETE" }),
-  setMemberRole: (teamId: string, userId: string, role: string) =>
-    request(`/teams/${teamId}/members/${userId}`, {
-      method: "PUT", body: JSON.stringify({ role }),
-    }),
+  // ---- 用量 / 审计（个人版：只统计自己的工作区）----
   usage: (days = 30, agent?: string, model?: string) =>
     request(`/usage?days=${days}${agent ? `&agent=${encodeURIComponent(agent)}` : ""}${model ? `&model=${encodeURIComponent(model)}` : ""}`),
   audit: (limit = 50, q?: string) =>
@@ -510,12 +511,26 @@ export const api = {
   /** WE 壁纸文件要鉴权头，浏览器标签带不上 → fetch→blob（见底部 blobUrl） */
   weFileBlob: (path: string) => blobUrl(`/wallpapers/file?path=${encodeURIComponent(path)}`),
 
+  // ---- 数据存储位置（设置 / 存储空间）----
+  storageInfo: () => request("/system/storage"),
+  storageMigrate: (targetDir: string) =>
+    request("/system/storage/migrate", {
+      method: "POST",
+      body: JSON.stringify({ target_dir: targetDir }),
+    }),
+  /** 迁移进度（轮询用）：phase = idle|scan|copy|db|done|error */
+  storageProgress: () => request("/system/storage/migrate/progress"),
+  /** 弹系统原生「选择文件夹」窗口（服务所在机器上）；501 = 弹不出来，前端回退内置浏览器 */
+  storagePickDir: (title?: string) =>
+    request<{ ok: boolean; path: string; cancelled: boolean }>("/system/storage/pick-dir", {
+      method: "POST",
+      body: JSON.stringify({ title: title || null }),
+    }),
+
   // ---- 会话导出（zip：conversation.md + session.json）----
   /** 带鉴权头 fetch → blob → 触发浏览器另存；文件名优先取后端 Content-Disposition */
-  exportSession: async (sessionId: string, title: string): Promise<void> => {    const token = useAuth.getState().token;
-    const teamId = useAuth.getState().currentTeamId;
+  exportSession: async (sessionId: string, title: string): Promise<void> => {    const teamId = useAuth.getState().currentTeamId;
     const headers: Record<string, string> = {};
-    if (token) headers.Authorization = `Bearer ${token}`;
     if (teamId) headers["X-Team-Id"] = teamId;
     const res = await fetch(`${BASE}/sessions/${sessionId}/export`, { headers });
     // 未知路由会被 SPA 兜底接住返回 200 HTML——下载下来就是个假 zip，必须拦
@@ -547,10 +562,8 @@ export { ApiError };
  * 浏览器原生标签带不上 Authorization，只能先 fetch 再给 blob URL。
  */
 async function blobUrl(path: string): Promise<string> {
-  const token = useAuth.getState().token;
   const teamId = useAuth.getState().currentTeamId;
   const headers: Record<string, string> = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
   if (teamId) headers["X-Team-Id"] = teamId;
   const res = await fetch(BASE + path, { headers });
   if (!res.ok) throw new ApiError(`加载文件失败 ${res.status}`);

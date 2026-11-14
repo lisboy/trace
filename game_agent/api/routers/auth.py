@@ -1,20 +1,21 @@
-"""认证路由：密码登录 / 会话 / PAT / 首启 / OIDC 配置口（设计 §3.4）。"""
+"""本机资料：昵称 / 头像 / 工作区信息。
+
+这个版本**没有登录、没有账号密码**——所以这里也没有 login / logout / setup /
+改密码这些接口。留下的只是「界面怎么称呼我」这类纯展示偏好（顶栏头像与昵称），
+它们跟身份校验无关，不会拦住任何操作。
+"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from game_agent.api.deps import get_current_context
-from game_agent.api.state import state
-from game_agent.auth.rbac import PERM_MEMBER
-from game_agent.config import AUTH_MODE
 from game_agent.core.context import RequestContext
+from game_agent.db.models import Team, TeamMember, User
 from game_agent.db.session import SessionLocal
-from game_agent.db.models import AuditLog, Team, TeamMember, User
 
-router = APIRouter(prefix="/api/auth", tags=["auth"])
+router = APIRouter(prefix="/api/auth", tags=["profile"])
 
 
 def _u(v):  # type: ignore[no-untyped-def]
@@ -28,83 +29,14 @@ def _u(v):  # type: ignore[no-untyped-def]
     return v
 
 
-def _ip(request: Request | None) -> str | None:
-    return request.client.host if request and request.client else None
-
-
-def _ua(request: Request | None) -> str | None:
-    return request.headers.get("user-agent") if request else None
-
-
 def _user_payload(u: User) -> dict:
     return {"id": str(u.id), "email": u.email, "display_name": u.display_name,
-            "avatar": u.avatar or None,
-            "is_active": u.is_active, "role": None}
-
-
-async def require_member(ctx: RequestContext = Depends(get_current_context)) -> RequestContext:
-    if not ctx.can(PERM_MEMBER):
-        raise HTTPException(status_code=403, detail="权限不足")
-    return ctx
-
-
-class LoginForm(BaseModel):
-    email: str
-    password: str
-
-
-@router.post("/login")
-async def login(email: str = Form(...), password: str = Form(...), request: Request = None):
-    if AUTH_MODE == "oidc":
-        raise HTTPException(status_code=400, detail="当前仅允许 OIDC 登录")
-    auth = state.auth
-    user = await auth.authenticate(email, password, ip=_ip(request))
-    if user is None:
-        # 失败也记一条：多人团队里"谁在试密码"只有在这里留痕才查得到
-        await _audit_login(email, "auth.login_failed", request)
-        raise HTTPException(status_code=401, detail="邮箱或密码错误")
-    token = await auth.create_session(str(user.id), _ip(request), _ua(request))
-    pat = await auth.create_pat(str(user.id), "web-session", scopes=["run:create", "run:read", "view", "download", "comment"])
-    await _audit_login(email, "auth.login", request, user_id=str(user.id))
-    resp = JSONResponse(content={**_user_payload(user), "access_token": pat})
-    resp.set_cookie("ga_session", token, httponly=True, samesite="lax", max_age=60 * 60 * 24 * 30)
-    return resp
-
-
-async def _audit_login(email: str, action: str, request: Request,
-                       user_id: str | None = None) -> None:
-    """登录痕迹写入审计：team_id 取该用户第一个团队，匿名失败的尝试挂不到任何团队下。"""
-    try:
-        async with SessionLocal() as s:
-            team_id = None
-            if user_id:
-                team_id = await s.scalar(select(TeamMember.team_id).where(
-                    TeamMember.user_id == _u(user_id)).order_by(TeamMember.joined_at))
-            elif email:
-                u = await s.scalar(select(User).where(
-                    User.email == email.strip().lower()))
-                if u is not None:
-                    team_id = await s.scalar(select(TeamMember.team_id).where(
-                        TeamMember.user_id == u.id).order_by(TeamMember.joined_at))
-            s.add(AuditLog(team_id=team_id, actor_id=_u(user_id) if user_id else None,
-                           action=action, target=(email or "").strip().lower() or None,
-                           ip=_ip(request), user_agent=_ua(request), detail_json={}))
-            await s.commit()
-    except Exception:  # noqa: BLE001 - 审计失败不能挡登录
-        pass
-
-
-@router.post("/logout")
-async def logout(ga_session: str | None = None):
-    if ga_session:
-        await state.auth.revoke_session(ga_session)
-    resp = JSONResponse(content={"ok": True})
-    resp.delete_cookie("ga_session")
-    return resp
+            "avatar": u.avatar or None, "is_active": u.is_active, "role": None}
 
 
 @router.get("/me")
 async def me(ctx: RequestContext = Depends(get_current_context)):
+    """本机身份 + 工作区（个人版恒为一个）。前端用它渲染顶栏昵称/头像。"""
     async with SessionLocal() as s:
         user = await s.get(User, _u(ctx.user_id))
         teams = await s.execute(
@@ -123,11 +55,11 @@ class ProfileIn(BaseModel):
 
 @router.patch("/me")
 async def update_me(body: ProfileIn, ctx: RequestContext = Depends(get_current_context)):
-    """修改个人资料：显示名称 / 头像地址（头像文件走 /api/auth/me/avatar 上传）。"""
+    """改昵称 / 头像地址（头像文件走 /api/auth/me/avatar 上传）。"""
     async with SessionLocal() as s:
         user = await s.get(User, _u(ctx.user_id))
         if user is None:
-            raise HTTPException(status_code=404, detail="用户不存在")
+            raise HTTPException(status_code=404, detail="本机身份不存在")
         if body.display_name is not None:
             name = (body.display_name or "").strip()
             if not name:
@@ -179,75 +111,3 @@ async def upload_avatar(file: UploadFile, ctx: RequestContext = Depends(get_curr
             user.avatar = url
             await s.commit()
     return {"ok": True, "avatar": url}
-
-
-class PasswordIn(BaseModel):
-    old_password: str = ""
-    new_password: str
-
-
-@router.post("/me/password")
-async def change_password(body: PasswordIn, ctx: RequestContext = Depends(get_current_context)):
-    """修改账号密码。OIDC-only 账号（无本地密码）可直接设置新密码。"""
-    from game_agent.auth.passwords import hash_password, verify_password
-
-    new = body.new_password or ""
-    if len(new) < 8:
-        raise HTTPException(status_code=400, detail="新密码至少 8 位")
-    if len(new) > 200:
-        raise HTTPException(status_code=400, detail="新密码过长")
-    async with SessionLocal() as s:
-        user = await s.get(User, _u(ctx.user_id))
-        if user is None:
-            raise HTTPException(status_code=404, detail="用户不存在")
-        if user.password_hash:
-            if not verify_password(body.old_password or "", user.password_hash):
-                raise HTTPException(status_code=400, detail="当前密码不正确")
-        user.password_hash = hash_password(new)
-        user.failed_logins = 0
-        user.locked_until = None
-        await s.commit()
-    return {"ok": True}
-
-
-@router.get("/status")
-async def status():
-    """公开的初始化状态：登录页据此区分「首次使用」与「已有账号」。
-    全新安装（0 个账号）不应预填/引导一个并不存在的默认账号，否则只会得到
-    「邮箱或密码错误」——直接引导到 /setup 用启动日志里的引导 token 建首个 owner。"""
-    auth = state.auth
-    count = await auth.count_users()
-    return {"initialized": count > 0, "has_bootstrap_token": bool(state.bootstrap_token)}
-
-
-class SetupForm(BaseModel):
-    token: str = ""
-    email: str
-    display_name: str
-    password: str
-
-
-@router.post("/setup")
-async def setup(form: SetupForm):
-    auth = state.auth
-    if await auth.count_users() > 0:
-        raise HTTPException(status_code=400, detail="已初始化，不能重复创建 owner")
-    if state.bootstrap_token and form.token != state.bootstrap_token:
-        raise HTTPException(status_code=403, detail="引导 token 不正确")
-    user = await auth.bootstrap_owner(form.email, form.display_name, form.password)
-    token = await auth.create_session(str(user.id), None, None)
-    pat = await auth.create_pat(str(user.id), "web-session", scopes=["run:create", "run:read", "view", "download", "comment"])
-    resp = JSONResponse(content={**_user_payload(user), "access_token": pat})
-    resp.set_cookie("ga_session", token, httponly=True, samesite="lax")
-    return resp
-
-
-@router.get("/oidc/providers")
-async def oidc_providers(ctx: RequestContext = Depends(require_member)):
-    # OIDC provider 配置存于 settings；lite 默认空。M1 配置口。
-    async with SessionLocal() as s:
-        from sqlalchemy import select as _select
-        from game_agent.db.models import Settings
-        row = await s.scalar(_select(Settings).where(Settings.key == "oidc_providers"))
-        providers = row.value_json.get("items", []) if row else []
-    return {"providers": providers}

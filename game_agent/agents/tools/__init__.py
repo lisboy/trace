@@ -49,8 +49,9 @@ class ToolContext:
     # 本次 run 的工具调用序号（execute_tool 每调一次 +1），view_image 用它判断
     # 「同一张图是不是刚看过」，避免在同一验证循环里反复回灌相似截图。
     call_seq: int = 0
-    # 路径 -> 最近一次查看时的 call_seq：同图短间隔重看时提示改用数字指标
-    last_view: dict[str, int] = field(default_factory=dict)
+    # 路径 -> 最近一次查看时的 call_seq（或 (call_seq, (mtime_ns,size))）：同图短间隔
+    # 重看且文件未变化时，view_image 不再重复回灌像素，改回一句节流提示。
+    last_view: dict[str, object] = field(default_factory=dict)
     agent_state: dict[str, Any] = field(default_factory=dict)
     orchestrator: "Orchestrator | None" = None
     python_bin: str | None = None
@@ -63,6 +64,9 @@ class ToolContext:
     # 区分「整批跑很久但一直在出东西」和「真的卡死」——只看总时长会把 11 张各 1-2 分钟
     # 的正常批量误判成超时（实测：正确一张张出图，到第 900s 被整批中止）。
     progress_seq: int = 0
+    # spawn_agents 的后台批次（SpawnBatch）：派发即返回，运行时每轮开头把已回收批次的
+    # 结论注入对话；主agent 退出时未回收的批次由 orchestrator 统一取消。
+    spawn_batches: list[Any] = field(default_factory=list)
 
 
 class ToolError(Exception):

@@ -15,7 +15,10 @@ from game_agent.api.state import state
 from game_agent.logging_setup import configure_logging, get_logger
 
 if sys.platform == "win32":
-    # aiomysql 在 Windows 上要求 Selector 事件循环（默认 Proactor 不兼容）
+    # Windows 上统一用 Selector 事件循环（默认是 Proactor）。
+    # 历史上这是因为 aiomysql 在 Proactor 下不兼容；现在只跑 SQLite，但整套工具链
+    # （native.py 的 Popen 子进程读线程、sysinfo 的 to_thread 调用）都是按 Selector
+    # 环境调好的，保持不动可避免无谓的运行时行为漂移。
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
@@ -37,13 +40,12 @@ def main() -> None:
     from game_agent.db.session import SessionLocal, engine
     from game_agent.core.lite.container import build_lite_services
     from game_agent.orchestration.orchestrator import Orchestrator
-    from game_agent.auth.service import AuthService
     from game_agent.bootstrap import bootstrap
 
     if not DEBUG_INSTANCE:
         _write_pidfile()
     try:
-        asyncio.run(_start(engine, SessionLocal, build_lite_services, Orchestrator, AuthService, bootstrap, log))
+        asyncio.run(_start(engine, SessionLocal, build_lite_services, Orchestrator, bootstrap, log))
     finally:
         if not DEBUG_INSTANCE:
             _remove_pidfile()
@@ -79,7 +81,66 @@ def _remove_pidfile() -> None:
         pass
 
 
-async def _start(engine, SessionLocal, build_lite_services, Orchestrator, AuthService, bootstrap, log):  # type: ignore[no-untyped-def]
+def _cleanup_old_data_dir(log) -> None:  # type: ignore[no-untyped-def]
+    """数据目录迁移后，删除旧目录。
+
+    只在新实例用新目录成功打开 DB 之后调用。迁移流程会在新目录里留一个
+    `.trace_pending_cleanup` 文件，内容是「旧目录的绝对路径」；这里读它、确认它
+    不是当前目录（防止误删正在用的目录），再删掉整个旧目录和这个标记文件。
+    尽力而为：删不掉只记 warning，不影响服务运行（旧目录顶多一些冗余文件）。
+
+    注意 ``Path`` 必须在本函数里导入：main.py 顶层没有 ``from pathlib import Path``，
+    以前这里直接写 ``Path(...)`` → NameError 被下面的 except 吞掉 → 当成「没有旧目录」
+    静默返回，于是「迁移完旧目录自动清理」从来没生效过，C 盘那 10 GB 一直躺着。
+    """
+    import shutil as _shutil
+    from pathlib import Path
+
+    from game_agent.config import DATA_DIR, PENDING_CLEANUP_FILENAME
+
+    marker = DATA_DIR / PENDING_CLEANUP_FILENAME
+    if not marker.is_file():
+        return
+    try:
+        old = Path(marker.read_text(encoding="utf-8").strip()).resolve()
+    except Exception:  # noqa: BLE001
+        old = None
+    if old is None or not str(old):
+        marker.unlink(missing_ok=True)
+        return
+    # 安全护栏：绝不删当前目录 / 主目录 / 盘符根
+    cur = DATA_DIR.resolve()
+    home = Path.home().resolve()
+    if old == cur or old == home or len(str(old)) <= 3:
+        log.warning("skip cleaning suspicious old data dir: %s", old)
+        marker.unlink(missing_ok=True)
+        return
+    try:
+        if old.is_dir():
+            _shutil.rmtree(old)
+            log.info("cleaned old data dir after migration: %s", old)
+        marker.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        log.warning("cleanup old data dir failed (ignored): %s", old)
+
+
+def _want_open_browser() -> bool:
+    """启动完成后要不要自动打开浏览器。
+
+    打包成 exe（PyInstaller 冻结）双击启动时**默认要开**：这时它就是个单机应用，
+    起来就该看见界面，不该让人去日志里翻端口再自己敲地址——用户提的就是这个。
+    源码/dev 跑则默认不开（restart.cmd 会反复重启，每改一行弹一次浏览器没法工作），
+    需要时用 GA_OPEN_BROWSER=1 打开。显式设 0/false 一律尊重（打包版也适用）。
+    """
+    v = (os.environ.get("GA_OPEN_BROWSER") or "").strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return bool(getattr(sys, "frozen", False))
+
+
+async def _start(engine, SessionLocal, build_lite_services, Orchestrator, bootstrap, log):  # type: ignore[no-untyped-def]
     import faulthandler
 
     from game_agent.config import DATA_DIR
@@ -100,22 +161,27 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, AuthSe
     from game_agent.db.migrate import init_db
     await init_db()
 
-    auth = AuthService(SessionLocal)
+    # 数据目录迁移后的旧目录清理：只有「新实例用新目录把 DB 打开成功」才走到这里，
+    # 才敢删旧目录——迁移期间旧数据一直保留，任何一步失败都能退回。
+    # 调试实例与主实例共用一个库，绝不能在这里删东西，直接跳过。
+    if not DEBUG_INSTANCE:
+        _cleanup_old_data_dir(log)
+
     services = await build_lite_services(SessionLocal, worker_id="lite-1")
     orchestrator = Orchestrator(services, worker_id="lite-1", session_factory=SessionLocal)
 
     state.session_factory = SessionLocal
     state.services = services
-    state.auth = auth
     state.orchestrator = orchestrator
     state.worker_id = "lite-1"
     state.frontend_dir = _frontend_dir()
 
-    await bootstrap(auth)
+    # 本机身份（无登录）：保证库里有一个默认用户 + 一个工作区，老库复用最早的账号
+    await bootstrap()
 
     # 启动清理：服务重启时遗留的 queued/running/claimed/blocked run 不会有人继续执行，
     # 标记为 failed，避免界面永远「运行中/排队中」的僵尸 run
-    # 注意用 Python 侧 UTC（func.now() 是 MySQL 会话本地时区，与 UTC 存储约定不一致）
+    # 注意用 Python 侧 UTC（不用 func.now()：那是数据库本地时区，与 UTC 存储约定不一致）
     # 调试实例跳过：它和主实例共用数据库，主实例的 run 是活的，不能当成僵尸清掉。
     from datetime import datetime, timezone as _tz
     from sqlalchemy import func, select, update
@@ -351,6 +417,12 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, AuthSe
                     asyncio.gather(*wait_for_tasks, return_exceptions=True), timeout=20)
         except asyncio.TimeoutError:
             log.warning("graceful stop timed out waiting for workers")
+        # 关掉 LLM 的共享长连接（进程级客户端不随单次请求关闭，这里统一收尾）
+        try:
+            from game_agent.llm.openai_compat import aclose_shared_clients
+            await aclose_shared_clients()
+        except Exception:  # noqa: BLE001 - 收尾失败不影响退出
+            log.warning("关闭 LLM 共享连接失败", exc_info=True)
 
     def _on_signal(sig) -> None:  # type: ignore[no-untyped-def]
         asyncio.create_task(_graceful_stop(f"signal {sig.name}"))
@@ -368,7 +440,7 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, AuthSe
     # 服务真正开始监听、并且端口确实能连上之后再开浏览器（端口可能已自动顺延，
     # 不能写死；也不能在 serve() 之前就开，否则浏览器会打到还没起来的端口）。
     async def _open_browser_when_ready() -> None:
-        if os.environ.get("GA_OPEN_BROWSER", "").strip().lower() not in ("1", "true", "yes", "on"):
+        if not _want_open_browser():
             return
         browse_host = "127.0.0.1" if HOST in ("0.0.0.0", "", "::") else HOST
         url = f"http://{browse_host}:{_bind_port}/"

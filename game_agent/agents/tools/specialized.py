@@ -584,6 +584,14 @@ async def _indextts_generate(text: str, prof: dict, args: dict,
         emo_mode = "3"
     elif emo_mode == "3":
         emo_mode = "0"
+    # 语速（2.5 的 duration_factor）与语言：条目 > 档位；0.5~2.0 钳制，越界取 None
+    speed = args.get("speed") or args.get("duration_factor") or params.get("speed")
+    if speed not in (None, ""):
+        try:
+            speed = max(0.5, min(2.0, float(speed)))
+        except (TypeError, ValueError):
+            speed = None
+    lang = str(args.get("lang") or params.get("lang") or "auto").strip() or "auto"
     weight = params.get("emo_weight") or 0.65
     try:
         weight = float(weight)
@@ -611,6 +619,8 @@ async def _indextts_generate(text: str, prof: dict, args: dict,
             emo_weight=weight,
             emo_vector=emo_vector,
             emo_audio=emo_audio_bytes,
+            speed=speed,
+            lang=lang,
             on_done=(lambda d: on_done(str(d.get("wav") or ""))) if on_done else None,
         )
     except local_tts.TTSError as e:
@@ -749,7 +759,7 @@ async def list_voice_presets(args: dict, t: ToolContext) -> str:
         return ("在线 TTS 用固定内置音色，voice 直接传：alloy / echo / fable / onyx / "
                 "nova / shimmer 之一。")
     if not provider:
-        return ("未配置音频档位（团队设置 → 模型档位 kind=audio）：generate_audio 会走"
+        return ("未配置音频档位（设置 → 模型配置，kind=audio）：generate_audio 会走"
                 "占位模式 ⚠️——先告知用户配置配音模型，不要闷头生成。")
     from game_agent.assets import tts as local_tts
     base = (prof or {}).get("base_url") or ""
@@ -887,7 +897,7 @@ def _recover_local_wav(server_wav_path: str) -> bytes | None:
     """客户端报错（读超时/断开/下载失败）时，从服务端已落盘的成品 wav 捡回字节。
 
     `server_wav_path` 是服务端 done 事件里给的相对/绝对路径（如
-    `D:\\AI\\IndexTTS2.0_v3\\outputs\\xxx.wav` 或 `/api/v1/audio/xxx.wav`）。
+    `D:\\AI\\IndexTTS-2.5-v3\\outputs\\xxx.wav` 或 `/api/v1/audio/xxx.wav`）。
     只读本地文件，不发网络请求；文件不存在/过小则返回 None。
     """
     p = str(server_wav_path or "").strip()

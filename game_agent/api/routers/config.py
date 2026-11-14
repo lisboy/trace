@@ -1,28 +1,35 @@
-"""团队配置口（设计 §4.1 / §7.2 / §8）：智能体配置、模型档位、成员管理、用量、审计。"""
+"""配置口（设计 §4.1 / §7.2 / §8）：智能体配置、模型档位、用量、审计。
+
+个人版：不再有「成员 / 账号管理」——工作区只属于当前登录用户。
+底层 teams / team_members 表仍保留，仅作为数据分区 id（个人空间）使用。
+"""
 from __future__ import annotations
 
 import asyncio
+import json
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import delete, func, or_, select
 
-from game_agent.config import DATABASE_URL, LLM_USER_AGENT
+from game_agent.config import LLM_USER_AGENT
 from game_agent.llm.openai_compat import (
     _new_llm_client, _proxy_env_disabled, _system_proxy,
 )
 from game_agent.api.deps import require
 from game_agent.auth.rbac import (
-    PERM_AGENT_CONFIG, PERM_MEMBER, PERM_USAGE_VIEW, PERM_VIEW,
+    PERM_AGENT_CONFIG, PERM_USAGE_VIEW, PERM_VIEW,
 )
 from game_agent.core.context import RequestContext
 from game_agent.agents.roles import ROLE_PROMPTS, ROLE_TOOLS
+from game_agent.llm.context_window import DEFAULT_CONTEXT_WINDOW
 from game_agent.db.models import (
     Agent, AuditLog, LlmCall, LlmProvider, ModelProfile, Project, Run,
-    Session, TeamMember, UsageLedger, User,
+    Session, UsageLedger, User,
 )
 from game_agent.db.session import SessionLocal
 from game_agent.orchestration import policy as policy_mod
@@ -93,6 +100,47 @@ def _extract_model_ids(data: dict) -> list[str]:
     return sorted(ids)
 
 
+_WAF_HINT_TPL = (
+    "被站点前置的 Cloudflare 人机验证拦下了（HTTP {code} + HTML 挑战页，不是 Key 无效）："
+    "直接再点一次重试通常就能过；若反复出现，关掉/切换本机代理，"
+    "或向供应商要一个不挂验证的 API 域名。")
+
+
+def _looks_like_waf(status: int, content_type: str, cf_mitigated: str | None,
+                    text: str) -> bool:
+    if status not in (403, 429, 503):
+        return False
+    if (cf_mitigated or "").lower() == "challenge":
+        return True
+    if "html" not in (content_type or "").lower():
+        return False
+    low = (text or "")[:800].lower()
+    return ("just a moment" in low or "cf-chl" in low
+            or "challenge-platform" in low
+            or "<!doctype html" in low or "<html" in low)
+
+
+def _is_waf_challenge(r: httpx.Response) -> bool:
+    """识别 Cloudflare 一类人机验证响应（403/429/503 + HTML 挑战页）。
+
+    中转站挂在 CF 后面时，出口 IP 声誉差 / 客户端指纹像脚本就会被判给人机验证页。
+    这不是 Key 问题，换条连接重试或改直连往往就过——所以单独识别出来重试。"""
+    return _looks_like_waf(r.status_code, r.headers.get("content-type") or "",
+                           r.headers.get("cf-mitigated"), r.text or "")
+
+
+async def _with_waf_retry(factory, attempts: int = 3, delays=(0.6, 1.6)):
+    """WAF 挑战页短退避重试：同一出口换一条连接常落到另一个 CF 节点，往往就能过。"""
+    r = None
+    for i in range(attempts):
+        r = await factory()
+        if not _is_waf_challenge(r):
+            return r
+        if i < attempts - 1:
+            await asyncio.sleep(delays[min(i, len(delays) - 1)])
+    return r
+
+
 @router.post("/llm/models")
 async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(require(PERM_VIEW))):
     """代理拉取模型列表（服务端发起，避开浏览器 CORS 与 key 泄露）。
@@ -147,7 +195,8 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
                 break
             for auth in auths:
                 try:
-                    r = await client.get(url, headers=_models_headers(auth, key, ua))
+                    r = await _with_waf_retry(
+                        lambda: client.get(url, headers=_models_headers(auth, key, ua)))
                 except Exception as e:  # noqa: BLE001
                     p_conn += 1
                     p_attempts.append(f"· {url}（{auth}）→ 连接失败：{e}")
@@ -158,9 +207,10 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
                     snippet = r.text[:140].replace("\n", " ")
                     p_attempts.append(f"· {url}（{auth}）→ HTTP {r.status_code}"
                                       f"{(' ' + ct) if ct else ''}：{snippet}")
+                    if _is_waf_challenge(r):
+                        p_waf = True
+                        continue  # 人机验证页：换鉴权方式也一样，交给上层改直连重试
                     if r.status_code in (401, 403):
-                        if "html" in ct:
-                            p_waf = True
                         continue  # 可能只是鉴权方式不对，换 x-api-key 再试
                     break  # 404/5xx 等：换地址
                 try:
@@ -183,11 +233,13 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
     proxy = None if _proxy_env_disabled() else await asyncio.to_thread(_system_proxy)
     async with _new_llm_client(proxy, ua, timeout=15, follow_redirects=True) as client:
         res = await _probe(client)
-    if proxy and not res["ids"] and res["conn_fail"] and not res["statuses"]:
+    # 代理出口被 CF 判成人机验证时，代理的出口 IP 才是问题根源——改直连往往直接 200。
+    if proxy and not res["ids"] and (res["saw_waf"] or (res["conn_fail"] and not res["statuses"])):
         async with _new_llm_client(None, ua, timeout=15, follow_redirects=True) as client:
             res2 = await _probe(client)
         if res2["ids"] or res2["statuses"]:
-            res2["attempts"].insert(0, f"· 经系统代理 {proxy} 连不上，已自动改直连重试")
+            why = "被人机验证拦截" if res["saw_waf"] else "连不上"
+            res2["attempts"].insert(0, f"· 经系统代理 {proxy} {why}，已自动改直连重试")
         res = res2
     attempts = res["attempts"]
     ids = res["ids"]
@@ -201,8 +253,9 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
             hint = ("连不上这个地址（域名解析失败或网络不通）：请确认 Base URL 拼写正确"
                     "（例如 ai.xxx.com 其实是 api.xxx.com？），以及本机/服务器能否访问该域名。")
         elif saw_waf:
-            hint = ("返回的是 Cloudflare 一类人机验证页（HTML，不是 JSON）：在该供应商的"
-                    "「User-Agent」里填浏览器 UA 后重试，或改用厂商提供的 API 域名。")
+            hint = ("返回的是 Cloudflare 一类人机验证页（HTML，不是 JSON，也不是 Key 问题）："
+                    "已经自动重试过并尝试改直连；仍失败就关掉/切换本机代理再试，"
+                    "或改用厂商提供的不挂验证的 API 域名。")
         elif 401 in statuses:
             hint = (f"Key 不被接受（共 {len(key)} 字符）：可能无效/未兑换/无该渠道权限。"
                     "可先「+ 添加模型」手填模型名直接保存；对话若报同样错误，说明 Key 确实无权。")
@@ -221,17 +274,189 @@ async def list_llm_models(body: LlmModelsIn, ctx: RequestContext = Depends(requi
         async with SessionLocal() as s:
             pv = await s.get(LlmProvider, provider_row.id)
             if pv is not None:
-                # 合并而不是覆盖：用户已设置的上下文窗口要保留；新拉到的模型补 0（未设置）
+                # 合并而不是覆盖：用户已设置的上下文窗口要保留；新拉到的模型按默认窗口（256k）建
                 old = {m["name"]: m for m in _norm_models(pv.models_json)}
                 for mid in ids:
-                    merged.append(old.get(mid) or {"name": mid, "context_window": 0})
+                    merged.append(old.get(mid) or {"name": mid, "context_window": DEFAULT_CONTEXT_WINDOW})
                 pv.models_json = merged
                 if used_base and used_base != (pv.base_url or "").rstrip("/"):
                     pv.base_url = used_base  # 记下真正可用的地址，对话走同一条
                 await s.commit()
     if not merged:
-        merged = [{"name": mid, "context_window": 0} for mid in ids]
+        merged = [{"name": mid, "context_window": DEFAULT_CONTEXT_WINDOW} for mid in ids]
     return {"models": merged, "base_url": used_base, "requested_base": base}
+
+
+class LlmSpeedTestIn(BaseModel):
+    provider_id: str | None = None  # 已保存的供应商：用它的 base_url/key/UA/协议
+    base_url: str = ""  # 未保存的新供应商表单：直接带地址+key 来测
+    api_key: str = ""
+    protocol: str = ""
+    models: list[str] = []
+
+
+@router.post("/llm/speed-test")
+async def speed_test_llm_models(body: LlmSpeedTestIn, ctx: RequestContext = Depends(require(PERM_VIEW))):
+    """一键测速：给目录里的每个模型发一条短请求，按 产出tokens/耗时 算 t/s。
+
+    与真实对话同一条网络路径（同 UA、同系统代理自动降级）。计时是端到端的
+    （含首字等待），推理型模型的思考 token 也计入产出，所以 t/s 偏低是正常现象，
+    横向对比同一批模型仍然有效。"""
+    ua = LLM_USER_AGENT
+    protocol = (body.protocol or "").strip().lower()
+    if body.provider_id:
+        async with SessionLocal() as s:
+            pv = await s.get(LlmProvider, _u(body.provider_id))
+            if pv is None or str(pv.team_id) != ctx.team_id:
+                raise HTTPException(status_code=404, detail="供应商不存在")
+            base = (body.base_url or pv.base_url or "").strip().rstrip("/")
+            key = "".join((body.api_key or pv.api_key or "").split())
+            ua = pv.user_agent or LLM_USER_AGENT
+            protocol = protocol or (pv.protocol or "")
+    else:
+        base = (body.base_url or "").strip().rstrip("/")
+        key = "".join((body.api_key or "").split())
+    names = [n.strip() for n in body.models if isinstance(n, str) and n.strip()]
+    if not base or not base.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Base URL 必填且以 http(s):// 开头")
+    if not names:
+        raise HTTPException(status_code=400, detail="没有可测的模型")
+    if protocol not in _SUPPORTED_PROTOCOLS:
+        protocol = "openai"
+
+    proxy = None if _proxy_env_disabled() else await asyncio.to_thread(_system_proxy)
+    url = f"{base}/messages" if protocol == "anthropic" else f"{base}/chat/completions"
+    if protocol == "anthropic":
+        headers = {"Content-Type": "application/json", "x-api-key": key,
+                   "anthropic-version": "2023-06-01", "Authorization": f"Bearer {key}"}
+    else:
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}"}
+    if ua:
+        headers["User-Agent"] = ua
+
+    # 提示词刻意要求一段确定长度的输出：产出太少时 t/s 波动大，太长又拖慢测速
+    PROMPT = "请从 1 数到 50，用顿号分隔，直接开始，不要任何解释。"
+    MAX_TOKENS = 300
+
+    async def _one(model: str, client: httpx.AsyncClient) -> dict:
+        if protocol == "anthropic":
+            payload = {"model": model, "max_tokens": MAX_TOKENS,
+                       "messages": [{"role": "user", "content": PROMPT}]}
+        else:
+            payload = {"model": model, "max_tokens": MAX_TOKENS, "stream": False,
+                       "messages": [{"role": "user", "content": PROMPT}]}
+        t0 = time.perf_counter()
+        try:
+            r = await _with_waf_retry(
+                lambda: client.post(url, headers=headers, json=payload))
+        except Exception as e:  # noqa: BLE001
+            return {"model": model, "ok": False, "error": f"请求失败：{e}"}
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        if r.status_code != 200:
+            if _is_waf_challenge(r):
+                return {"model": model, "ok": False, "waf": True, "latency_ms": latency_ms,
+                        "error": _WAF_HINT_TPL.format(code=r.status_code)}
+            return {"model": model, "ok": False, "latency_ms": latency_ms,
+                    "error": f"HTTP {r.status_code}：{r.text[:160]}"}
+        try:
+            data = r.json()
+        except Exception:  # noqa: BLE001
+            return {"model": model, "ok": False, "latency_ms": latency_ms,
+                    "error": "HTTP 200 但响应不是 JSON"}
+        usage = data.get("usage") if isinstance(data, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+        out_tok = usage.get("completion_tokens")
+        if out_tok is None:
+            out_tok = usage.get("output_tokens")
+        out_tok = int(out_tok or 0)
+        if out_tok <= 0:
+            # 不少中转站非流式响应不带 usage。改走流式重测：每个 SSE 块 ≈ 1 个 token，
+            # 数块也能算出 t/s（比 usage 略有误差，但横向对比够用）。
+            if protocol == "openai":
+                return await _one_stream(model, client)
+            snippet = r.text[:200].replace("\n", " ")
+            return {"model": model, "ok": False, "latency_ms": latency_ms,
+                    "error": f"响应没有用量统计，无法计算 t/s。响应片段：{snippet}"}
+        tps = round(out_tok / max(latency_ms, 1) * 1000, 1)
+        return {"model": model, "ok": True, "latency_ms": latency_ms,
+                "completion_tokens": out_tok, "tok_per_s": tps}
+
+    async def _one_stream(model: str, client: httpx.AsyncClient) -> dict:
+        t0 = time.perf_counter()
+        try:
+            async with client.stream(
+                "POST", url, headers=headers,
+                json={"model": model, "max_tokens": MAX_TOKENS, "stream": True,
+                      "stream_options": {"include_usage": True},
+                      "messages": [{"role": "user", "content": PROMPT}]},
+            ) as r:
+                if r.status_code != 200:
+                    body = (await r.aread()).decode("utf-8", "replace")
+                    if _looks_like_waf(r.status_code, r.headers.get("content-type") or "",
+                                       r.headers.get("cf-mitigated"), body):
+                        return {"model": model, "ok": False, "waf": True,
+                                "error": _WAF_HINT_TPL.format(code=r.status_code)}
+                    return {"model": model, "ok": False,
+                            "error": f"流式重测 HTTP {r.status_code}：{body[:160]}"}
+                chunks = 0
+                err = ""
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        evt = json.loads(payload)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if isinstance(evt.get("error"), dict):
+                        err = str(evt["error"].get("message") or evt["error"])[:160]
+                        break
+                    u = evt.get("usage") or {}
+                    if u.get("completion_tokens"):
+                        chunks = max(chunks, int(u["completion_tokens"]))
+                        break  # 有 usage 块就以它为准
+                    for ch in evt.get("choices") or []:
+                        d = ch.get("delta") or {}
+                        if (d.get("content") or d.get("reasoning_content")
+                                or ch.get("text")):
+                            chunks += 1
+        except Exception as e:  # noqa: BLE001
+            return {"model": model, "ok": False, "error": f"流式重测请求失败：{e}"}
+        ms = int((time.perf_counter() - t0) * 1000)
+        if err:
+            return {"model": model, "ok": False, "error": f"流式重测报错：{err}"}
+        if chunks <= 0:
+            return {"model": model, "ok": False,
+                    "error": "流式重测也没拿到任何产出块，无法计算 t/s"}
+        return {"model": model, "ok": True, "completion_tokens": chunks,
+                "latency_ms": ms, "tok_per_s": round(chunks / max(ms, 1) * 1000, 1),
+                "via": "stream"}
+
+    async def _run_all(p: str | None) -> list[dict]:
+        async with _new_llm_client(p, ua, timeout=90, follow_redirects=True) as client:
+            sem = asyncio.Semaphore(4)  # 并发太猛会被限流，限 4 路同时测
+
+            async def _guarded(m: str) -> dict:
+                async with sem:
+                    return await _one(m, client)
+
+            return list(await asyncio.gather(*[_guarded(m) for m in names]))
+
+    results = await _run_all(proxy)
+    # 代理出口 IP 被人机验证拦时，代理才是根源：这批被拦的模型改直连再测一遍。
+    if proxy and any(x.get("waf") for x in results):
+        direct = await _run_all(None)
+        merged: list[dict] = []
+        for old, new in zip(results, direct):
+            if old.get("waf") and not new.get("waf"):
+                new = {**new, "via": "direct"}
+                merged.append(new)
+            else:
+                merged.append(old)
+        results = merged
+    return {"results": results, "protocol": protocol, "base_url": base}
 
 
 # ---------------------------------------------------------------- LLM 供应商
@@ -268,7 +493,12 @@ class LlmProviderPatch(BaseModel):
 
 
 def _norm_models(raw: list | None) -> list[dict]:
-    """统一模型目录格式：兼容存量字符串列表与 {name, context_window[, vision]} 对象列表。"""
+    """统一模型目录格式：兼容存量字符串列表与 {name, context_window[, vision]} 对象列表。
+
+    这里刻意**不**给没填窗口的模型补默认值：0 表示「目录对该模型没有意见」，
+    merge_model_catalog_params 据此保留档位里显式配过的窗口；默认 256k 的口径在
+    「拉取新模型」与「自动建档位」两处落地，运行时兜底见 DEFAULT_CONTEXT_WINDOW。
+    """
     out: list[dict] = []
     seen: set[str] = set()
     for item in raw or []:
@@ -548,9 +778,10 @@ async def auto_profile(body: ModelProfileAutoIn, ctx: RequestContext = Depends(r
                 ModelProfile.team_id == team, ModelProfile.key == key)):
             key = f"{_auto_key(pv.key, model)}-{n}"
             n += 1
-        # 供应商模型目录里配了窗口/视觉就直接带进档位，选模型即生效
+        # 供应商模型目录里配了窗口/视觉就直接带进档位，选模型即生效；
+        # 目录没配窗口时按默认 256k 落，避免档位「未配置」让运行时按更小值保守压缩。
         pm = next((m for m in _norm_models(pv.models_json) if m["name"] == model), None)
-        win = pm["context_window"] if pm else 0
+        win = (pm["context_window"] if pm else 0) or DEFAULT_CONTEXT_WINDOW
         vision = bool(pm and pm.get("vision"))
         params: dict = {}
         if win:
@@ -793,97 +1024,8 @@ async def put_assistant_policy(body: PolicyIn,
     return {"ok": True, **pol}
 
 
-# ---------------------------------------------------------------- 成员管理
-class MemberIn(BaseModel):
-    email: str
-    role: str = "developer"
-
-
-@router.get("/teams/{team_id}/members/detail")
-async def members_detail(team_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
-    """成员 + 各自角色 + 近 30 天发起的 run 数（用量台账按团队记，拆不到个人头上）。"""
-    async with SessionLocal() as s:
-        rows = (await s.execute(
-            select(TeamMember, User)
-            .join(User, User.id == TeamMember.user_id)
-            .where(TeamMember.team_id == _u(team_id))
-            .order_by(TeamMember.joined_at)
-        )).all()
-        # 每人近 30 天发起过多少 run：光有"角色"看不出谁在真正用这套系统
-        # select 返回 (user, count, last) 三元组，不能直接 dict() —— 取前两列组对
-        since = datetime.now(timezone.utc) - timedelta(days=30)
-        act = {r[0]: (r[1], r[2]) for r in (await s.execute(
-            select(Run.triggered_by, func.count(), func.max(Run.created_at))
-            .where(Run.team_id == _u(team_id), Run.created_at >= since)
-            .group_by(Run.triggered_by))).all()}
-        return {"members": [{
-            "user_id": str(tm.user_id), "email": u.email, "display_name": u.display_name,
-            "role": tm.role, "joined_at": str(tm.joined_at),
-            "is_self": str(u.id) == ctx.user_id,
-            "runs_30d": int((act.get(tm.user_id) or (0, None))[0]),
-            "last_run_at": str(act[tm.user_id][1]) if tm.user_id in act else None,
-        } for tm, u in rows]}
-
-
-class MemberRoleIn(BaseModel):
-    role: str
-
-
-@router.put("/teams/{team_id}/members/{user_id}")
-async def update_member_role(team_id: str, user_id: str, body: MemberRoleIn,
-                             ctx: RequestContext = Depends(require(PERM_MEMBER))):
-    """改成员角色（owner 不可改：唯一 owner 被降级会让团队失去管理入口）。"""
-    if body.role not in ("admin", "developer", "viewer"):
-        raise HTTPException(status_code=400, detail="角色仅支持 admin/developer/viewer")
-    async with SessionLocal() as s:
-        tm = await s.get(TeamMember, (_u(team_id), _u(user_id)))
-        if tm is None:
-            raise HTTPException(status_code=404, detail="不是成员")
-        if tm.role == "owner":
-            raise HTTPException(status_code=400, detail="owner 角色不可改")
-        tm.role = body.role
-        await s.commit()
-        s.add(AuditLog(team_id=_u(team_id), actor_id=_u(ctx.user_id),
-                       action="member.role", target=str(user_id),
-                       detail_json={"role": body.role}))
-        await s.commit()
-    return {"ok": True}
-
-
-@router.post("/teams/{team_id}/members")
-async def add_member(team_id: str, body: MemberIn, ctx: RequestContext = Depends(require(PERM_MEMBER))):
-    if body.role not in ("admin", "developer", "viewer"):
-        raise HTTPException(status_code=400, detail="角色仅支持 admin/developer/viewer")
-    async with SessionLocal() as s:
-        u = await s.scalar(select(User).where(User.email == body.email.strip().lower()))
-        if u is None:
-            raise HTTPException(status_code=404, detail="该邮箱尚未注册，请让对方先注册登录")
-        tm = await s.get(TeamMember, (_u(team_id), u.id))
-        if tm:
-            raise HTTPException(status_code=409, detail="已是成员")
-        s.add(TeamMember(team_id=_u(team_id), user_id=u.id, role=body.role, invited_by=_u(ctx.user_id)))
-        await s.commit()
-        s.add(AuditLog(team_id=_u(team_id), actor_id=_u(ctx.user_id), action="member.add",
-                       target=u.email, detail_json={"role": body.role}))
-        await s.commit()
-    return {"ok": True}
-
-
-@router.delete("/teams/{team_id}/members/{user_id}")
-async def remove_member(team_id: str, user_id: str, ctx: RequestContext = Depends(require(PERM_MEMBER))):
-    async with SessionLocal() as s:
-        tm = await s.get(TeamMember, (_u(team_id), _u(user_id)))
-        if tm is None:
-            raise HTTPException(status_code=404, detail="不是成员")
-        if tm.role == "owner":
-            raise HTTPException(status_code=400, detail="不能移除 owner")
-        await s.delete(tm)
-        await s.commit()
-        s.add(AuditLog(team_id=_u(team_id), actor_id=_u(ctx.user_id), action="member.remove",
-                       target=str(user_id)))
-        await s.commit()
-    return {"ok": True}
-
+# 个人版已移除「成员管理」：不再有邀请/添加账号、改角色、移除成员。
+# 一个工作区只属于当前登录用户，账号本身由登录体系（/api/auth）管理。
 
 # ---------------------------------------------------------------- 用量
 def _local_offset_hours() -> int:
@@ -901,7 +1043,6 @@ async def usage(days: int = Query(30, ge=1, le=365),
     比如只看项目组长自己的缓存命中率。facets 永远按未筛选的全集返回，避免选中后下拉只剩自己。"""
     since = datetime.now(timezone.utc) - timedelta(days=days)
     tz_off = _local_offset_hours()
-    is_sqlite = DATABASE_URL.startswith("sqlite")
     call_cond = [LlmCall.team_id == _u(ctx.team_id), LlmCall.created_at >= since]
     if agent:
         call_cond.append(LlmCall.agent_key == agent)
@@ -960,10 +1101,7 @@ async def usage(days: int = Query(30, ge=1, le=365),
             .where(*call_cond)
             .group_by(Run.project_id))).all()
         # 按天（本地日切）：调用数 + tokens，供趋势图
-        day_expr = (func.date(func.datetime(LlmCall.created_at, f"{tz_off:+d} hours"))
-                    if is_sqlite else
-                    func.date(func.date_add(LlmCall.created_at,
-                                            text(f"INTERVAL {tz_off} HOUR"))))
+        day_expr = func.date(func.datetime(LlmCall.created_at, f"{tz_off:+d} hours"))
         by_day = (await s.execute(
             select(day_expr, func.count(),
                    func.coalesce(func.sum(LlmCall.prompt_tokens + LlmCall.completion_tokens), 0),

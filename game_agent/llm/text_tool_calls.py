@@ -19,14 +19,17 @@ from typing import Any
 
 from game_agent.llm.base import ToolCall
 
-# 分隔符：竖线（半角/全角）、空白、斜杠可以任意顺序出现在尖括号与关键词之间
-_SEP = r"[|｜\s/]*"
+# 分隔符：竖线（半角/全角）、空白、斜杠（半角/全角）可以任意顺序出现在尖括号与关键词之间
+_SEP = r"[|｜\s/／]*"
+# 闭合标签的斜杠：模型偶尔把 `/` 打成全角 `／`（实测 2026-11-10 山西可研会话：
+# `<／｜DSML｜｜parameter>` 这种闭合全用全角斜杠，整段调用解析失败、原文漏进聊天流）
+_SLASH = r"[/／]"
 # 命名空间段：各家模板在关键词前带自己的标记（DSML / tool_call / tool_calls）
 _NS = r"(?:DSML|tool_calls?|functions?)?" + _SEP
 # 开始标签前缀
 _OPEN = r"<" + _SEP + _NS
-# 闭合标签前缀：斜杠可出现在竖线之后或尖括号之后（两种写法都见过）
-_CLOSE = r"<" + r"[|｜\s]*" + r"/" + _SEP + _NS
+# 闭合标签前缀：斜杠可出现在竖线之后或尖括号之后（两种写法都见过）；斜杠有半角/全角
+_CLOSE = r"<" + r"[|｜\s]*" + _SLASH + _SEP + _NS
 _KW = r"(?:invoke|call|tool_call)"
 # 关键词后面紧跟竖线 = 它其实是命名空间段（如 tool_call|parameter），不是标签名
 _KW_T = _KW + r"\b(?![|｜])"
@@ -45,12 +48,12 @@ _LEFTOVER_RE = re.compile(r"<[^>\n]*[|｜][^>\n]*>")
 # function 模板：开始标签的取值写法有两种（等号式与 name 属性式），参数标签不带 string 声明
 _FUNC_RE = re.compile(
     r"<" + _SEP + r"function\s*(?:=\s*[\"']?|\s+name\s*=\s*[\"'])([^\"'>\s]+)[\"']?\s*>", re.I)
-_FUNC_CLOSE_RE = re.compile(r"<" + r"[|｜\s]*" + r"/" + _SEP + r"function\s*>", re.I)
+_FUNC_CLOSE_RE = re.compile(r"<" + r"[|｜\s]*" + _SLASH + _SEP + r"function\s*>", re.I)
 # function 模板的参数标签有两种写法：属性式（name 加引号）与等号式（等号后直接跟参数名）
 _PNAME = r"(?:" + _NAME_ALT + r"|=\s*[\"']?([^\"'\s>]+)[\"']?)"
 _FUNC_ARG_RE = re.compile(
     r"<" + _SEP + r"parameter\b[^>]*?" + _PNAME + r"\s*>(?P<val>.*?)"
-    r"<" + r"[|｜\s]*" + r"/" + _SEP + r"parameter\s*>", re.I | re.S)
+    r"<" + r"[|｜\s]*" + _SLASH + _SEP + r"parameter\s*>", re.I | re.S)
 
 
 def _coerce_arg(raw: str, declared_str: bool) -> Any:

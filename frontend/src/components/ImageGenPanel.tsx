@@ -101,7 +101,8 @@ export default function ImageGenPanel(
   const poll = useJobPoll(1200);
   const jobProgress = poll.progress;
   const stageLog = poll.log;
-  // 本次结果 / 历史 / 摘要：跨组件卸载持久化（切换面板、刷新页面后仍能看到刚出的图）。
+  // 本次结果 / 历史 / 摘要：「本次结果」跨卸载持久化（刷新后仍能看到刚出的图）；
+  // 「历史」（本次会话生成记录）只活在当前挂载期，刷新即清，避免每次打开都多出一组重复图。
   // 只存元数据（含后端文件路径 file），图片 blob URL 在恢复时按 file 重新拉取。
   const [shots, setShots] = useState<Shot[]>([]);
   const [history, setHistory] = useState<Shot[]>([]);
@@ -148,9 +149,12 @@ export default function ImageGenPanel(
       .catch(() => setProjPresetId(""));
   }, [projectId]);
 
-  // ---- 结果持久化：切换面板 / 刷新页面后仍能看到刚生成的图 ----
-  // 组件卸载会丢 shots/history/meta（用户反馈「生成完切换一下就没了」）。这里只把
-  // 元数据（含后端文件路径 file）存 localStorage，图片 blob URL 恢复时按 file 重取。
+  // ---- 结果持久化：刷新页面后仍能看到「本次结果」 ----
+  // 组件卸载会丢 shots/meta（用户反馈「生成完切换一下就没了」）。这里只把
+  // 本次结果的元数据（含后端文件路径 file）存 localStorage，图片 blob URL 恢复时按 file 重取。
+  // 注意：history（「本次会话生成记录」= 往次历史）刻意不落 localStorage —— 否则它会跟着
+  // 「本次结果」一起被恢复，导致每次打开都同时出现两组同样的图，看上去像「一直在、清不掉」
+  // （2026-11-10 用户反馈）。刷新后只保留本次结果，历史仅存活于当前挂载期、便于切回上一批。
   // 读写都按 projectId 分键，并等「该项目的恢复完成」才允许回写，避免切换项目时
   // 把上一个项目的结果写进新项目的槽位。
   const stripUrl = (s: Shot): Shot => ({ ...s, url: "" });
@@ -159,7 +163,6 @@ export default function ImageGenPanel(
     try { localStorage.setItem(key, JSON.stringify(list.map(stripUrl))); } catch { /* 忽略配额/隐私模式 */ }
   };
   useEffect(() => { saveShots(`ga_imagegen_result:${projectId || "_"}`, shots); }, [shots, projectId]);
-  useEffect(() => { saveShots(`ga_imagegen_history:${projectId || "_"}`, history); }, [history, projectId]);
   useEffect(() => { saveShots(`ga_imagegen_meta:${projectId || "_"}`, meta ? [meta as any] : []); }, [meta, projectId]);
 
   useEffect(() => {
@@ -168,12 +171,12 @@ export default function ImageGenPanel(
     shotsRestored.current = ""; // 恢复中：禁止回写
     (async () => {
       const rk = `ga_imagegen_result:${pkey}`;
-      const hk = `ga_imagegen_history:${pkey}`;
       const mk = `ga_imagegen_meta:${pkey}`;
-      let restoredS: Shot[] = [], restoredH: Shot[] = [], restoredM: any = null;
+      let restoredS: Shot[] = [], restoredM: any = null;
       try { restoredS = JSON.parse(localStorage.getItem(rk) || "[]"); } catch { /* ignore */ }
-      try { restoredH = JSON.parse(localStorage.getItem(hk) || "[]"); } catch { /* ignore */ }
       try { restoredM = (JSON.parse(localStorage.getItem(mk) || "[]") || [])[0] || null; } catch { /* ignore */ }
+      // 旧版本曾把 history 也落盘，这里顺手清掉，避免遗留键继续占空间
+      try { localStorage.removeItem(`ga_imagegen_history:${pkey}`); } catch { /* ignore */ }
       // 换项目时先清掉上一个项目的内存状态，避免串号
       if (alive) { setShots([]); setHistory([]); setMeta(null); }
       const backfill = async (list: Shot[]) => Promise.all(list.map(async (s) => {
@@ -181,10 +184,11 @@ export default function ImageGenPanel(
         try { const url = await api.imageGenBlob(s.file); blobUrls.current.add(url); return { ...s, url }; }
         catch { return s; }
       }));
-      const [s2, h2] = await Promise.all([backfill(restoredS), backfill(restoredH)]);
+      const s2 = await backfill(restoredS);
       if (!alive) return;
+      // 只恢复「本次结果」；「本次会话生成记录」不从落盘恢复（每次打开都从空开始，
+      // 只在本次挂载期里生成多批后才出现），这样刷新后不会一直挂着一份旧记录。
       if (s2.length) setShots(s2);
-      if (h2.length) setHistory(h2);
       if (restoredM) setMeta(restoredM);
       shotsRestored.current = pkey; // 恢复完成：此后才允许回写该项目槽位
     })();

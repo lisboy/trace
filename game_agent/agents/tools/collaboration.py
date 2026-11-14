@@ -27,6 +27,13 @@ async def report_to_user(args: dict, t: ToolContext) -> str:
     if t.orchestrator is None:
         raise ToolError("编排器不可用")
     report = args.get("report", "")
+    # 子agent 的「汇报」其实是交给主agent 的调研结论：单独存到 task 维度。
+    # 以前和主agent 共用 set_final_summary(run_id)，子agent 一汇报就把用户看到的
+    # 最终总结顶成子任务的片段（run 54fbf901 实测：主agent 还没收尾，final_summary
+    # 已经是某个子agent 的结论）。
+    if getattr(t, "role", "") == "sub" and getattr(t, "task_id", ""):
+        await t.orchestrator.set_sub_summary(str(t.task_id), report)
+        return "已汇报给主agent。"
     await t.orchestrator.set_final_summary(t.run_ctx.run_id, report)
     return "已汇报给用户。"
 
@@ -258,7 +265,7 @@ async def _image_batch(jobs: list[dict], t: ToolContext) -> str:
 
 @media_queue.serialized("image")
 async def generate_image(args: dict, t: ToolContext) -> str:
-    """直接生成图片（走团队配置的美术模型/本地 ComfyUI）。
+    """直接生成图片（走设置里绑定的美术模型/本地 ComfyUI）。
 
     - 批量（items / count > 1）：串行逐张生成，一张一张落盘并推进度事件；
     - 单张：直接生成本地真实图片文件，返回文件相对路径。
@@ -306,8 +313,8 @@ async def _warm_video_backend(t: ToolContext) -> str:
     if not COMFYUI_BASE_URL:
         return "（未配置 ComfyUI 地址）"
     try:
-        from game_agent.assets.comfyui import ensure_comfyui_running
-        boot = await ensure_comfyui_running(COMFYUI_BASE_URL)
+        from game_agent.assets.comfyui import actual_base, ensure_comfyui_running
+        boot = await ensure_comfyui_running(actual_base())
     except Exception as e:  # noqa: BLE001
         log.warning("整批出片预热：检查失败 %s: %s", type(e).__name__, e)
         return f"（本地出片服务检查失败：{type(e).__name__}: {e}）"
@@ -474,7 +481,8 @@ MAX_AUDIO_JOBS = 24
 # 批量时透传给每条音频的公共字段
 _AUDIO_BASE_KEYS = ("voice", "kind", "note", "slug", "out", "design_desc", "design_say",
                     "preset_name", "design_n", "prompt", "text", "duration_s",
-                    "emo_mode", "emo_text", "emo_weight", "emo_vector", "emo_audio")
+                    "emo_mode", "emo_text", "emo_weight", "emo_vector", "emo_audio",
+                    "speed", "lang")
 
 
 def _audio_jobs(args: dict) -> list[dict]:
@@ -725,7 +733,7 @@ async def _audio_batch(jobs: list[dict], t: ToolContext) -> str:
 
 @media_queue.serialized("voice")
 async def generate_audio(args: dict, t: ToolContext) -> str:
-    """直接生成音频（走团队配置的配音模型/本地 IndexTTS2）。
+    """直接生成音频（走设置里绑定的配音模型/本地 IndexTTS2）。
 
     - kind: voice（台词配音，默认）| sfx（音效）| music（BGM）；
     - 批量（items / count > 1）：串行逐条生成并推进度事件；

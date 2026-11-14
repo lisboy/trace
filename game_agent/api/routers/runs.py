@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,8 +22,11 @@ from game_agent.auth.rbac import (PERM_COMMENT, PERM_RUN_CANCEL_OTHERS, PERM_RUN
 from game_agent.core.context import RequestContext
 from game_agent.core.notices import post_session_notice
 from game_agent.db.models import (Artifact, Comment, Event, LlmCall, LlmTranscript,
-                                  Message, Run, Session, Task, WorkOrder)
+                                  Message, Run, RunQuestion, Session, Task, WorkOrder)
 from game_agent.db.session import SessionLocal
+from game_agent.logging_setup import get_logger
+
+log = get_logger("api.runs")
 
 router = APIRouter(prefix="/api", tags=["runs"])
 
@@ -47,6 +50,12 @@ async def run_detail(run_id: str, ctx: RequestContext = Depends(require(PERM_VIE
             .where(LlmCall.run_id == _u(run_id)))).one()
         prompt, completion, cached, total_ms = int(u[1]), int(u[2]), int(u[3]), int(u[4])
         reported = int(u[5])
+        # 当前是否停在一个待回答的提问上（同一 run 内暂停）：让前端在刷新/重连后也能
+        # 正确显示「等你回答」而不误以为「执行中」。
+        pending_q = await s.scalar(
+            select(RunQuestion).where(
+                RunQuestion.run_id == _u(run_id),
+                RunQuestion.status == "pending").order_by(RunQuestion.created_at.desc()).limit(1))
         usage = {
             "calls": int(u[0]), "prompt": prompt, "completion": completion,
             "cached": cached, "total": prompt + completion,
@@ -66,6 +75,8 @@ async def run_detail(run_id: str, ctx: RequestContext = Depends(require(PERM_VIE
         "usage": usage,
         "tasks": [{"id": str(t.id), "kind": t.kind, "agent_key": t.agent_key,
                    "title": t.title, "status": t.status, "attempt": t.attempt,
+                   "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
+                   "cancel_requested": bool(getattr(t, "cancel_requested", False)),
                    "result_json": t.result_json} for t in tasks],
         "work_order": {
             "goal": wo.goal, "checklist": wo.checklist_json, "art_direction": wo.art_direction,
@@ -74,6 +85,7 @@ async def run_detail(run_id: str, ctx: RequestContext = Depends(require(PERM_VIE
                        "rel_path": a.rel_path, "is_placeholder": a.is_placeholder,
                        "provider": a.provider} for a in arts],
         "plan": run.plan_json or [],
+        "awaiting_question": (pending_q.question if pending_q is not None else None),
     }
 
 
@@ -202,7 +214,7 @@ async def cancel_run(run_id: str, ctx: RequestContext = Depends(get_current_cont
         was_queued = run.status == "queued"
         if was_queued:
             run.status = "cancelled"
-            # 与后端其余部分一致用 Python UTC（func.now() 是 MySQL 会话本地时区）
+            # 与后端其余部分一致用 Python UTC（不用 func.now()：那是数据库本地时区）
             run.finished_at = datetime.now(timezone.utc)
         # 会在会话里补提示：提交后 ORM 对象可能过期，先把需要的标量取出来
         snap = {"session_id": run.session_id, "team_id": run.team_id,
@@ -216,6 +228,49 @@ async def cancel_run(run_id: str, ctx: RequestContext = Depends(get_current_cont
             session_id=snap["session_id"], run_id=run_id,
             team_id=snap["team_id"], project_id=snap["project_id"],
             text="已按你的要求取消本次执行（排队中，未开始执行）。")
+    return {"ok": True, "status": snap["status"]}
+
+
+@router.post("/runs/{run_id}/tasks/{task_id}/cancel")
+async def cancel_task(run_id: str, task_id: str,
+                      ctx: RequestContext = Depends(get_current_context)):
+    """单独停掉一个子agent（主agent 与其它子agent 继续跑）。
+
+    语义与整轮「停止」不同：整轮停止会掐断主agent 和全部子agent（见 cancel_run），
+    这里只给**某一个子 task** 置取消位，它自己的看门狗看到就只掐断它，把「已停止」当成
+    该子任务的结果回给主agent——主agent 既能继续等其它子agent，也能拿这条失败/停止信息
+    自己接手或再派一个新子agent（用户 2026-11-11 要求）。
+    """
+    async with SessionLocal() as s:
+        run = await s.get(Run, _u(run_id))
+        if run is None or str(run.team_id) != ctx.team_id:
+            raise HTTPException(status_code=404, detail="run 不存在")
+        is_self = str(run.triggered_by) == ctx.user_id
+        if is_self:
+            if not ctx.can(PERM_RUN_CANCEL_SELF):
+                raise HTTPException(status_code=403, detail="无权停止子agent")
+        else:
+            if not ctx.can(PERM_RUN_CANCEL_OTHERS):
+                raise HTTPException(status_code=403, detail="无权停止他人的 run")
+        task = await s.get(Task, _u(task_id))
+        if task is None or str(task.run_id) != str(run.id):
+            raise HTTPException(status_code=404, detail="子任务不存在")
+        if task.status in ("done", "failed", "cancelled"):
+            # 已经收口的子任务不用再停：如实告诉前端（前端据此刷新状态）
+            return {"ok": True, "status": task.status, "already": True}
+        task.cancel_requested = True
+        snap = {"status": task.status, "session_id": run.session_id,
+                "project_id": run.project_id}
+        await s.commit()
+    # 广播一条状态，前端收到立刻拉事件流（task_done(cancelled) 由看门狗落库后推送）
+    try:
+        from game_agent.core.abstractions import EventEnvelope
+        await state.services.bus.emit(EventEnvelope(
+            team_id=str(ctx.team_id), project_id=str(snap["project_id"]),
+            run_id=str(run_id), type="status",
+            payload={"status": "running", "note": "已停止一个子agent"}))
+    except Exception:  # noqa: BLE001 - 广播失败不影响取消
+        pass
     return {"ok": True, "status": snap["status"]}
 
 
@@ -292,6 +347,7 @@ async def steer_run(run_id: str, body: SteerIn,
         if body.analyze is not None:
             settings_switch["analyze"] = bool(body.analyze)
     client_msg_id = (body.client_msg_id or "").strip()[:64]
+    switch_label: str | None = None
     async with SessionLocal() as s:
         run, _project, workspace = await _run_workspace(s, run_id, ctx)
         snap = {"status": run.status, "session_id": run.session_id,
@@ -311,6 +367,7 @@ async def steer_run(run_id: str, body: SteerIn,
                     ModelProfile.kind == "llm"))
                 if prof is None:
                     raise HTTPException(status_code=400, detail="所选模型档位不存在")
+                switch_label = prof.model or prof.label or pkey
             opts = dict(run.options_json or {})
             if pkey:
                 opts["model_profile_key"] = pkey
@@ -391,19 +448,59 @@ async def steer_run(run_id: str, body: SteerIn,
                          "author_type": "user", "kind": "steer"},
             ))
         if model_switch is not None:
+            target = f"「{switch_label}」" if switch_label else "跟随角色默认"
+            if model_switch["effort"]:
+                target += f"，推理等级 {model_switch['effort']}"
             await state.services.bus.emit(EventEnvelope(
                 team_id=str(ctx.team_id), project_id=str(snap["project_id"]),
                 run_id=str(run_id), type="status",
                 payload={"status": "running",
-                         "note": ("已切换到新模型（下一轮对话起生效）"
-                                  if model_switch["profile_key"]
-                                  else "已切回跟随角色默认模型（下一轮对话起生效）")},
+                         "note": f"已收到模型切换 → {target}；当前这一轮仍用原模型跑完，"
+                                 "下一个思考轮次生效"},
             ))
     except Exception:  # noqa: BLE001 - 广播失败不影响投递，前端仍会轮询补拉
         pass
     steering.push(run_id, noted, images, model=model_switch)
     if settings_switch is not None:
         steering.push_settings(run_id, settings_switch)
+    # 插话分派（用户 2026-11-11 要求）：如果这一轮有正在跑的子agent，由**大模型**判断这条
+    # 插话该不该同步给其中哪几个，命中的子任务各自从自己的信箱取走。不阻塞主返回：
+    # 判定要一次短 LLM 调用，放到后台跑，主agent 的插话立即照旧投递（即便判定失败也只是
+    # 不给子agent 派，主agent 不受影响）。
+    if text and state.orchestrator is not None:
+        try:
+            async with SessionLocal() as _s2:
+                running_subs = (await _s2.execute(select(Task).where(
+                    Task.run_id == _u(run_id),
+                    Task.agent_key == "sub",
+                    Task.status == "running").order_by(Task.created_at))).scalars().all()
+        except Exception:  # noqa: BLE001 - 查询失败不影响插话投递
+            running_subs = []
+        if running_subs:
+            subs_info = [{"index": i, "name": (t.title or "").replace("子agent · ", ""),
+                          "question": str((t.result_json or {}).get("question") or t.title or "")}
+                         for i, t in enumerate(running_subs)]
+            task_ids = [str(t.id) for t in running_subs]
+
+            async def _dispatch(note_text: str, subs: list[dict], tids: list[str],
+                                team_id: str) -> None:
+                from game_agent.orchestration import interject
+                try:
+                    pkey = await state.orchestrator._agent_profile_key(team_id, "main")
+                    profile = await state.orchestrator._load_profile(team_id, pkey)
+                except Exception:  # noqa: BLE001
+                    profile = {}
+                try:
+                    targets = await interject.decide_targets(note_text, subs, profile=profile)
+                except Exception:  # noqa: BLE001 - 判定异常不派
+                    targets = []
+                for idx in targets:
+                    if 0 <= idx < len(tids):
+                        steering.push_to_task(tids[idx], note_text)
+                        log.info("interjection dispatched to subagent %s", tids[idx][:8])
+
+            import asyncio as _asyncio
+            _asyncio.create_task(_dispatch(noted, subs_info, task_ids, str(ctx.team_id)))
     return {"ok": True, "delivered": True, "images": len(images), "files": len(files)}
 
 
@@ -412,7 +509,9 @@ async def run_events(run_id: str, since: int = Query(0),
                      ctx: RequestContext = Depends(require(PERM_VIEW))):
     events = await state.services.repo.get_events_since(run_id, since)
     return [{"seq": e.seq, "type": e.type, "payload": e.payload_json,
-            "created_at": str(e.created_at)} for e in events]
+             # task_id：子agent 的事件带自己的 task，前端靠它把行归进对应的子agent 分组
+             "task_id": str(e.task_id) if e.task_id else None,
+             "created_at": str(e.created_at)} for e in events]
 
 
 # ---------------- diff 评审（设计 §8.4：自建 diff 评审 + 行内评论） ----------------
@@ -479,6 +578,154 @@ _RAW_CACHEABLE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
                        ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"}
 _RAW_CACHEABLE_EXTS_IMG = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico"}
 
+_MD_HTML = """<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+  body {{ font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+        line-height: 1.65; color: #1f2329; background: #fff; margin: 0; }}
+  .layout {{ display: flex; min-height: 100vh; align-items: flex-start; }}
+  /* 左侧目录：随页面滚动钉住，独立滚动 */
+  nav#md-nav {{ width: 224px; flex: 0 0 224px; position: sticky; top: 0;
+        max-height: 100vh; overflow-y: auto; border-right: 1px solid #f0f1f3;
+        background: #fafbfc; padding: 16px 8px; box-sizing: border-box; }}
+  .toc-title {{ font-size: 11px; font-weight: 500; letter-spacing: .04em;
+        color: #9aa0a6; padding: 0 8px 6px; }}
+  .toc-item {{ display: block; font-size: 11.5px; line-height: 1.35;
+        color: #57606a; text-decoration: none; padding: 3px 8px; border-radius: 5px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .toc-item:hover {{ background: #eef1f4; color: #24292f; }}
+  .toc-item.active {{ background: #eef3ff; color: #2f54eb; font-weight: 500; }}
+  main {{ flex: 1; min-width: 0; padding: 24px 28px 60px; }}
+  h1,h2,h3,h4 {{ line-height: 1.3; margin: 1.4em 0 .5em; scroll-margin-top: 16px; }}
+  h1 {{ font-size: 1.7em; border-bottom: 1px solid #e5e7eb; padding-bottom: .3em; }}
+  h2 {{ font-size: 1.4em; border-bottom: 1px solid #f0f1f3; padding-bottom: .25em; }}
+  table {{ border-collapse: collapse; margin: 1em 0; display: block;
+         overflow-x: auto; max-width: 100%; }}
+  th,td {{ border: 1px solid #d0d7de; padding: 6px 10px; font-size: .93em; }}
+  th {{ background: #f6f8fa; }}
+  code {{ background: #f2f3f5; padding: 1px 5px; border-radius: 3px;
+        font-family: ui-monospace, Consolas, monospace; font-size: .9em; }}
+  pre {{ background: #f6f8fa; padding: 12px 14px; border-radius: 6px;
+       overflow-x: auto; }}
+  pre code {{ background: none; padding: 0; }}
+  blockquote {{ color: #57606a; border-left: 4px solid #d0d7de;
+              margin: 1em 0; padding: 0 12px; }}
+  img {{ max-width: 100%; }}
+  @media (max-width: 820px) {{ nav#md-nav {{ display: none; }} }}
+</style>
+</head><body>
+<div class="layout">
+  <nav id="md-nav" style="display:none">
+    <div class="toc-title">目录</div>
+    <div id="md-nav-list"></div>
+  </nav>
+  <main>
+    <div id="md-src" style="display:none">{src}</div>
+    <div id="md-out"></div>
+  </main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script>
+(function () {{
+  var raw = document.getElementById("md-src").textContent;
+  var out = document.getElementById("md-out");
+  var nav = document.getElementById("md-nav");
+  var navList = document.getElementById("md-nav-list");
+  var headingEls = [];
+  var activeLink = null;
+
+  function render() {{
+    if (window.marked) {{
+      marked.setOptions({{ gfm: true, breaks: false }});
+      out.innerHTML = marked.parse(raw);
+    }} else {{
+      // CDN 不可达（离线服务器）：退回等宽排版，至少表格逐行可读，不比纯文本差
+      var pre = document.createElement("pre");
+      pre.style.cssText = "white-space:pre-wrap;font-size:13px";
+      pre.textContent = raw;
+      out.appendChild(pre);
+    }}
+    buildToc();
+  }}
+
+  // 渲染后从真实 DOM 抓 h1~h4 建目录（同名标题去重 -1/-2，代码块里的 # 不会误收）
+  function buildToc() {{
+    var hs = Array.prototype.slice.call(out.querySelectorAll("h1, h2, h3, h4"));
+    if (hs.length < 2) return; // 0~1 个标题没有目录价值，正文铺满
+    var seen = {{}};
+    hs.forEach(function (el) {{
+      var base = (el.textContent || "").trim() || "（无标题）";
+      var n = seen[base] || 0;
+      seen[base] = n + 1;
+      var id = n > 0 ? base + "-" + n : base;
+      el.id = id;
+      var a = document.createElement("a");
+      a.href = "#" + encodeURIComponent(id);
+      a.textContent = base;
+      a.className = "toc-item";
+      a.title = base;
+      a.style.paddingLeft = ((Number(el.tagName[1]) - 1) * 10 + 8) + "px";
+      a.addEventListener("click", function (ev) {{
+        ev.preventDefault();
+        scrollToHeading(el, a);
+      }});
+      navList.appendChild(a);
+      headingEls.push({{ el: el, link: a }});
+    }});
+    nav.style.display = "";
+  }}
+
+  function scrollToHeading(el, a) {{
+    setActive(a);
+    var startY = window.scrollY;
+    el.scrollIntoView({{ behavior: "smooth", block: "start" }});
+    // 无合成器环境（headless / 远程桌面）smooth 可能静默不动：退回瞬时跳转
+    window.setTimeout(function () {{
+      if (Math.abs(window.scrollY - startY) < 4) {{
+        el.scrollIntoView({{ behavior: "auto", block: "start" }});
+      }}
+    }}, 300);
+  }}
+
+  function setActive(a) {{
+    if (activeLink) activeLink.classList.remove("active");
+    activeLink = a;
+    a.classList.add("active");
+  }}
+
+  // 滚动高亮：找判定线之上最近的一个标题
+  var ticking = false;
+  function onScroll() {{
+    if (ticking) return;
+    ticking = true;
+    window.requestAnimationFrame(function () {{
+      var top = 56;
+      var cur = null;
+      headingEls.forEach(function (h) {{
+        if (h.el.getBoundingClientRect().top <= top) cur = h.link;
+      }});
+      if (cur) setActive(cur);
+      ticking = false;
+    }});
+  }}
+  window.addEventListener("scroll", onScroll, {{ passive: true }});
+
+  render();
+}})();
+</script>
+</body></html>"""
+
+
+def _md_as_html(target: Path) -> str:
+    """Markdown 包成可渲染的 HTML 壳。文本先做 HTML 转义再塞进 DOM，
+    由 marked 解析——不直接拼 HTML，文件内容里的 <script> 不会被执行。"""
+    import html as _html
+    text = target.read_bytes().decode("utf-8", errors="replace")
+    return _MD_HTML.format(title=_html.escape(target.name),
+                           src=_html.escape(text))
+
 
 def _resolve_in_workspace(workspace, rel: str) -> Path:
     """把「工作区相对路径」解析成绝对路径；越界一律 400。"""
@@ -540,6 +787,46 @@ async def run_file(run_id: str, path: str = Query(...), mode: str = Query("text"
             "content": target.read_bytes().decode("utf-8", errors="replace")}
 
 
+class RevealBody(BaseModel):
+    path: str
+
+
+@router.post("/runs/{run_id}/reveal")
+async def run_reveal(run_id: str, body: "RevealBody",
+                     ctx: RequestContext = Depends(require(PERM_VIEW))):
+    """在系统文件管理器里定位工作区里的文件（点击文件查看器顶部的路径触发）。
+
+    Windows 用 explorer /select（选中该文件），文件已不存在（如已删/已回滚）则退回
+    打开工作区根目录。必须走 to_thread：Windows 上的 Selector 事件循环里
+    asyncio.create_subprocess_exec 永远 NotImplementedError（见项目记忆）。
+    """
+    import sys
+    import subprocess
+
+    async with SessionLocal() as s:
+        _, _, workspace = await _run_workspace(s, run_id, ctx)
+
+    try:
+        target_abs = _resolve_in_workspace(workspace, body.path)
+        exists = target_abs.is_file()
+    except HTTPException:
+        raise
+    if not exists:
+        # 文件已被删/回滚：退回定位到工作区根目录
+        target_abs = Path(workspace).resolve()
+
+    def _open(abs_path: Path) -> None:
+        if sys.platform == "win32":
+            # explorer /select 选中后自身退出码是 1，不能当失败
+            subprocess.run(["explorer", "/select,", str(abs_path)], check=False)
+        else:  # linux / mac：打开所在目录
+            subprocess.run(["xdg-open" if sys.platform != "darwin" else "open",
+                            str(abs_path.parent)], check=False)
+
+    await run_in_threadpool(_open, target_abs)
+    return {"ok": True}
+
+
 @router.get("/runs/{run_id}/raw/{file_path:path}")
 async def run_raw(run_id: str, file_path: str,
                   thumb: int = Query(0),
@@ -555,6 +842,11 @@ async def run_raw(run_id: str, file_path: str,
     target = _resolve_in_workspace(workspace, file_path)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
+    # Markdown 不能按字节直出：浏览器只显示纯文本，表格/标题全糊成一行
+    # （用户截图：/raw/.../review.md 打开是一坨）。包一层 HTML 壳交给
+    # marked 渲染；离线环境 CDN 失败时退回等宽 <pre>，不比原来差。
+    if target.suffix.lower() == ".md":
+        return Response(content=_md_as_html(target), media_type="text/html")
     is_img = target.suffix.lower() in _RAW_CACHEABLE_EXTS_IMG
     if thumb and is_img:
         from starlette.concurrency import run_in_threadpool

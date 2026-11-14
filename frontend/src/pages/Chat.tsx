@@ -9,7 +9,7 @@ import ModelPicker, { DEFAULT_MODEL_CHOICE, type ModelChoice } from "../componen
 import RunPanel from "../components/RunPanel";
 import Markdown from "../components/Markdown";
 import { ProjectScriptButtons } from "../components/ProjectScriptButtons";
-import RunTraceInline, { type SteerNote, type RunStat } from "../components/RunTraceInline";
+import RunTraceInline, { type SteerNote, type ReplyNote, type RunStat } from "../components/RunTraceInline";
 import AskQuestion from "../components/AskQuestion";
 import PlanChecklist from "../components/PlanChecklist";
 import SessionUsage from "../components/SessionUsage";
@@ -22,9 +22,6 @@ import { fireNotify, truncBody } from "../notify";
 import { loadQueueImages, saveQueueImages } from "../queueMedia";
 import { ROLE_LABEL, type Message, type PermissionScope, type ProjectSummary, type Session } from "../types";
 import { defaultScope } from "../assistantPolicy";
-import {
-  EMO_PRESETS, emoLabel, emoPayload, loadChatEmo, saveChatEmo, type ChatEmo,
-} from "../chatTts";
 
 /** UUID 归一比较：runs.session_id 存的是 32 位无横线串，sessions.id 带横线，
  *  直接 === 永远不相等（会导致「正在执行的会话」永远认不出来）。 */
@@ -35,6 +32,8 @@ function sameId(a?: string | null, b?: string | null): boolean {
 
 /** 没有插话时返回同一个空数组：每次新建一个会让轨迹里的行缓存整段作废、全量重算。 */
 const NO_STEERS: SteerNote[] = [];
+/** 同理：没有中途答复时返回同一个空数组。 */
+const NO_REPLIES: ReplyNote[] = [];
 
 /** 首屏消息分页大小：大会话（几百条 + 大量附图）只先拉最近一屏，
  *  往上翻到顶再按 created_at cursor 拉更早的，避免一次吐全量把页面撑爆。 */
@@ -43,11 +42,17 @@ const MSG_PAGE = 60;
 /** 这条消息是否「接管」它所属 run 的执行轨迹/改动卡片（只有助手与系统消息接管）。
  *  插话落的 user 消息也带 run_id（见 runs.py 的 steer_run），若把它算作「这条 run 已落消息」，
  *  底部那块实时轨迹会在插话瞬间被自己抹掉，而 user 气泡又不画轨迹 → 两段话中间的内容整段消失。
- *  另外，**阶段汇报消息**（meta.kind==='stage_report'）虽也是 agent 消息、也带 run_id，
- *  但它只是途中一次汇报，不接管轨迹——轨迹必须挂在最后那条收尾消息上，否则长任务里
- *  每来一次阶段汇报，整段执行轨迹就会「搬」到这条中间消息上，看着像跑到了过去。 */
+ *  另外，**中途进度消息**（meta.kind==='stage_report'）虽也是 agent 消息、也带 run_id，
+ *  但它只是途中一句进度同步，不接管轨迹——轨迹必须挂在最后那条收尾消息上，否则长任务里
+ *  每来一次进度消息，整段执行轨迹就会「搬」到这条中间消息上，看着像跑到了过去。 */
 function ownsRunUi(m: Message): boolean {
-  return !!m.run_id && m.author_type !== "user" && m.meta?.kind !== "stage_report";
+  // 提问消息（kind==='question'）不算接管：它由输入框上方的提问面板统一渲染，
+  // 且提问是「同一 run 内暂停」，轨迹应挂在底部实时块/后续动作上，不该被一条问题气泡牵走。
+  // 临时回复（kind==='interim_reply'）同理：等子agent/插话期间的一段过渡答复，
+  // 不是这次执行的最终交付，轨迹必须继续留在底部实时块直到收尾消息出现。
+  return !!m.run_id && m.author_type !== "user"
+    && m.meta?.kind !== "stage_report" && m.meta?.kind !== "question"
+    && m.meta?.kind !== "interim_reply";
 }
 
 /** 会话里的图片可能是 dataURL，也可能是服务端 URL；剪贴板只认 dataURL，统一转一道。
@@ -148,7 +153,7 @@ const QUEUE_MAX_KEEP = 10;
 interface QueuedFile { path: string; name: string; size: number }
 /** imageCount 只在「从 localStorage 读回来」时有值：文字/附件走 localStorage，图片本体走
  *  IndexedDB（见 queueMedia.ts），刷新后由 loadQueueImages 还原；还原不到时才提示重新附上。 */
-interface QueueItem { id: string; content: string; images: string[]; files: QueuedFile[]; imageCount?: number; analyze?: boolean; caps?: Record<string, boolean>; modelProfile?: string; reasoningEffort?: string; scope?: PermissionScope }
+interface QueueItem { id: string; content: string; images: string[]; files: QueuedFile[]; imageCount?: number; modelProfile?: string; reasoningEffort?: string; scope?: PermissionScope }
 
 function queueArchive(): Record<string, QueueItem[]> {
   try {
@@ -174,8 +179,6 @@ function loadQueue(sessionId?: string | null): QueueItem[] {
         images,
         files: Array.isArray(q.files) ? q.files : [],
         imageCount: Math.max(Number(q.imageCount) || 0, images.length),
-        analyze: !!q.analyze,
-        caps: q.caps && typeof q.caps === "object" ? q.caps : undefined,
         modelProfile: typeof q.modelProfile === "string" ? q.modelProfile : "",
         reasoningEffort: typeof q.reasoningEffort === "string" ? q.reasoningEffort : "",
         scope: q.scope === "full" ? "full" : "workspace",
@@ -194,8 +197,6 @@ function saveQueue(sessionId: string | null | undefined, items: QueueItem[]): vo
       id: q.id, content: q.content, files: q.files,
       images: [] as string[],
       imageCount: q.images.length || (q.imageCount || 0),
-      analyze: !!q.analyze,
-      caps: q.caps,
       modelProfile: q.modelProfile || "",
       reasoningEffort: q.reasoningEffort || "",
       scope: q.scope,
@@ -229,7 +230,7 @@ function fileKindLabel(kind?: string): string {
 function AutoContinueNote({ text, count }: { text: string; count: number }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="mx-auto max-w-2xl rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+    <div className="ga-auto-continue mx-auto max-w-2xl rounded-lg border border-amber-200 px-3 py-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-[12.5px] text-amber-800">
           ⏩ 系统自动续跑：上一轮清单还有 {count || "若干"} 项没做完，已排队接着做
@@ -242,7 +243,7 @@ function AutoContinueNote({ text, count }: { text: string; count: number }) {
         </button>
       </div>
       {open && (
-        <div className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap border-t border-amber-200 pt-2 text-[11.5px] leading-relaxed text-amber-900">
+        <div className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere] border-t border-amber-200 pt-2 text-[11.5px] leading-relaxed text-amber-900">
           {text}
         </div>
       )}
@@ -250,23 +251,20 @@ function AutoContinueNote({ text, count }: { text: string; count: number }) {
   );
 }
 
-/** 单条消息的整块渲染（气泡 + 附图 + 轨迹 + 改动 + 朗读）。
+/** 单条消息的整块渲染（气泡 + 附图 + 轨迹 + 改动）。
  *  从主组件的 map 里抽出来：虚拟列表只需要为「视口附近」的消息调用它，
  *  不再一次把几百条消息的 Markdown/图片/轨迹全挂到 DOM 上。 */
 function MessageItem({
-  m, mi, role, traceHostIdxOfRun, steerHasHost, steersOf, runStatById,
+  m, mi, role, traceHostIdxOfRun, steerHasHost, steersOf, repliesOf, runStatById,
   runsLoaded, runningRunId, usageKey, lastMsgIdxOfRun, setZoom,
-  speakMessage, ttsBusyId, ttsAudio, ttsErr, ttsEmo, onTtsEmoClick,
 }: {
   m: Message; mi: number; role: (m: Message) => string;
   traceHostIdxOfRun: Record<string, number>; steerHasHost: (id: string) => boolean;
-  steersOf: (id: string) => SteerNote[]; runStatById: Record<string, RunStat>;
+  steersOf: (id: string) => SteerNote[]; repliesOf: (id: string) => ReplyNote[];
+  runStatById: Record<string, RunStat>;
   runsLoaded: boolean; runningRunId: string | null; usageKey: number;
   lastMsgIdxOfRun: Record<string, number>;
   setZoom: (z: { src: string; alt: string } | null) => void;
-  speakMessage: (m: Message) => void;
-  ttsBusyId: string | null; ttsAudio: Record<string, string>; ttsErr: Record<string, string>;
-  ttsEmo: ChatEmo; onTtsEmoClick: (e: React.MouseEvent) => void;
 }) {
   // 附图缩略图加载失败：可能只是网络抖动 / 服务端一时没起来，别急着判「文件已清理」。
   // 失败先自动重试两次（带 cache-bust），仍不行才显示一张中性占位卡，点它还可手动再试或开原图。
@@ -299,11 +297,19 @@ function MessageItem({
       probeReason(full, i);
     }
   };
-  // 插话统一并入所属 run 的轨迹按时间显示（带图也一起）：留在消息流会出现
+  // 插话/回答统一并入所属 run 的轨迹按时间显示（带图也一起）：留在消息流会出现
   // 「我明明在后面插话，却显示到前面去」。带附件的插话除外（文件芯片要显示）。
-  // 没有轨迹宿主时也原位兜底显示，绝不能让插话凭空消失。
+  // 没有轨迹宿主时也原位兜底显示，绝不能让插话/回答凭空消失。
   if (m.author_type === "user" && m.run_id && steerHasHost(m.run_id)
     && !m.meta?.files?.length) return null;
+  // 提问消息：由输入框上方的提问面板（AskQuestion）统一渲染成选项卡片，
+  // 消息流里不再重复一条原始问题气泡——这既是「样式」修复，也避免同一句问题出现两次。
+  if (m.author_type !== "user" && m.meta?.kind === "question") return null;
+  // 主 agent 中途落的答复（临时回复/进度）：有轨迹宿主时按发生时刻嵌进轨迹（见
+  // repliesOf → RunTraceInline），消息流里不再重复一条气泡——否则它会悬在消息流末尾，
+  // 看起来像「跑到了最上面/最下面」而不是过程的一部分。没有宿主时原位兜底显示。
+  if (m.author_type !== "user" && m.run_id && steerHasHost(m.run_id)
+    && (m.meta?.kind === "interim_reply" || m.meta?.kind === "stage_report")) return null;
   // 系统自动续跑的「续跑说明」：折成一条提示，不把整段指令贴成用户气泡
   //（点「继续」的手动续跑不再发消息，所以这里只会命中自动续跑）
   if (m.author_type === "user" && m.meta?.auto_continue_from)
@@ -316,17 +322,25 @@ function MessageItem({
         />
       </div>
     );
-  // 阶段汇报：run 还在跑、途中交的一份完整报告（meta.kind==='stage_report'）。
-  // 它和最终汇报走同一套 Markdown 渲染，但外观更淡、并标明「还有 N 项没做完，继续执行」，
-  // 免得用户把它误当成「这就完事了」。它不接管执行轨迹（见 ownsRunUi）。
+  // 进度消息：run 还在跑、模型自己决定发的一句话（meta.kind==='stage_report'，沿用旧键）。
+  // 它不是一份格式化的汇报，只是让用户知道进度到哪了；外观更淡，并标明「还有 N 项没做完」。
+  // 它不接管执行轨迹（见 ownsRunUi）。
   const isStage = m.author_type !== "user" && m.meta?.kind === "stage_report";
+  // 临时回复：run 还在跑时主agent 对插话/进度的即时答复（不等子agent 收工、也不等收尾）。
+  // 用虚线框 + 「执行中」小标，和最终汇报区分开——省得用户把过渡答复当成已交付。
+  const isInterim = m.author_type !== "user" && m.meta?.kind === "interim_reply";
   return (
     <div className={m.author_type === "user" ? "ml-auto text-right" : ""}>
       <div className="text-[11px] text-slate-400">
         {role(m)}
         {isStage && (
           <span className="ml-1.5 rounded bg-amber-50 px-1 py-[1px] text-[10px] font-medium text-amber-700 ring-1 ring-amber-200">
-            阶段汇报{Number(m.meta?.open_count) > 0 ? ` · 还有 ${Number(m.meta.open_count)} 项没做完` : ""}
+            进度{Number(m.meta?.open_count) > 0 ? ` · 还有 ${Number(m.meta.open_count)} 项没做完` : ""}
+          </span>
+        )}
+        {isInterim && (
+          <span className="ml-1.5 rounded bg-sky-50 px-1 py-[1px] text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">
+            执行中 · 临时回复
           </span>
         )}
       </div>
@@ -334,6 +348,7 @@ function MessageItem({
         <>
           {/* 待办清单已统一挪到输入框上方（见下方 planRunId 区块） */}
           <RunTraceInline runId={m.run_id} steers={steersOf(m.run_id)}
+            replies={repliesOf(m.run_id)}
             stat={runStatById[m.run_id]} statPending={!runsLoaded} />
         </>
       )}
@@ -343,6 +358,8 @@ function MessageItem({
             ? "inline-block max-w-2xl bg-brand-600 text-white whitespace-pre-wrap"
             : isStage
             ? "block w-full bg-amber-50/50 border border-amber-200/70"
+            : isInterim
+            ? "block w-full bg-slate-50/60 border border-dashed border-slate-300"
             : "block w-full bg-white border border-slate-200"
         }`}
       >
@@ -421,7 +438,7 @@ function MessageItem({
           />
         </div>
       )}
-      {/* 对话语音：一键把这条回复念出来（Markdown 由后端清掉）；同排提供复制 */}
+      {/* 对话消息的底部操作条：只保留复制（原「🔊 朗读」及情绪设置已按需求移除） */}
       {m.author_type !== "user" &&
         (!!m.content?.trim() || msgImageSrcs(m).length > 0) && (
         <div className="mt-1 flex items-center gap-2">
@@ -430,38 +447,12 @@ function MessageItem({
             title="复制这条回复（含附图）"
             className="text-[11px] text-slate-400 hover:text-brand-600"
           />
-          <button
-            className="text-[11px] text-slate-400 hover:text-brand-600 disabled:opacity-50"
-            onClick={() => speakMessage(m)}
-            disabled={ttsBusyId === m.id || !m.content?.trim()}
-            title="用本机 IndexTTS2 把这条回复念出来"
-          >
-            {ttsBusyId === m.id ? "合成中…" : "🔊 朗读"}
-          </button>
-          <button
-            className="text-[10.5px] text-slate-400 hover:text-brand-600"
-            onClick={onTtsEmoClick}
-            title="朗读情绪：只给音色参考音频时是平静腔；这里可让朗读带感情（自动/向量/文字/情感音频）"
-          >
-            情绪：{emoLabel(ttsEmo)} ▾
-          </button>
-          {ttsAudio[m.id] && (
-            <audio src={ttsAudio[m.id]} controls className="h-7 max-w-[260px]" />
-          )}
-          {ttsErr[m.id] && (
-            <span
-              className="text-[11px] text-rose-500"
-              title={ttsErr[m.id]}
-            >
-              朗读不可用（{ttsErr[m.id].slice(0, 60)}{ttsErr[m.id].length > 60 ? "…" : ""}）
-            </span>
-          )}
         </div>
       )}
       {/* 本次改动了几个文件：放在整条消息（含轨迹）的最末尾——
-          以前插在气泡和朗读条之间，一旦轨迹在气泡之后继续增长，卡片就被夹在
+          以前插在气泡和消息操作条之间，一旦轨迹在气泡之后继续增长，卡片就被夹在
           「编辑」和后面那些「读取 / 思考」中间（用户截图 2026-11-02）。
-          阶段汇报不挂改动卡片：那时活儿还没干完，改动清单属于最后那条收尾消息。 */}
+          进度消息不挂改动卡片：那时活儿还没干完，改动清单属于最后那条收尾消息。 */}
       {m.author_type !== "user" &&
         !isStage &&
         m.run_id &&
@@ -583,10 +574,10 @@ export default function Chat({ route }: { route: Route }) {
   const currentTeamId = useAuth((s) => s.currentTeamId);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   // 工作区列表到位了吗：没到位之前不能判定「没有项目」去自动建默认工作区，
-  // 否则首帧的空数组会被误解成「团队下确实没项目」，每次进对话都白建一个。
+  // 否则首帧的空数组会被误解成「工作区下确实没项目」，每次进对话都白建一个。
   const [projectsLoaded, setProjectsLoaded] = useState(false);
-  // 每个团队各允许一次「进对话即自动建默认工作区」：按 teamId 记账，
-  // 切团队时对新团队还能再补建一次，但同一团队不会循环重试（失败也不重试）。
+  // 每个工作区各允许一次「进对话即自动建默认工作区」：按 teamId 记账，
+  // 换工作区时还能再补建一次，但同一工作区不会循环重试（失败也不重试）。
   const autoWsRef = useRef<string>("");
   const projectId = route.params.project || projects[0]?.id || "";
   const [session, setSession] = useState<Session | null>(
@@ -636,7 +627,6 @@ export default function Chat({ route }: { route: Route }) {
     setFiles(next);
   }
   const fileRef = useRef<HTMLInputElement>(null);
-  const [analyze, setAnalyze] = useState(false);
   const [runningRunId, setRunningRunId] = useState<string | null>(null);
   // 「停止」按钮的在途标记：取消是异步的（后端看门狗约 1s 掐断），期间先禁用别连点
   const [stopping, setStopping] = useState(false);
@@ -659,66 +649,17 @@ export default function Chat({ route }: { route: Route }) {
   const stickRef = useRef(true);
   const lastSidRef = useRef<string | null>(null);
   const [showJump, setShowJump] = useState(false);
-  // 对话语音：把某条回复念出来（走本机 IndexTTS2，音色用服务端默认预设）
-  const [ttsBusyId, setTtsBusyId] = useState<string | null>(null);
-  const [ttsAudio, setTtsAudio] = useState<Record<string, string>>({});
-  // 朗读错误只挂在「那一条消息」上：之前挂在页面级 err 上，一个会话失败后切到哪个会话都还亮着
-  const [ttsErr, setTtsErr] = useState<Record<string, string>>({});
-  // 对话朗读情绪：auto=用台词本身自动判情绪（默认，最省事）；也可选平静/向量/文字/情感音频
-  const [ttsEmo, setTtsEmo] = useState<ChatEmo>(() => loadChatEmo());
-  const [ttsEmoOpen, setTtsEmoOpen] = useState(false);
-  const [ttsEmoPos, setTtsEmoPos] = useState<{ left: number; bottom: number } | null>(null);
-  const ttsEmoBtnRef = useRef<HTMLButtonElement | null>(null);
-  const ttsEmoPanelRef = useRef<HTMLDivElement>(null);
-  const ttsEmoFileRef = useRef<HTMLInputElement>(null);
-  function chooseTtsEmo(e: ChatEmo) {
-    setTtsEmo(e);
-    saveChatEmo(e);
-    setTtsEmoOpen(false);
-  }
-  function openTtsEmo(ev: React.MouseEvent) {
-    if (ttsEmoOpen) { setTtsEmoOpen(false); return; }
-    const btn = ev.currentTarget as HTMLElement;
-    ttsEmoBtnRef.current = btn as HTMLButtonElement;
-    const r = btn.getBoundingClientRect();
-    const W = 300, M = 12;
-    setTtsEmoPos({
-      left: Math.max(M, Math.min(r.left, window.innerWidth - W - M)),
-      bottom: Math.max(M, window.innerHeight - r.top + 8),
-    });
-    setTtsEmoOpen(true);
-  }
-  const [ttsEmoText, setTtsEmoText] = useState(() => {
-    const e = loadChatEmo();
-    return e.kind === "text" ? e.text : "";
-  });
-  useEffect(() => {
-    if (!ttsEmoOpen) return;
-    const close = () => setTtsEmoOpen(false);
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") close(); };
-    const onDown = (e: MouseEvent) => {
-      const t = e.target as Node | null;
-      if (t && (ttsEmoPanelRef.current?.contains(t) || ttsEmoBtnRef.current?.contains(t))) return;
-      close();
-    };
-    const onScroll = (e: Event) => {
-      const t = e.target as Node | null;
-      if (t && (t === ttsEmoPanelRef.current || ttsEmoPanelRef.current?.contains(t))) return;
-      close();
-    };
-    window.addEventListener("resize", close);
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("scroll", onScroll, true);
-    document.addEventListener("mousedown", onDown, true);
-    return () => {
-      window.removeEventListener("resize", close);
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("scroll", onScroll, true);
-      document.removeEventListener("mousedown", onDown, true);
-    };
-  }, [ttsEmoOpen]);
   // 会话用量条刷新信号（run 结束/新任务开始时 +1，触发 SessionUsage 重新拉聚合值）
   const [usageKey, setUsageKey] = useState(0);
+  // 顶栏读数区的「让位等级」：0=全显示 1=收起本机余量 2=用量条只留 token/上下文 3=只留右侧操作按钮。
+  // 顶栏读数区的「让位等级」：0=全显示 1=用量条收起速度/缓存命中 2=再收起本机余量
+  // 3=再收起整条用量条 4=只留右侧操作按钮。
+  // 右上角面板可拖宽（最窄时中栏只剩 ~820px），读数三条加起来放不下会把「复制会话/导出记录」
+  // 挤出容器或裁掉「速度」的值。这里靠 ResizeObserver 实测 scrollWidth>clientWidth 逐级让位，
+  // 不写死像素阈值——面板宽度、字体、项目名长度都变了也不会失配（用户 2026-11-14 指图要求）。
+  const topbarRef = useRef<HTMLDivElement>(null);
+  const readWrapRef = useRef<HTMLDivElement>(null);
+  const [readLevel, setReadLevel] = useState(0);
   const [qKey, setQKey] = useState(0); // 提问面板刷新信号
   // 会话挂载技能（渐进式披露）：null=跟随项目默认；[]=明确不挂；数组=手动指定的清单
   const [attachSkills, setAttachSkills] = useState<string[] | null>(null);
@@ -730,7 +671,7 @@ export default function Chat({ route }: { route: Route }) {
   const skillBtnRef = useRef<HTMLButtonElement>(null);
   const skillPanelRef = useRef<HTMLDivElement>(null);
   const [skillPos, setSkillPos] = useState<{ left: number; bottom: number } | null>(null);
-  // 运行选项（仅分析等）：从顶栏挪到输入区，平时收起，别一直占着工具栏
+  // 运行选项（会话权限）：从顶栏挪到输入区，平时收起，别一直占着工具栏
   const [runOptsOpen, setRunOptsOpen] = useState(false);
   // 运行选项弹层改为 portal 到 body：开壁纸后祖先的 backdrop-filter 会把 fixed 定位的
   // 遮罩困在局部包含块里，点到别处关不掉。portal 后要用按钮的屏幕坐标自己定位。
@@ -738,9 +679,9 @@ export default function Chat({ route }: { route: Route }) {
   const runOptsPanelRef = useRef<HTMLDivElement>(null);
   const [runOptsPos, setRunOptsPos] = useState<{ left: number; bottom: number } | null>(null);
   // 运行中改运行选项 → 立刻推给正在跑的 run（下一轮生效），而不是只改本地状态。
-  // 后端把 caps / permission_scope / analyze 写回 run 选项并推进 steering 邮箱，runtime
-  // 下一轮开头重算工具白名单与权限作用域（以前只在开跑时读一次，中途改了不生效）。
-  function pushSettingsToRun(s: { caps?: Record<string, boolean>; permission_scope?: string; analyze?: boolean }) {
+  // 后端把 permission_scope 写回 run 选项并推进 steering 邮箱，runtime
+  // 下一轮开头重算权限作用域（以前只在开跑时读一次，中途改了不生效）。
+  function pushSettingsToRun(s: { permission_scope?: string }) {
     if (!runningRunId) return;
     api.steerRun(runningRunId, "", [], [], "", undefined, s)
       .then((r: any) => {
@@ -793,6 +734,46 @@ export default function Chat({ route }: { route: Route }) {
       document.removeEventListener("mousedown", onDown, true);
     };
   }, [runOptsOpen]);
+  // 顶栏读数区让位：容器一溢出就升一级（少显示一组读数），直到放得下。
+  // 反方向不自动降级（否则会在两级之间来回跳），只有顶栏明显变宽时才重置重测。
+  useEffect(() => {
+    const bar = topbarRef.current;
+    const wrap = readWrapRef.current;
+    if (!bar || !wrap) return;
+    let raf = 0;
+    const measure = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const overflow = wrap.scrollWidth - wrap.clientWidth;
+        if (overflow > 1) {
+          setReadLevel((lv) => (lv < 4 ? lv + 1 : lv));
+        }
+      });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(bar);
+    ro.observe(wrap);
+    return () => {
+      cancelAnimationFrame(raf);
+      ro.disconnect();
+    };
+  }, [readLevel, session?.id, projects, projectId]);
+
+  // 顶栏变宽（面板收起/窗口放大）时重置，重新从「全显示」开始测
+  useEffect(() => {
+    const bar = topbarRef.current;
+    if (!bar) return;
+    let lastW = bar.clientWidth;
+    const ro = new ResizeObserver(() => {
+      const w = bar.clientWidth;
+      if (w > lastW + 160) setReadLevel(0);
+      lastW = w;
+    });
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, []);
+
   // 模型选择（图三/图四）：输入框右下角胶囊，按会话记住；空=跟随角色绑定档位
   const [modelChoice, setModelChoice] = useState<ModelChoice>(DEFAULT_MODEL_CHOICE);
   const modelKeyRef = useRef<string>("ga_model_choice:draft");
@@ -824,6 +805,15 @@ export default function Chat({ route }: { route: Route }) {
   function setModelPick(v: ModelChoice, silent?: boolean) {
     setModelChoice(v);
     try { localStorage.setItem(modelKeyRef.current, JSON.stringify(v)); } catch { /* ignore */ }
+    // 手点切换 = 同时改「设置 → 智能体 → 助手」的默认：默认模型对没单独选过模型的会话生效，
+    // 设置页也就跟这里看到的一致（以前两处各管各的，聊天里换了模型设置页纹丝不动）。
+    // 选「跟随默认」（profile 为空）时不动默认值——否则等于把默认清空，会掉回 .env 全局端点。
+    if (!silent) {
+      const patch: Record<string, any> = { params_json: { reasoning_effort: v.effort || "" } };
+      if (v.profile) patch.model_profile_key = v.profile;
+      api.updateAgent("main", patch)
+        .catch(() => { /* 没有改配置权限：按会话生效即可，不打断对话 */ });
+    }
     // 执行中用户手点改模型 → 直接切这一轮后续的 LLM（不排队、不新开 run）。
     // silent=true 是程序化校正（档位被删→清回跟随默认），不该触发切换。
     if (!silent && runningRunId) {
@@ -836,43 +826,6 @@ export default function Chat({ route }: { route: Route }) {
         .catch((e: any) => setErr(e?.message || "切换模型失败"));
     }
   }
-  // 能力开关：自动化测试 / 联网 / 媒体生成，默认全开，按会话记住
-  const [caps, setCaps] = useState({ test: true, web: true, media: true });
-  const capsKeyRef = useRef<string>("ga_caps:draft");
-  useEffect(() => {
-    const key = session && session.id !== "__new__" ? `ga_caps:${session.id}` : "ga_caps:draft";
-    if (capsKeyRef.current === key) return;
-    capsKeyRef.current = key;
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw) {
-        const p = JSON.parse(raw);
-        setCaps({ test: p.test !== false, web: p.web !== false, media: p.media !== false });
-      } else {
-        // 新会话默认全开；草稿里刚改过的设置带进这个会话（带完就清，别污染下一个新会话）
-        const draft = localStorage.getItem("ga_caps:draft");
-        if (key !== "ga_caps:draft" && draft) {
-          localStorage.setItem(key, draft);
-          localStorage.removeItem("ga_caps:draft");
-          const p = JSON.parse(draft);
-          setCaps({ test: p.test !== false, web: p.web !== false, media: p.media !== false });
-        } else {
-          setCaps({ test: true, web: true, media: true });
-        }
-      }
-    } catch {
-      setCaps({ test: true, web: true, media: true });
-    }
-  }, [session?.id]);
-  function setCap(k: "test" | "web" | "media", v: boolean) {
-    const next = { ...caps, [k]: v };
-    setCaps(next);
-    try { localStorage.setItem(capsKeyRef.current, JSON.stringify(next)); } catch { /* ignore */ }
-    // 执行中改开关 → 立刻推给正在跑的 run（下一轮重算工具白名单），不再只改本地状态
-    pushSettingsToRun({ caps: next });
-  }
-  const anyCapOff = !caps.test || !caps.web || !caps.media;
-
   // 会话权限作用域：仅工作区 / 全部权限。
   // 已有会话读它自己记着的值（后端 sessions.permission_scope）；
   // 新会话草稿跟「设置 → 助手行为」里的默认值走（defaultScope() 同步读本地缓存）。
@@ -951,33 +904,6 @@ export default function Chat({ route }: { route: Route }) {
     try { localStorage.setItem("ga_run_panel_collapsed", collapsed ? "1" : "0"); } catch { /* ignore */ }
   }
 
-  async function speakMessage(m: Message) {
-    if (ttsBusyId) return;
-    setTtsErr((s) => {
-      if (!(m.id in s)) return s;
-      const { [m.id]: _drop, ...rest } = s;
-      return rest;
-    });
-    setTtsBusyId(m.id);
-    try {
-      // 情感音频（kind=audio）：先上传拿文件名，再随合成请求带 emo_audio（不能持久化 File）
-      let extra: Record<string, unknown> = {};
-      if (ttsEmo.kind === "audio") {
-        const up = await api.voiceGenUpload(ttsEmo.file);
-        extra = { emo_mode: "1", emo_audio: up.file };
-      } else {
-        extra = emoPayload(ttsEmo);
-      }
-      const r = await api.voiceGen({ text: m.content, label: "chat", ...extra });
-      const url = await api.voiceGenBlob(r.file);
-      setTtsAudio((s) => ({ ...s, [m.id]: url }));
-    } catch (e: any) {
-      // 只在这一条消息下报错（不占页面级错误位，也不跟着别的会话走）
-      setTtsErr((s) => ({ ...s, [m.id]: e?.message || "朗读失败" }));
-    } finally {
-      setTtsBusyId(null);
-    }
-  }
   function resetTa() {
     if (taRef.current) taRef.current.style.height = "auto";
   }
@@ -999,7 +925,7 @@ export default function Chat({ route }: { route: Route }) {
 
   useEffect(refreshProjects, [refreshProjects]);
 
-  // 「对话」是默认落地页，必须开箱就能说话：团队下还没有任何工作区时，
+  // 「对话」是默认落地页，必须开箱就能说话：还没有任何工作区时，
   // 自动建一个默认工作区并切过去，用户不用先跑去建项目才能发第一条消息。
   // 只在列表确实加载完、且确实为空时做一次；建失败就停下，让用户手动新建。
   useEffect(() => {
@@ -1151,6 +1077,10 @@ export default function Chat({ route }: { route: Route }) {
 
   // 「执行中」跟踪的镜像 ref：ws 回调里判断 run_done 是否属于当前跟踪的 run
   const runningRef = useRef<string | null>(null);
+  // 桌面通知点击的落点（跳到那条会话）。通知的 onclick 跑在 WS 回调里，而 WS 回调是
+  // 「建连那一刻」的闭包——用户中途切过会话，那里读到的 session/projectId 就是旧的。
+  // 所以统一经 ref 取最新的一份（在下面的 effect 里每帧更新）。
+  const jumpToSessionRef = useRef<(projectOfSession: string, sid: string) => void>(() => {});
   // 是否已经从服务端确认过「这个会话现在有没有 run 在跑」；没确认过之前不发排队消息
   const runsChecked = useRef(false);
   useEffect(() => {
@@ -1177,7 +1107,8 @@ export default function Chat({ route }: { route: Route }) {
         window.dispatchEvent(new CustomEvent(`ga-run-ev-${e.run_id}`, { detail: e }));
       }
       const mine = sameId(e.payload?.session_id, session?.id);
-      if ((e.type === "message_new" || e.type === "question_asked") && mine) {
+      if ((e.type === "message_new" || e.type === "question_asked"
+           || e.type === "question_answered") && mine) {
         setQKey((k) => k + 1); // 新提问到达 / 已回答 → 刷新提问面板
         refreshMessages();
       }
@@ -1188,19 +1119,31 @@ export default function Chat({ route }: { route: Route }) {
       }
       if (e.type === "run_done") {
         const st = e.payload?.status;
+        // 这条 run 属于哪条会话：后端在 run_done 载荷里带上了 session_id（事件通道按
+        // 项目扇出，不带就不知道点开该跳哪条会话）。老数据/老服务没有这个字段时
+        // jump 为 undefined —— 通知照常弹、点了只把窗口拉到前面，不会跳到错的地方。
+        const sid = String(e.payload?.session_id || "");
+        const jump = sid ? () => jumpToSessionRef.current(projectId, sid) : undefined;
         if (e.run_id && !notifiedDone.current.has(e.run_id)) {
           notifiedDone.current.add(e.run_id);
-          if (st === "succeeded") fireNotify("done", "任务完成", "运行已成功结束");
+          if (st === "succeeded")
+            fireNotify("done", "任务完成", "运行已成功结束 · 点击跳到这条会话", jump);
           else if (st === "failed")
-            fireNotify("done", "任务失败", truncBody(e.payload?.error) || "运行失败，详情见对话页");
-          else if (st === "cancelled") fireNotify("done", "任务已取消", "运行被停止");
+            fireNotify("done", "任务失败",
+                       (truncBody(e.payload?.error) || "运行失败，详情见对话页") + " · 点击跳到这条会话",
+                       jump);
+          else if (st === "cancelled")
+            fireNotify("done", "任务已取消", "运行被停止 · 点击跳到这条会话", jump);
         }
       }
       if (e.type === "question_asked") {
         const qid = e.payload?.id || e.payload?.message_id;
         if (qid && !notifiedQ.current.has(qid)) {
           notifiedQ.current.add(qid);
-          fireNotify("question", "需要你的回答", truncBody(e.payload?.question) || "智能体在等待你的回复");
+          const sid = String(e.payload?.session_id || "");
+          fireNotify("question", "需要你的回答",
+                     (truncBody(e.payload?.question) || "智能体在等待你的回复") + " · 点击跳到这条会话",
+                     sid ? () => jumpToSessionRef.current(projectId, sid) : undefined);
         }
       }
       if (e.type === "run_done" && sameId(e.run_id, runningRef.current)) {
@@ -1280,9 +1223,8 @@ export default function Chat({ route }: { route: Route }) {
     setShowJump(false);
     if (lastSidRef.current !== sid) {
       lastSidRef.current = sid;
-      // 上一个会话的临时错误（朗读失败、图片超限…）不跟着这个会话显示
+      // 上一个会话的临时错误（图片超限…）不跟着这个会话显示
       setErr("");
-      setTtsErr({});
     }
     applyBottom(el);
     const r1 = requestAnimationFrame(() => {
@@ -1429,6 +1371,21 @@ export default function Chat({ route }: { route: Route }) {
     navigate("chat", { project: projectOfSession, session: s.id });
   }
 
+  // 桌面通知点击的落点：正好是当前会话就滚到最新（新回复在底部，别让人自己找），
+  // 是别的会话就走「点会话列表」同一套流程（清草稿、重置跟踪、切项目+会话）。
+  // 每帧重挂一次，保证闭包里的 session/projectId 是最新的。
+  useEffect(() => {
+    jumpToSessionRef.current = (projectOfSession, sid) => {
+      if (!sid) return;
+      if (session && sameId(sid, session.id)) {
+        jumpToBottom(true);
+        return;
+      }
+      onPickSession(projectOfSession || projectId,
+                    { id: sid, title: "", created_at: "" } as Session);
+    };
+  });
+
   async function addFiles(list: FileList | File[] | null) {
     if (!list?.length || !projectId || sendBusy.current) return;
     if (uploadBusy.current) {
@@ -1537,7 +1494,7 @@ export default function Chat({ route }: { route: Route }) {
     }
   }
 
-  async function doSend(content: string, imgList: string[], fileList: { path: string; name: string; size: number }[] = [], analyzeOverride?: boolean, capsOverride?: Record<string, boolean>, modelOverride?: ModelChoice, scopeOverride?: PermissionScope) {
+  async function doSend(content: string, imgList: string[], fileList: { path: string; name: string; size: number }[] = [], modelOverride?: ModelChoice, scopeOverride?: PermissionScope) {
     if ((!content.trim() && !imgList.length && !fileList.length) || !projectId || sendBusy.current) return false;
     sendBusy.current = true;
     setSending(true);
@@ -1550,9 +1507,6 @@ export default function Chat({ route }: { route: Route }) {
         projectId,
         {
           content,
-          // 排队消息要按「入队那一刻」的模式跑：否则中途切开关会把已排队的任务悄悄改成另一种
-          analyze: analyzeOverride ?? analyze,
-          caps: capsOverride ?? caps,
           // 模型选择：空=跟随角色绑定，不改变现有行为
           ...(chosenModel.profile ? { model_profile_key: chosenModel.profile } : {}),
           ...(chosenModel.effort ? { reasoning_effort: chosenModel.effort } : {}),
@@ -1611,7 +1565,7 @@ export default function Chat({ route }: { route: Route }) {
       // 连点「排队」：同步锁挡住第二次，避免同一条草稿入队两遍（run 结束后会发两次）。
       if (queueLockRef.current) return;
       queueLockRef.current = true;
-      setQueue((q) => [...q, { id: crypto.randomUUID(), content, images: imgList, files: fileList, analyze, caps,
+      setQueue((q) => [...q, { id: crypto.randomUUID(), content, images: imgList, files: fileList,
                                 modelProfile: modelChoice.profile, reasoningEffort: modelChoice.effort,
                                 scope }]);
       window.setTimeout(() => { queueLockRef.current = false; }, 500);
@@ -1712,7 +1666,7 @@ export default function Chat({ route }: { route: Route }) {
     setSteerBusyIds((cur) => (cur.includes(id) ? cur : [...cur, id]));
     try {
       if (!runningRunId) {
-        if (await doSend(item.content, item.images, item.files, item.analyze, item.caps,
+        if (await doSend(item.content, item.images, item.files,
           { profile: item.modelProfile || "", effort: item.reasoningEffort || "" }, item.scope)) {
           setQueue((q) => q.filter((x) => x.id !== id));
         }
@@ -1729,7 +1683,7 @@ export default function Chat({ route }: { route: Route }) {
         if (r?.delivered === false) {
           // 这个 run 其实已经结束了：当成普通消息发出去
           setRunningRunId(null);
-          if (await doSend(item.content, item.images, item.files, item.analyze, item.caps,
+          if (await doSend(item.content, item.images, item.files,
             { profile: item.modelProfile || "", effort: item.reasoningEffort || "" }, item.scope)) {
             setQueue((q) => q.filter((x) => x.id !== id));
           }
@@ -1780,7 +1734,7 @@ export default function Chat({ route }: { route: Route }) {
       // 图片在刷新后失效的消息不自动发：宁可停在这儿（行上有「点编辑重新附上」），
       // 也不能把用户发的截图悄悄扔掉。
       if (!first.images.length && (first.imageCount || 0) > 0) return;
-      doSend(first.content, first.images, first.files, first.analyze, first.caps,
+      doSend(first.content, first.images, first.files,
         { profile: first.modelProfile || "", effort: first.reasoningEffort || "" }, first.scope).then((sent) => {
         if (sent && !dead) setQueue((q) => q.filter((x) => x.id !== first.id));
       });
@@ -1925,6 +1879,9 @@ export default function Chat({ route }: { route: Route }) {
     const seen = new Set<string>();
     messages.forEach((m) => {
       if (m.author_type !== "user" || !m.run_id) return;
+      // 「回答提问」也是同一 run 内用户说的话：按发生时刻插进轨迹（和插话一样），
+      // 不再作为独立气泡另起一段——它就是这一轮里的一个动作。
+      const isAnswer = m.meta?.kind === "answer";
       if (m.meta?.files?.length) return; // 带附件的插话走普通消息气泡，文件芯片要看得见
       if (!m.content?.trim() && !msgImageSrcs(m).length) return; // 空插话不占行
       // 历史脏数据/连点会留下同 run 同内容同秒的两条插话：展示层去重，只显示一条
@@ -1932,11 +1889,37 @@ export default function Chat({ route }: { route: Route }) {
       if (seen.has(dedupKey)) return;
       seen.add(dedupKey);
       const list = map.get(m.run_id) ?? [];
-      list.push({ id: m.id, text: m.content, at: m.created_at, images: msgImageSrcs(m) });
+      list.push({ id: m.id, text: m.content, at: m.created_at, images: msgImageSrcs(m),
+        kind: isAnswer ? "answer" : "steer" });
       map.set(m.run_id, list);
     });
     return map;
   }, [messages]);
+
+  /** 主 agent 中途落的答复（临时回复/进度）按 run 归组，交给那一轮的轨迹块按发生
+   *  时刻插进中间——它们逻辑上属于这次执行的过程，不是一条独立气泡。
+   *  和插话同源同位置：有轨迹宿主时嵌进轨迹、消息流里不重复渲染；没有宿主时原位兜底。 */
+  const repliesByRun = useMemo(() => {
+    const map = new Map<string, ReplyNote[]>();
+    messages.forEach((m) => {
+      if (m.author_type === "user" || !m.run_id) return;
+      const kind = m.meta?.kind;
+      if (kind !== "interim_reply" && kind !== "stage_report") return;
+      if (!m.content?.trim()) return; // 空答复不占行
+      const note: ReplyNote = {
+        id: m.id,
+        text: m.content,
+        at: m.created_at,
+        kind: kind === "stage_report" ? "stage" : "interim",
+        openCount: m.meta?.open_count != null ? Number(m.meta.open_count) : undefined,
+      };
+      const list = map.get(m.run_id) ?? [];
+      list.push(note);
+      map.set(m.run_id, list);
+    });
+    return map;
+  }, [messages]);
+
   /** run id → 轨迹收起态那一行的全部说辞（状态 / 动作分桶 / 角色 / 起止时间）。
    *  这些数据 /sessions/{id}/runs 一次就带回来了，切会话时不必每条 run 各自去拉全量事件。 */
   const runStatById = useMemo(() => {
@@ -1955,6 +1938,7 @@ export default function Chat({ route }: { route: Route }) {
   }, [sessionRuns]);
 
   const steersOf = (runId: string): SteerNote[] => steersByRun.get(runId) ?? NO_STEERS;
+  const repliesOf = (runId: string): ReplyNote[] => repliesByRun.get(runId) ?? NO_REPLIES;
   // 轨迹块还在不在（run 没落消息、轨迹列表被截断时可能没了）：
   // 没地方可插就原位显示，绝不能让插话凭空消失
   const steerHasHost = (runId: string) =>
@@ -2011,7 +1995,7 @@ export default function Chat({ route }: { route: Route }) {
       const retryImages = await msgImages(lastUserMsg);
       await doSend(lastUserMsg.content || "", retryImages,
         Array.isArray(lastUserMsg.meta?.files) ? lastUserMsg.meta.files : [],
-        undefined, undefined, modelChoice);
+        modelChoice);
     } catch (e: any) {
       setErr(e?.message || "继续失败，请稍后再试");
     } finally {
@@ -2046,7 +2030,7 @@ export default function Chat({ route }: { route: Route }) {
     }
   }
 
-  // 团队下还没有工作区：不再把整页挡死（「请到项目页创建」——可项目入口早就收进
+  // 还没有工作区：不再把整页挡死（「请到项目页创建」——可项目入口早就收进
   // 左侧会话面板了）。这里照常渲染会话面板 + 输入区，面板里的「+」可新建工作区；
   // 上面那段 effect 通常已经自动建好默认工作区，这里是建失败/建好前的兜底。
   // 输入区此时禁用（projectId 为空），不会发出没有归属的任务。
@@ -2117,37 +2101,42 @@ export default function Chat({ route }: { route: Route }) {
         onDrop={onDrop}
         onDragOver={onDragOver}
       >
-        <div className="h-12 shrink-0 border-b border-slate-200 bg-white flex items-center gap-2 px-3">
+        <div ref={topbarRef} className="h-12 shrink-0 border-b border-slate-200 bg-white flex items-center gap-2 px-3">
           {/* 项目切换已移到左侧「工作区」会话树（图二）；这里只显示当前项目名，避免两套入口 */}
-          <span className="text-sm font-medium text-slate-700 truncate max-w-[220px]" title={projects.find((p) => p.id === projectId)?.name || ""}>
+          <span className="text-sm font-medium text-slate-700 truncate max-w-[220px] shrink-0" title={projects.find((p) => p.id === projectId)?.name || ""}>
             {projects.find((p) => p.id === projectId)?.name || "未选择项目"}
           </span>
           {projectId && <ProjectScriptButtons projectId={projectId} />}
-          {/* 会话级用量：总消耗 token / 缓存命中率 / 速度（落库，重进会话仍在） */}
-          <div className="ml-auto flex items-center gap-2">
-            {/* 本机余量：跑批/配音/压上下文时先看它还顶不顶得住，不用翻系统日志 */}
-            <SystemMetrics />
-            {exportErr && <span className="text-xs text-red-600">{exportErr}</span>}
-            {session && session.id !== "__new__" && (
-              <>
-                <CopyButton
-                  className="ga-btn ga-btn-secondary ga-btn-sm"
-                  get={() => sessionCopyPayload(messages)}
-                  title="把当前会话的文字和图片复制进剪贴板，可直接粘贴到聊天工具或文档"
-                  label="复制会话"
-                />
-                <button
-                  className="ga-btn ga-btn-secondary ga-btn-sm"
-                  disabled={exporting}
-                  onClick={onExportSession}
-                  title="打包下载当前会话记录（markdown 转写 + JSON 全量，含 run 轨迹）"
-                >
-                  {exporting ? "导出中…" : "导出记录"}
-                </button>
-                <SessionUsage sessionId={session.id} refreshKey={usageKey} />
-              </>
-            )}
-          </div>
+          {/* 会话级用量：总消耗 token / 缓存命中率 / 速度（落库，重进会话仍在）
+              顺序固定为「机器 → 用量 → 操作」；读数区 min-w-0 可收缩，右侧操作按钮 shrink-0
+              贴在最右边，读数放不下时按 readLevel 逐组让位，绝不把按钮挤出容器
+              （用户 2026-11-14 指图要求：按钮组放最右，不要夹在读数中间）。 */}
+          <div ref={readWrapRef} className="ml-auto flex min-w-0 items-center gap-2 overflow-hidden">
+             {/* 本机余量：跑批/配音/压上下文时先看它还顶不顶得住，不用翻系统日志 */}
+             {readLevel < 2 && <SystemMetrics />}
+             {session && session.id !== "__new__" && readLevel < 4 && (
+               <SessionUsage sessionId={session.id} refreshKey={usageKey} compact={readLevel >= 1} />
+             )}
+           </div>
+          {session && session.id !== "__new__" && (
+            <div className="ml-1 flex shrink-0 items-center gap-2">
+              {exportErr && <span className="text-xs text-red-600">{exportErr}</span>}
+              <CopyButton
+                className="ga-btn ga-btn-secondary ga-btn-sm"
+                get={() => sessionCopyPayload(messages)}
+                title="把当前会话的文字和图片复制进剪贴板，可直接粘贴到聊天工具或文档"
+                label="复制会话"
+              />
+              <button
+                className="ga-btn ga-btn-secondary ga-btn-sm"
+                disabled={exporting}
+                onClick={onExportSession}
+                title="打包下载当前会话记录（markdown 转写 + JSON 全量，含 run 轨迹）"
+              >
+                {exporting ? "导出中…" : "导出记录"}
+              </button>
+            </div>
+          )}
         </div>
 
         <div className="relative flex-1 min-h-0">
@@ -2167,7 +2156,7 @@ export default function Chat({ route }: { route: Route }) {
             // 翻到顶附近就自动补更早的一页（还有历史时）
             if (el.scrollTop <= 120 && hasMoreRef.current) loadOlder();
           }}
-          className="h-full overflow-auto p-4 space-y-3"
+          className="ga-scroll-stable h-full overflow-auto p-4 space-y-3"
         >
           {/* 加载/失败/空态：以前这三种情况都是「什么都不画」，看起来就像对话内容丢了 */}
           {msgErr && (
@@ -2213,6 +2202,7 @@ export default function Chat({ route }: { route: Route }) {
                       <RunTraceInline
                         runId={pendingTraceIds[vi.index - messages.length]}
                         steers={steersOf(pendingTraceIds[vi.index - messages.length])}
+                        replies={repliesOf(pendingTraceIds[vi.index - messages.length])}
                         stat={runStatById[pendingTraceIds[vi.index - messages.length]]}
                         statPending={!runsLoaded}
                       />
@@ -2224,18 +2214,13 @@ export default function Chat({ route }: { route: Route }) {
                         traceHostIdxOfRun={traceHostIdxOfRun}
                         steerHasHost={steerHasHost}
                         steersOf={steersOf}
+                        repliesOf={repliesOf}
                         runStatById={runStatById}
                         runsLoaded={runsLoaded}
                         runningRunId={runningRunId}
                         usageKey={usageKey}
                         lastMsgIdxOfRun={lastMsgIdxOfRun}
                         setZoom={setZoom}
-                        speakMessage={speakMessage}
-                        ttsBusyId={ttsBusyId}
-                        ttsAudio={ttsAudio}
-                        ttsErr={ttsErr}
-                        ttsEmo={ttsEmo}
-                        onTtsEmoClick={openTtsEmo}
                       />
                     )}
                   </div>
@@ -2565,18 +2550,14 @@ export default function Chat({ route }: { route: Route }) {
               <button
                 ref={runOptsBtnRef}
                 className={`h-9 w-9 rounded border flex items-center justify-center relative ${
-                  analyze || anyCapOff
+                  scope === "full"
                     ? "border-amber-300 bg-amber-50 text-amber-700"
                     : "border-slate-200 text-slate-500 hover:bg-slate-50"
                 }`}
                 title={
-                  analyze
-                    ? "运行选项：当前为「仅分析」，本轮不改代码"
-                    : anyCapOff
-                      ? "运行选项：有能力的勾选被关闭"
-                      : scope === "full"
-                        ? "运行选项：会话权限为「全部权限」（可访问工作区外）"
-                        : "运行选项（会话权限 / 能力开关 / 仅分析）"
+                  scope === "full"
+                    ? "运行选项：会话权限为「全部权限」（可访问工作区外）"
+                    : "运行选项（会话权限）"
                 }
                 aria-label="运行选项"
                 aria-expanded={runOptsOpen}
@@ -2587,7 +2568,7 @@ export default function Chat({ route }: { route: Route }) {
                   <circle cx="15.5" cy="7" r="2.2" />
                   <circle cx="9.5" cy="17" r="2.2" />
                 </svg>
-                {(analyze || anyCapOff) && (
+                {scope === "full" && (
                   <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-amber-500" />
                 )}
               </button>
@@ -2603,26 +2584,6 @@ export default function Chat({ route }: { route: Route }) {
                       backgroundColor: "rgb(var(--ga-panel-rgb))",
                     }}
                   >
-                    <div className="text-[11px] font-medium text-slate-500 pb-1">能力（默认全开，按会话记住）</div>
-                    {([
-                      ["test", "自动化测试", "改完起服务 / CDP 截图 / 接口测试验收；关闭后改完直接给结论"],
-                      ["web", "联网搜索", "允许 web_search / web_fetch 查外部资料"],
-                      ["media", "出图与配音", "允许 generate_image / generate_audio 等媒体工具"],
-                    ] as const).map(([k, title, desc]) => (
-                      <label key={k} className="flex items-start gap-2 px-1 py-1.5 rounded hover:bg-slate-50 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          className="mt-0.5"
-                          checked={caps[k]}
-                          onChange={(e) => setCap(k, e.target.checked)}
-                        />
-                        <span>
-                          <span className="text-[12.5px] font-medium">{title}</span>
-                          <span className="block text-[11px] text-slate-500 leading-relaxed">{desc}</span>
-                        </span>
-                      </label>
-                    ))}
-                    <div className="my-2 border-t border-slate-100" />
                     <div className="text-[11px] font-medium text-slate-500 pb-1">会话权限</div>
                     <label className="flex items-start gap-2 px-1 py-1.5 rounded hover:bg-slate-50 cursor-pointer">
                       <input
@@ -2657,34 +2618,6 @@ export default function Chat({ route }: { route: Route }) {
                     <div className="text-[10px] text-slate-400 px-1 pt-0.5">
                       每个会话单独生效；新会话默认值在「设置 → 助手行为」里调。
                     </div>
-                    <div className="my-2 border-t border-slate-100" />
-                    <div className="text-[11px] font-medium text-slate-500 pb-1">运行方式</div>
-                    <label className="flex items-start gap-2 px-1 py-1.5 rounded hover:bg-slate-50 cursor-pointer">
-                      <input
-                        type="checkbox"
-                        className="mt-0.5"
-                        checked={analyze}
-                        onChange={(e) => {
-                          const v = e.target.checked;
-                          setAnalyze(v);
-                          // 执行中切换仅分析 → 立刻推给正在跑的 run（下一轮起剔写/生成工具）
-                          pushSettingsToRun({ analyze: v });
-                        }}
-                      />
-                      <span>
-                        <span className="text-[12.5px] font-medium">仅分析（不改代码）</span>
-                        <span className="block text-[11px] text-slate-500 leading-relaxed">
-                          本轮只读：写文件、改配置、起服务等修改类工具会被剔除，适合排查与评审。
-                        </span>
-                      </span>
-                    </label>
-                    {analyze && (
-                      <div className="mt-1 rounded bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
-                        {runningRunId
-                          ? "已开启：当前这轮从下一轮起只读（不再改代码/起服务）。"
-                          : "已开启：下一次发送只分析。关闭后恢复改代码。"}
-                      </div>
-                    )}
                   </div>
                 </>,
                 document.body,
@@ -2764,100 +2697,14 @@ export default function Chat({ route }: { route: Route }) {
                   title={
                     runningRunId
                       ? "当前会话正在执行，点击加入本会话的排队队列（其他会话不受影响，可同时执行）"
-                      : analyze
-                      ? "仅分析发送：本轮不改代码"
                       : "发送"
                   }
                 >
-                  {runningRunId ? "排队" : analyze ? "仅分析发送" : "发送"}
+                  {runningRunId ? "排队" : "发送"}
                 </button>
               </div>
             )}
           </div>
-          {/* 朗读情绪选择：影响下方每条回复的「🔊 朗读」。默认「自动」=用台词本身让服务端判情绪。 */}
-          {ttsEmoOpen && ttsEmoPos && createPortal(
-            <>
-              <div className="fixed inset-0 z-50" onClick={() => setTtsEmoOpen(false)} />
-              <div
-                ref={ttsEmoPanelRef}
-                className="fixed z-[60] w-[300px] rounded-lg border border-slate-200 bg-white shadow-xl p-2.5"
-                style={{ left: ttsEmoPos.left, bottom: ttsEmoPos.bottom, backgroundColor: "rgb(var(--ga-panel-rgb))" }}
-              >
-                <div className="text-xs font-medium px-1 pb-1">朗读情绪</div>
-                <div className="text-[10.5px] text-slate-400 px-1 pb-1.5 leading-relaxed">
-                  只给音色参考音频时默认是平静腔；这里让朗读带上感情。
-                </div>
-                {([
-                  ["auto", "自动（按台词语气判情绪）", "不指定素材，服务端用这段话本身分析情绪，最省事"],
-                  ["calm", "平静（沿用参考音色情绪）", "显式走平静，不加任何情绪"],
-                ] as const).map(([k, title, desc]) => (
-                  <label key={k} className="flex items-start gap-2 px-1 py-1 rounded hover:bg-slate-50 cursor-pointer">
-                    <input type="radio" className="mt-1" name="ga-tts-emo"
-                      checked={ttsEmo.kind === k} onChange={() => chooseTtsEmo({ kind: k } as ChatEmo)} />
-                    <span>
-                      <span className="text-[12px] font-medium">{title}</span>
-                      <span className="block text-[10.5px] text-slate-500 leading-snug">{desc}</span>
-                    </span>
-                  </label>
-                ))}
-                <div className="my-1.5 border-t border-slate-100" />
-                <div className="text-[10.5px] font-medium text-slate-500 px-1 pb-1">八维向量（单维拉高）</div>
-                <div className="flex flex-wrap gap-1 px-1">
-                  {EMO_PRESETS.map((p) => (
-                    <button key={p.id}
-                      className={`px-2 py-0.5 rounded border text-[11px] ${
-                        ttsEmo.kind === "vector" && ttsEmo.label === p.label
-                          ? "border-brand-500 text-brand-700 bg-brand-50"
-                          : "border-slate-200 text-slate-600 hover:bg-slate-50"
-                      }`}
-                      onClick={() => chooseTtsEmo({ kind: "vector", label: p.label, vec: p.vec })}
-                    >
-                      {p.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="my-1.5 border-t border-slate-100" />
-                <div className="text-[10.5px] font-medium text-slate-500 px-1 pb-1">文字描述</div>
-                <div className="flex items-center gap-1 px-1">
-                  <input
-                    className="flex-1 min-w-0 border border-slate-200 rounded px-2 py-1 text-[11.5px]"
-                    placeholder="如：压抑着怒气的低吼"
-                    value={ttsEmoText}
-                    onChange={(e) => setTtsEmoText(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && ttsEmoText.trim())
-                        chooseTtsEmo({ kind: "text", label: "文字", text: ttsEmoText.trim() });
-                    }}
-                  />
-                  <button
-                    className="ga-btn ga-btn-secondary ga-btn-sm shrink-0"
-                    disabled={!ttsEmoText.trim()}
-                    onClick={() => chooseTtsEmo({ kind: "text", label: "文字", text: ttsEmoText.trim() })}
-                  >
-                    用
-                  </button>
-                </div>
-                <div className="my-1.5 border-t border-slate-100" />
-                <div className="text-[10.5px] font-medium text-slate-500 px-1 pb-1">情感参考音频</div>
-                <div className="flex items-center gap-1 px-1">
-                  <button className="ga-btn ga-btn-secondary ga-btn-sm"
-                    onClick={() => ttsEmoFileRef.current?.click()}>
-                    {ttsEmo.kind === "audio" ? `已选：${ttsEmo.file.name.slice(0, 12)}` : "选一段带情绪的干声…"}
-                  </button>
-                  <input ref={ttsEmoFileRef} type="file" accept="audio/*" className="hidden"
-                    onChange={(e) => {
-                      const f = e.target.files?.[0];
-                      e.target.value = "";
-                      if (f) chooseTtsEmo({ kind: "audio", label: "情感音频", file: f });
-                    }} />
-                </div>
-                <div className="text-[9.5px] text-slate-400 px-1 pt-1.5 leading-snug">
-                  情感音频仅在本次页面有效，刷新后回到「自动」。
-                </div>
-              </div>
-            </>,
-            document.body,
-          )}
         </div>
       </div>
 

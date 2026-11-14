@@ -205,8 +205,8 @@ else
   cp "$TPL" "$ENV_PATH"
   ok ".env 已生成（来自 env.template）。请编辑并至少设置 GA_LLM_MODE=real / OPENAI_API_KEY / OPENAI_BASE_URL / GA_LLM_MODEL"
 fi
-if grep -qE '^\s*DATABASE_URL\s*=\s*mysql' "$ENV_PATH" 2>/dev/null; then
-  warn "检测到 DATABASE_URL 用 MySQL：还需 .venv/bin/pip install aiomysql，并先建库 game_agent(utf8mb4)。"
+if grep -qE '^\s*DATABASE_URL\s*=\s*(mysql|postgres)' "$ENV_PATH" 2>/dev/null; then
+  warn "检测到 DATABASE_URL 用了非 SQLite 连接串：本版本只支持 SQLite，请清空该项或改为 sqlite+aiosqlite:///…。"
 fi
 
 # ---------- 4. 可选组件体检（不阻断）----------

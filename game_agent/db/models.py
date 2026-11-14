@@ -1,4 +1,4 @@
-"""数据模型（设计 §9）。MySQL 8.0+ 与 SQLite 共用同一套模型（SQLAlchemy 2 async）。
+"""数据模型（设计 §9）。个人版只跑 SQLite（SQLAlchemy 2 async）。
 
 表清单：
   身份: users / auth_sessions / api_tokens
@@ -37,17 +37,15 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# MySQL 下 Text 只有 64KB，装不下一次完整 LLM 请求（含工具定义常超 100KB）→ 用 LONGTEXT。
-# SQLite（测试/单机）没有该类型，用普通 TEXT。
-from sqlalchemy.dialects.mysql import LONGTEXT  # noqa: E402
-
-_LongText = Text().with_variant(LONGTEXT(), "mysql")
+# 大文本列：SQLite 的 TEXT 没有长度上限，直接用它存完整 LLM 请求 / 事件细节。
+_LongText = Text()
 
 
 class UTCDateTime(TypeDecorator):
-    """MySQL DATETIME 不存时区：写入时丢 tzinfo（值已是 UTC），读回为裸时间。
-    读回统一补 UTC 标记，API 序列化才会带 +00:00，
-    前端 new Date 才不会把 UTC 当本地时间（导致「已进行 480 分」差 8 小时）。"""
+    """写入时已是 UTC，读回若没带时区就统一补 UTC 标记。
+
+    API 序列化带 +00:00，前端 new Date 才不会把 UTC 当本地时间
+    （否则「已进行 480 分」这种差 8 小时的显示会再现）。"""
     impl = DateTime
     cache_ok = True
 
@@ -337,6 +335,9 @@ class Task(Base):
     title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     status: Mapped[str] = mapped_column(String(12), default="pending", nullable=False)
     # pending|running|done|failed|cancelled
+    # 单个子agent 的独立停止位：用户在界面上单独点掉某个子agent 时置位，
+    # 该 task 自己的取消看门狗看到就掐断它（不影响主agent / 其它子agent）。
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     result_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
@@ -467,6 +468,10 @@ class LlmCall(Base):
     # 供应商是否上报了缓存字段（0/1）：没上报时命中率应显示"未知"而不是 0%
     cache_reported: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # 含重试的总耗时
+    # 首 token 耗时（TTFT，毫秒）：从发出请求到第一个内容增量到达。
+    # 「等多久才开始吐字」和「总共跑多久」是两件事，用户最在意的往往是前者；
+    # 非流式端点测不出来，记 0（前端显示「未测到」，不假报 0 秒）。
+    ttft_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     # 这次往返是正文产出（agent）还是压缩历史的摘要调用（summarize）。
     # 摘要调用的 prompt 只是「被压的那段历史」，不能当成「模型看到的上下文」去算占用；
     # 用它而不是 LLM_TRANSCRIPT 关联，是因为 llm_transcripts 只保留 14 天，过期后仍然要对得上。
@@ -478,8 +483,8 @@ class LlmTranscript(Base):
     """一次 LLM 往返的完整现场：压缩后真正发给模型的内容 + 模型返回的内容。
 
     为什么要单独一张表：llm_calls 只有计数，排查「模型为什么这么答／为什么原地打转」
-    必须看到发出去的原文（尤其上下文压缩丢弃了什么）。大字段走 LONGTEXT，
-    列表查询只取轻列，别把 blob 拖进排序（同 messages 那次 1038 Out of sort memory）。
+    必须看到发出去的原文（尤其上下文压缩丢弃了什么）。大字段走 TEXT，
+    列表查询只取轻列，别把 blob 拖进排序（大行排序会把内存和耗时一起拉爆）。
     """
     __tablename__ = "llm_transcripts"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
@@ -607,3 +612,91 @@ class Settings(Base):
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
+
+
+# ---------------- 消息通道（微信 / 钉钉 / 企业微信 / Webhook）----------------
+class ChannelLink(Base):
+    """用户与外部 IM 通道的绑定关系（一个用户在每个通道上最多一条有效绑定）。
+
+    为什么单独建表而不是塞进 users.prefs_json：绑定要能被入站回调（服务端）反查
+    「这条钉钉消息是谁发的 → 对应哪个用户/团队」，prefs 是整块 JSON、无法索引，
+    而且解绑要留审计痕迹（unlinked_at）。
+
+    状态机 active → unlinked（用户主动解绑）/ revoked（凭证失效被服务端摘掉）。
+    """
+    __tablename__ = "channel_links"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
+    team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    # wecom|dingtalk|wechat|webhook：企业微信（可主动推消息）/钉钉（可主动推+可入站）/个微（仅入站）/通用 webhook
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 通道侧唯一标识：钉钉=unionId/staffId，企微=userid，个微=openid
+    external_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    # 通道侧展示名（昵称/工号），仅用于界面显示
+    display_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # 外发用的补充凭证（钉钉 sessionWebhook / 个微 appid 等），JSON 存放，按通道各自解释
+    credentials_json: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    # 通知开关：任务完成、需要用户回答、失败告警
+    notify_done: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="1")
+    notify_question: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="1")
+    notify_failed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False, server_default="1")
+    # 允许在该通道里直接回复消息继续对话（inbound_reply）——需要通道支持回调
+    inbound_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
+    # 绑定时选定的默认项目：从通道发来的新话题落到哪个项目
+    default_project_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+    # 最近一次会话上下文：通道里「直接接着聊」时复用这条会话，而不是每次新建
+    last_session_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="active", nullable=False,
+                                        server_default="active")  # active|unlinked|revoked
+    last_notified_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
+    linked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    unlinked_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("channel", "external_id", name="ux_channel_links_ext"),
+        Index("ix_channel_links_team", "team_id", "channel", "status"),
+    )
+
+
+class ChannelLinkCode(Base):
+    """扫码绑定的一次性令牌（二维码里编码的就是它的 token）。
+
+    · token 只存哈希：二维码图片本身会出现在浏览器/日志/截图里，明文入库等于把令牌泄了。
+    · 一次一用 + 5 分钟过期：扫码后立刻置 used_at，超时/已用的令牌一律无效。
+    · 只对指定通道有效（channel 列），拿钉钉的码去绑企微会被拒。
+    """
+    __tablename__ = "channel_link_codes"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
+    team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # 二维码内容（前端直接渲染成图，后端不落图）
+    redirect_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    used_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False)
+
+
+class ChannelMessage(Base):
+    """通道外发记录（通知/告警）：用于界面上展示「推送了什么、成没成功」和排障。
+
+    不做重试队列（个人版不需要），但失败原因必须落下来——否则用户只会看到
+    「说好会提醒我，什么都没收到」。
+    """
+    __tablename__ = "channel_messages"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=_uuid)
+    team_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False, index=True)
+    link_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("channel_links.id", ondelete="SET NULL"), nullable=True)
+    channel: Mapped[str] = mapped_column(String(16), nullable=False)
+    run_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), nullable=True, index=True)
+    session_id: Mapped[uuid.UUID | None] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"), nullable=True)
+    # done|question|failed|test
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    body: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)  # pending|sent|failed|skipped
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=_utcnow, nullable=False, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)

@@ -93,6 +93,10 @@ class LLMResponse:
     # ↑ prompt_tokens / completion_tokens；DeepSeek 风格还会带
     #   prompt_cache_hit_tokens / prompt_cache_miss_tokens（有则透传）
     latency_ms: int = 0  # 本次调用耗时（含重试），用于统计生成速度 tok/s
+    # 首 token 耗时（TTFT）：从发出请求到**第一个正文/思考增量**到达的毫秒数。
+    # 用户最直观的感受就是「点了发送后干等多久」，它和总耗时是两件事：
+    # 首字慢=排队/预填充重，首字快但总时长=输出长。0 = 没测到（非流式端点给不出）。
+    ttft_ms: int = 0
     # 本次往返的追踪 id：llm_calls.call_id 与 llm_transcripts.call_id 用它互相对齐
     trace_id: str = ""
 
@@ -111,14 +115,22 @@ class Ctx:
     images: list[str] = field(default_factory=list)  # 用户随需求附图（dataURL）
     model_profile: dict = field(default_factory=dict)
     # ↑ {"model","base_url","api_key","params":{context_window,vision,...}}，来自 ModelProfile
+    # 本轮推理强度覆盖（空=用适配器实例上的默认档位）：runtime 在「长 run 后段」按轮次
+    # 下调一档时用它，只对当次 chat() 生效，不改档位本身。
+    reasoning_effort_override: str = ""
     llm_round: int = 0  # agent 循环内第几轮（上下文记录用它排序）
     # 每次往返落库前的回调：async def(record: dict) -> None，由 runtime 注入（写 llm_transcripts）。
     # 只有适配层知道「压缩后真正发出去」的 messages，所以钩子放在这里而不是 runtime。
     on_llm_request: Any = None
     # 每次退避重试前的回调：def(attempt, max_attempts, delay_s, error) -> None（同步），
     # 由 runtime 注入（发 llm_retry 轨迹事件）。端点 503/限流这类「会自己恢复」的失败
-    # 不该只躺在系统日志里，用户要在运行轨迹里直接看到「正在重试、第几次、等多久」。
+    # 界面上**静默**（用户明确要求别提醒），事件只留给导出/排查。
     on_llm_retry: Any = None
+    # 适配层触发压缩后的回调：def(report: dict, source: str) -> None（同步）。
+    # source: "pre_send"=发送前估算超预算；"endpoint_overflow"=端点拒收（HTTP 400 超长）
+    # 后按半预算重压。端点拒收的压缩以前完全不可见：用户只看到「压缩处理中」，
+    # 不知道是端点的实际上限比配置窗口小。runtime 注入（发 context_compacted 事件）。
+    on_llm_compressed: Any = None
 
 
 class LLM(ABC):

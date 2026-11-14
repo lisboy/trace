@@ -60,6 +60,11 @@ DEFAULT_GUIDANCE: list[dict] = [
      "enabled": True,
      "text": "不确定功能在哪时，先用 glob 找文件、grep 找内容定位，再 read_file 按行精读；"
              "不要对整份大文件反复整读，也不要靠记忆猜路径。"},
+    {"id": "spawn-when-parallel",
+     "title": "多路独立线索开子agent",
+     "enabled": True,
+     "text": "同一问题要查 2 个以上互不依赖的线索/文件/资料时，用 spawn_agents 一次派出多个只读子agent "
+             "并行核对、汇总后自己再动手改，比一条条串行读快；只有 1 处就自己直接读，不必派。"},
 ]
 
 
@@ -86,15 +91,42 @@ def _clean_guidance(raw: object) -> list[dict]:
     return out
 
 
+def _merge_new_builtins(stored: list[dict], known_builtin_ids: set[str]) -> list[dict]:
+    """把「这一版本新增的内置指导项」补进已存清单。
+
+    为什么需要：指导项一旦在 Settings 里存过，``load_policy`` 就以存值为准——于是
+    后来往 DEFAULT_GUIDANCE 加的新条目（如 spawn-when-parallel）对老安装**永远不可见**
+    （实测：库里 50117 次工具调用、0 次 spawn_agents，而库里存的 guidance 恰好在
+    spawn-when-parallel 加入之前保存过）。
+
+    合并规则（可区分「老安装没见过」与「用户故意删掉」）：
+    - ``known_builtin_ids`` = 上次保存时内置清单的 id 集合（随 payload 落库）。
+      老 payload 没有这个字段 → 视为「一个内置项都不认识」，只会补没重复的；
+    - 不在 known 里、且存值里也没有的内置项 = 新版本新增 → 追加到末尾（默认启用）；
+    - 在 known 里的内置项，用户删掉/停用/改词都尊重存值，不复活（「补回内置项」按钮干这事）。
+    """
+    have = {g["id"] for g in stored}
+    added = [dict(g) for g in DEFAULT_GUIDANCE
+             if g["id"] not in known_builtin_ids and g["id"] not in have]
+    return stored + added
+
+
 async def load_policy() -> dict:
-    """读取设置：{permission_scope, guidance}。缺省用内置默认。"""
+    """读取设置：{permission_scope, guidance}。缺省用内置默认。
+
+    新版本新增的内置指导项会自动补进旧安装的已存清单（见 _merge_new_builtins），
+    不用用户跑去「补回内置项」或重装——环境迁移后也不用再找我修。"""
     async with SessionLocal() as s:
         row = await s.get(Settings, POLICY_KEY)
         val = (row.value_json or {}) if row else {}
     scope = normalize_scope(val.get("permission_scope"))
-    # guidance 未存过 → 用内置默认；存过（哪怕是空列表）就以存值为准
+    # guidance 未存过 → 用内置默认；存过（哪怕是空列表）就以存值为准，再补新内置项
     if "guidance" in val and isinstance(val.get("guidance"), list):
-        guidance = _clean_guidance(val.get("guidance"))
+        stored = _clean_guidance(val.get("guidance"))
+        known = set()
+        if isinstance(val.get("builtin_ids"), list):
+            known = {str(x) for x in val["builtin_ids"]}
+        guidance = _merge_new_builtins(stored, known)
     else:
         guidance = [dict(x) for x in DEFAULT_GUIDANCE]
     return {"permission_scope": scope, "guidance": guidance}
@@ -104,6 +136,9 @@ async def save_policy(permission_scope: object, guidance: object) -> dict:
     payload = {
         "permission_scope": normalize_scope(permission_scope),
         "guidance": _clean_guidance(guidance),
+        # 记录「保存这一刻内置清单里有谁」：load_policy 靠它区分
+        # 「老安装从没见过的新内置项」（补进来）和「用户故意删掉的内置项」（尊重删除）。
+        "builtin_ids": [g["id"] for g in DEFAULT_GUIDANCE],
     }
     async with SessionLocal() as s:
         row = await s.get(Settings, POLICY_KEY)

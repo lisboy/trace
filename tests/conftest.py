@@ -68,6 +68,7 @@ def _fake_brain() -> None:
     import game_agent.agents.runtime as rt
     import game_agent.orchestration.orchestrator as orch_mod
     import game_agent.orchestration.project_memory as pm_mod
+    import game_agent.orchestration.intent as intent_mod
     from game_agent.llm.mock_brain import MockBrain
 
     def _make(role, ctx=None):  # noqa: ANN001, ANN202
@@ -78,7 +79,8 @@ def _fake_brain() -> None:
 
     patches = [patch.object(rt, "build_llm", _make),
                patch.object(orch_mod, "build_llm", _make),
-               patch.object(pm_mod, "build_llm", _make)]
+               patch.object(pm_mod, "build_llm", _make),
+               patch.object(intent_mod, "build_llm", _make)]
     for p in patches:
         p.start()
     yield

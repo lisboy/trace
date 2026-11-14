@@ -66,7 +66,7 @@
 --------------------------------------------------------
 五、可选增强（不装也能用，只是对应功能降级）
 --------------------------------------------------------
-- 本地生图 ComfyUI：.env 里 COMFYUI_BASE_URL=http://127.0.0.1:8588
+- 本地生图 ComfyUI：.env 里 COMFYUI_BASE_URL=http://127.0.0.1:10188
 - 本地语音 IndexTTS2：.env 里 TTS_BASE_URL=... 与 TTS_HOME=<安装目录>
 - 网页截图验收：需要本机有 Chrome 或 Edge（自动探测；否则设 GA_BROWSER_PATH）
 - 音视频转换：需要 ffmpeg / ffprobe 在 PATH 里

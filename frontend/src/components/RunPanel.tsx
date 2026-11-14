@@ -151,11 +151,11 @@ export default function RunPanel({
         {run?.usage && run.usage.calls > 0 && (
           <span
             className="text-[10px] px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 min-w-0 truncate whitespace-nowrap"
-            title={`输入 ${run.usage.prompt} / 输出 ${run.usage.completion} tokens · 缓存命中 ${run.usage.cached ?? 0} · 总耗时 ${(run.usage.latency_ms / 1000).toFixed(1)}s（含重试）`}
+            title={`输入 ${run.usage.prompt} / 输出 ${run.usage.completion} tokens · 缓存命中 ${run.usage.cached ?? 0} · 总耗时 ${(run.usage.latency_ms / 1000).toFixed(1)}s（含重试、工具等待的空档）`}
           >
             {run.usage.calls} 次调用 ·{" "}
             {(run.usage.prompt + run.usage.completion).toLocaleString()} tok
-            {run.usage.tokens_per_sec != null ? ` · ${run.usage.tokens_per_sec} tok/s` : ""}
+            {run.usage.tokens_per_sec != null ? ` · 均 ${run.usage.tokens_per_sec} tok/s` : ""}
             {(run.usage as any).cache_hit_rate != null
               ? ` · 缓存 ${(run.usage as any).cache_hit_rate}%`
               : " · 缓存未上报"}

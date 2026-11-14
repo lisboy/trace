@@ -58,8 +58,13 @@ def test_second_edit_in_same_run_is_not_stale(tmp_path: Path) -> None:
     assert (tmp_path / "style.css").read_text(encoding="utf-8") == ".a{color:#f00}\n.b{color:#00f}\n"
 
 
-def test_external_change_still_blocked(tmp_path: Path) -> None:
-    """run 外把文件改了（用户手改/构建产出）仍然要拦——自愈不能把这个也放过。"""
+def test_external_change_is_still_safe_via_unique_match(tmp_path: Path) -> None:
+    """run 外改过文件照样安全，但靠的是「old_string 唯一命中」而不是 stale 检查。
+
+    口径见 native.py:621-629：edit_file 刻意不做「读过之后是否被改过」的检查（同轮并行
+    多个 edit 会互相误报、run_command 改文件后必误报）。安全闸是精确替换本身：
+    old_string 不命中或不唯一都会被拦下。本用例锁这个行为，防止有人把 stale 检查加回来。
+    """
     f = tmp_path / "a.txt"
     f.write_text("one\ntwo\n", encoding="utf-8")
     t = _ctx(tmp_path)
@@ -67,12 +72,17 @@ def test_external_change_still_blocked(tmp_path: Path) -> None:
     async def _flow():
         await read_file({"path": "a.txt"}, t)
         f.write_text("one\ntwo\nthree\n", encoding="utf-8")  # 外部改动：大小变了
-        return await execute_tool("edit_file",
-                                  {"path": "a.txt", "old_string": "one",
-                                   "new_string": "1"}, t)
+        ok = await execute_tool("edit_file",
+                                {"path": "a.txt", "old_string": "one", "new_string": "1"}, t)
+        # 外部改动把内容改得 old_string 不唯一了 → 必须拦下，不能瞎改
+        f.write_text("1\ntwo\n1\n", encoding="utf-8")
+        bad = await execute_tool("edit_file",
+                                 {"path": "a.txt", "old_string": "1", "new_string": "x"}, t)
+        return ok, bad
 
-    out = _run(_flow())
-    assert "工具错误" in out and "已经被改过" in out, out
+    ok, bad = _run(_flow())
+    assert "已修改" in ok, ok                       # 精确替换，外部改动不影响这一处
+    assert "工具错误" in bad and "不唯一" in bad or "多处" in bad, bad
 
 
 def test_write_then_edit_needs_no_reread(tmp_path: Path) -> None:
@@ -431,6 +441,69 @@ def test_codemap_category_roundtrip(tmp_path: Path) -> None:
             "category"] == "codemap"
     assert project_notes.delete_entry(ws, "codemap", entries[0]["key"]) is True
     assert project_notes.list_entries(ws) == []
+
+
+# ---------------------------------------------------------------- 改动八：生命周期（钉住 / 失效 / 公平预算）
+def test_trim_keeps_pinned_and_drops_stale_first(tmp_path: Path) -> None:
+    """三级淘汰：钉住的永不丢、失效的最先丢、其余满了丢最旧。"""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    project_notes.append(ws, [{"category": "convention", "title": "迁移先复制再删旧",
+                               "detail": "- 铁律"}])
+    project_notes.append(ws, [{"category": "convention", "title": "过程性临时条目",
+                               "detail": "- 一次性"}])
+    entries = {e["title"]: e["key"] for e in project_notes.list_entries(ws)}
+    assert project_notes.set_flag(ws, "convention", entries["迁移先复制再删旧"], keep=True) is True
+    assert project_notes.set_flag(ws, "convention", entries["过程性临时条目"], stale=True) is True
+    for i in range(45):
+        project_notes.append(ws, [{"category": "convention", "title": f"普通条目 {i}",
+                                   "detail": "- x"}])
+    listed = project_notes.list_entries(ws)
+    titles = [e["title"] for e in listed]
+    assert "迁移先复制再删旧" in titles, "钉住的被挤掉了"
+    assert "过程性临时条目" not in titles, "失效的没被优先淘汰"
+    assert len(listed) <= 40
+    assert any(e["keep"] for e in listed if e["title"] == "迁移先复制再删旧")
+
+
+def test_stale_entry_not_injected(tmp_path: Path) -> None:
+    """失效条目不再注入上下文（否则旧口径会一直误导后续 run）。"""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    project_notes.append(ws, [{"category": "pitfall", "title": "旧口径已过时", "detail": "- x"}])
+    key = project_notes.list_entries(ws)[0]["key"]
+    assert project_notes.set_flag(ws, "pitfall", key, stale=True) is True
+    assert "旧口径已过时" not in project_notes.index_block(ws)
+    assert project_notes.list_entries(ws)[0]["stale"] is True
+    # 恢复后重新注入
+    assert project_notes.set_flag(ws, "pitfall", key, stale=False) is True
+    assert "旧口径已过时" in project_notes.index_block(ws)
+
+
+def test_index_block_fair_budget_across_categories(tmp_path: Path) -> None:
+    """五类都要拿到预算：曾出现 playbook/codemap 整类被饿死（一条都没注入）。"""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    for cat in ("decision", "pitfall", "convention", "playbook", "codemap"):
+        for i in range(30):
+            project_notes.append(ws, [{"category": cat, "title": f"{cat} 条目 {i}",
+                                       "detail": "- x"}])
+    block = project_notes.index_block(ws, budget_tokens=600)
+    for cn in ("决策与取舍", "踩坑与规避", "项目约定", "可复用做法", "代码地图"):
+        assert f"**{cn}**" in block, f"{cn} 没拿到任何预算"
+
+
+def test_supersede_marks_old_entry_stale(tmp_path: Path) -> None:
+    """judge 让模型写「取代：<旧标题>」，新条目落盘时旧条要自动标失效。"""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    project_notes.append(ws, [{"category": "decision", "title": "收尾汇报按情况选块",
+                               "detail": "- 旧口径"}])
+    project_notes.append(ws, [{"category": "decision", "title": "收尾汇报挑 3~5 块",
+                               "detail": "- 取代：收尾汇报按情况选块\n- 新口径"}])
+    by_title = {e["title"]: e for e in project_notes.list_entries(ws)}
+    assert by_title["收尾汇报按情况选块"]["stale"] is True
+    assert by_title["收尾汇报挑 3~5 块"]["stale"] is False
 
 
 def test_index_block_lists_titles_not_bodies(tmp_path: Path) -> None:

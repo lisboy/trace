@@ -13,7 +13,7 @@ export interface Team {
   id: string;
   name: string;
   slug: string;
-  role: string; // owner|admin|developer|viewer
+  role: string; // 个人版固定 owner；后端保留字段以便将来扩展
 }
 
 export interface Project {
@@ -72,8 +72,13 @@ export interface ContextOccupancy {
   profile_key: string | null;
   profile_label: string | null;
   rounds: number;
+  /** 该角色最近若干轮（≤500）的输入/输出/缓存合计：缓存弹层按角色拆开看 */
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cached_tokens?: number;
+  cache_reported_rounds?: number;
   context_window: number;
-  window_configured: boolean; // false=档位没填，按 32768 保守估算
+  window_configured: boolean; // false=档位没填，按默认 256k 估算
   budget_tokens: number; // 超过这条线 compress_messages 就开始裁剪
   last_prompt_tokens: number;
   peak_prompt_tokens: number;
@@ -92,10 +97,36 @@ export interface SessionUsage {
   prompt_tokens: number;
   completion_tokens: number;
   cached_tokens: number;
+  /** 未命中缓存的输入 = prompt - cached；弹层里「总量 = 未缓存输入 + 缓存读取 + 输出」可自校验 */
+  uncached_tokens?: number;
   total_tokens: number;
   latency_ms: number;
-  tokens_per_sec: number | null;
+  tokens_per_sec: number | null; // 瞬时：最近一轮往返的输出速度
+  /** 会话累计平均速度（全历史、含重试）：只作对照，换模型后会滞后 */
+  tokens_per_sec_avg?: number | null;
+  /** 首 token 耗时（TTFT）：最近一轮实测毫秒；0/null = 该轮没测到（非流式端点） */
+  ttft_ms?: number | null;
+  /** 会话内已测到的 TTFT 中位数（毫秒）：偶发排队不会把它拉爆，代表「常态等多久」 */
+  ttft_median_ms?: number | null;
+  /** 测到过 TTFT 的往返条数（0 = 这个端点的响应拿不到首字时间） */
+  ttft_calls?: number;
+  /** 最近一轮往返的明细（tooltip 用）：哪个角色/模型、输出多少、耗时多久 */
+  last_round?: {
+    agent_key: string;
+    agent_label: string;
+    model: string | null;
+    completion_tokens: number;
+    latency_ms: number;
+    ttft_ms?: number;
+    /** 最近一轮的输入/缓存明细（缓存弹层里「这一轮」那几行） */
+    prompt_tokens?: number;
+    cached_tokens?: number;
+    cache_reported?: boolean;
+    created_at: string;
+  } | null;
   cache_hit_rate: number | null; // 0-100，null=无缓存信息
+  /** 端点是否上报过缓存字段：false 时候弹层写「未上报」，不把「没数据」说成 0% */
+  cache_reported?: boolean;
   context: ContextOccupancy | null; // 占用比例最高的角色
   context_by_agent: ContextOccupancy[];
   compress_at_pct: number; // 到这条百分比就开始压缩历史
@@ -280,7 +311,9 @@ export interface ProjectNote {
   when: string;          // YYYY-MM-DD
   files: string[];
   run_id: string;
-  key: string;           // 删除用
+  key: string;           // 删除/标记用
+  keep: boolean;         // 钉住：永不淘汰（满了也不丢）
+  stale: boolean;        // 已失效：不再注入上下文、优先淘汰（留痕不删除）
 }
 
 export interface Message {
@@ -403,6 +436,7 @@ export interface WSEvent {
 
 export const ROLE_LABEL: Record<string, string> = {
   main: "助手",
+  sub: "子agent",
   // 旧数据里的角色 key，统一显示成「助手」
   planner: "助手",
   artist: "助手",

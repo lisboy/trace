@@ -56,7 +56,11 @@ def test_view_images_saves_sheet_and_reports_path(tmp_path: Path) -> None:
 
 
 def test_run_raw_serves_saved_sheet(tmp_path: Path, session_factory, monkeypatch) -> None:
-    """端到端：合图落盘后，/runs/{id}/raw/<path> 能把它当图片直出（前端 <img> 就取这个地址）。"""
+    """端到端：合图落盘后，/runs/{id}/raw/<path> 能把它当图片直出（前端 <img> 就取这个地址）。
+
+    这个版本没有登录：请求不带凭证，服务端用本机唯一身份 —— fixture 必须把 run 挂到
+    该身份的 team 下，否则 /raw 会因为 team 不一致返回 404。
+    """
     import asyncio
 
     import httpx
@@ -64,41 +68,30 @@ def test_run_raw_serves_saved_sheet(tmp_path: Path, session_factory, monkeypatch
 
     from game_agent.api.routers import runs as runs_router
     from game_agent.api.state import state
-    from game_agent.auth.service import AuthService
+    from game_agent.auth.local import ensure_local_identity
     from game_agent.config import PROJECTS_ROOT
-    from game_agent.core.context import RequestContext
-    from game_agent.db.models import Project, Run, Team, TeamMember, User
-
-    auth = AuthService(session_factory)
+    from game_agent.db.models import Project, Run, Session as DbSession
 
     async def seed():
         key = uuid.uuid4().hex
         async with session_factory() as db:
-            team = Team(name="Sheet", slug=f"sheet-{key}")
-            user = User(email=f"owner-{key}@example.com", display_name="owner")
-            db.add_all([team, user])
-            await db.flush()
-            db.add(TeamMember(user_id=user.id, team_id=team.id, role="owner"))
-            await db.flush()
+            user, team = await ensure_local_identity(db)
             workspace = PROJECTS_ROOT / f"sheet-ws-{key}"
             project = Project(name="sheet", slug=f"sheet-p-{key}", team_id=team.id,
                               repo_path=workspace.name, created_by=user.id)
             db.add(project)
             await db.flush()
-            sess = __import__("game_agent.db.models", fromlist=["Session"]).Session(
-                team_id=team.id, project_id=project.id)
+            sess = DbSession(team_id=team.id, project_id=project.id, created_by=user.id)
             db.add(sess)
             await db.flush()
             run = Run(team_id=team.id, project_id=project.id, session_id=sess.id,
                       triggered_by=user.id, run_type="modify")
             db.add(run)
             await db.commit()
-            return str(run.id), str(user.id), workspace
+            return str(run.id), workspace
 
-    run_id, user_id, workspace = asyncio.run(seed())
+    run_id, workspace = asyncio.run(seed())
     workspace.mkdir(parents=True, exist_ok=True)
-    token = asyncio.run(auth.create_session(user_id, None, None))
-    monkeypatch.setattr(state, "auth", auth)
     monkeypatch.setattr(state, "session_factory", session_factory)
 
     # 在项目工作区内造一张图（等价 view_images 落盘产物）
@@ -112,9 +105,7 @@ def test_run_raw_serves_saved_sheet(tmp_path: Path, session_factory, monkeypatch
     async def send():
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            return await client.get(
-                f"/api/runs/{run_id}/raw/.trace/previews/sheet-x.jpg",
-                headers={"Cookie": f"ga_session={token}"})
+            return await client.get(f"/api/runs/{run_id}/raw/.trace/previews/sheet-x.jpg")
 
     resp = asyncio.run(send())
     assert resp.status_code == 200, resp.text

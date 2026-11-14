@@ -1,4 +1,4 @@
-"""团队 / 项目 / 成员 路由（设计 §3 / §9）。"""
+"""空间 / 项目 路由（设计 §3 / §9）。"""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from game_agent.api.deps import _u, get_current_context, get_optional_context, require
 from game_agent.api.state import state
 from game_agent.auth.rbac import (
-    PERM_MEMBER, PERM_PROJECT_CREATE, PERM_RUN_CREATE, PERM_TEAM_DELETE, PERM_VIEW,
+    PERM_PROJECT_CREATE, PERM_RUN_CREATE, PERM_TEAM_DELETE, PERM_VIEW,
 )
 from game_agent.config import CHAT_UPLOADS_ROOT, MODE, PROJECTS_ROOT, default_python_bin
 from game_agent.core.context import RequestContext
@@ -33,9 +33,11 @@ RAW_MAX_BYTES = 24 * 1024 * 1024
 TEXT_PREVIEW_MAX = 2 * 1024 * 1024
 
 
-# ---------------- 团队 ----------------
+# ---------------- 个人空间 ----------------
+# 个人版：一个账号对应一个工作区（内部仍用 teams 表存 id，供各表按空间分区）。
+# 前端登录后调这个接口拿自己的空间 id，之后所有请求都带上 X-Team-Id。
 @router.get("/teams")
-async def list_teams(ctx: RequestContext = Depends(require(PERM_MEMBER))):
+async def list_teams(ctx: RequestContext = Depends(get_current_context)):
     async with state.session_factory() as s:
         rows = await s.execute(
             select(Team.id, Team.name, Team.slug, TeamMember.role)
@@ -43,17 +45,6 @@ async def list_teams(ctx: RequestContext = Depends(require(PERM_MEMBER))):
             .where(TeamMember.user_id == _u(ctx.user_id))
         )
         return [{"id": str(t[0]), "name": t[1], "slug": t[2], "role": t[3]} for t in rows.all()]
-
-
-@router.get("/teams/{team_id}/members")
-async def list_members(team_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
-    async with state.session_factory() as s:
-        rows = await s.execute(
-            select(User.id, User.email, User.display_name, TeamMember.role)
-            .join(TeamMember, TeamMember.user_id == User.id)
-            .where(TeamMember.team_id == _u(team_id))
-        )
-        return [{"id": str(r[0]), "email": r[1], "display_name": r[2], "role": r[3]} for r in rows.all()]
 
 
 # ---------------- 项目 ----------------
@@ -70,7 +61,7 @@ class ProjectIn(BaseModel):
 async def create_project(team_id: str, body: ProjectIn,
                          ctx: RequestContext = Depends(require(PERM_PROJECT_CREATE))):
     if team_id != ctx.team_id:
-        raise HTTPException(status_code=403, detail="不能在其他团队建项目")
+        raise HTTPException(status_code=403, detail="不能在其他工作区建项目")
     workspace = PROJECTS_ROOT / body.repo_path
     workspace.mkdir(parents=True, exist_ok=True)
     commands = body.commands_json or {
@@ -127,6 +118,34 @@ async def restore_project(project_id: str,
     return {"id": project_id, "archived": False}
 
 
+@router.post("/projects/{project_id}/reveal")
+async def reveal_project(project_id: str,
+                         ctx: RequestContext = Depends(require(PERM_VIEW))):
+    """在系统文件管理器里打开项目工作区目录。
+
+    只对本机（lite）模式有意义：server 模式的「工作区」在服务端机器上，
+    浏览器所在客户端打不开，直接拒绝。返回实际打开的绝对路径，便于前端提示。"""
+    if MODE != "lite":
+        raise HTTPException(status_code=400, detail="仅本机（lite）模式支持打开文件夹")
+    async with state.session_factory() as s:
+        ws = await _project_workspace(s, project_id, ctx)
+    if not ws.exists():
+        raise HTTPException(status_code=404, detail="工作区目录不存在")
+    import subprocess as _sub
+    import sys as _sys
+    try:
+        if _sys.platform == "win32":
+            # explorer 打开目录后即使成功也常返回非 0，不能据此判断失败
+            _sub.Popen(["explorer", str(ws)])
+        elif _sys.platform == "darwin":
+            _sub.Popen(["open", str(ws)])
+        else:
+            _sub.Popen(["xdg-open", str(ws)])
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"打开文件夹失败：{type(e).__name__}: {e}")
+    return {"ok": True, "path": str(ws)}
+
+
 @router.get("/projects/{project_id}")
 async def get_project(project_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
     async with state.session_factory() as s:
@@ -178,6 +197,7 @@ async def list_projects(team_id: str, archived: bool = Query(False),
     async with state.session_factory() as s:
         q = select(Project).where(Project.team_id == _u(team_id))
         q = q.where(Project.archived_at.is_not(None)) if archived else q.where(Project.archived_at.is_(None))
+        q = q.order_by(Project.created_at.desc())  # 工作区按创建时间倒序：最新添加的排最上面
         rows = await s.execute(q)
         projects = rows.scalars().all()
         out = []
@@ -291,18 +311,15 @@ async def serve_chat_image(ref: str = Query(...), thumb: int = Query(0),
 
     以前附图原图存在项目工作区的 .trace/uploads 里，跑完/回滚/换机器就没了，灯箱只能黑屏。
     现在独立存放，前端通过 ``?ref=chat-uploads/<team>/<file>`` 读。**两种放行方式**：
-      ① 带有效签名 sig（serve_url 生成）：自授权，不依赖 cookie。因为 <img> 发不出
-         Authorization 头，也可能带不上会话 cookie，只靠 cookie 鉴权时会 401（图片一片空）；
-      ② 无签名：要求登录态（ctx 非空）且属于该 ref 内嵌的团队（多团队 <img> 也正确）。
-    防跨租户：签名只发给登录用户；无签名路径强制团队校验。thumb=长边像素出缩略图。"""
+      ① 带有效签名 sig（serve_url 生成）：自授权（<img> 带不了自定义头，签名最省事）；
+      ② 无签名：按本机工作区校验（这个版本没有登录，ctx 恒存在）。
+    thumb=长边像素出缩略图。"""
     from starlette.concurrency import run_in_threadpool
     from game_agent.core import chat_images
 
     signed = chat_images.verify_ref(ref, exp, sig)
-    if not signed:
-        if ctx is None:
-            raise HTTPException(status_code=401, detail="未登录")
-        # 无签名：走原团队校验
+    if not signed and ctx is None:
+        raise HTTPException(status_code=404, detail="附图不存在")
     target = await _resolve_chat_upload_path(ref, ctx, allow_any_team=signed)
     if target is None:
         raise HTTPException(status_code=404, detail="附图不存在")

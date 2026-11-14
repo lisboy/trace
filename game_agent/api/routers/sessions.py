@@ -30,14 +30,30 @@ from game_agent.agents.roles import ROLE_LABELS
 from game_agent.auth.rbac import PERM_RUN_CREATE, PERM_VIEW
 from game_agent.config import CHAT_UPLOADS_ROOT, PROJECTS_ROOT
 from game_agent.core.context import RequestContext
-from game_agent.db.models import (Agent, Event, LlmCall, LlmTranscript, Message, ModelProfile,
-                                  Project, Run, RunQuestion, Session)
+from game_agent.db.models import (Agent, Event, LlmCall, LlmProvider, LlmTranscript, Message,
+                                  ModelProfile, Project, Run, RunQuestion, Session, Task)
 from game_agent.db.session import SessionLocal
 from game_agent.orchestration.caps import normalize_caps
 from game_agent.orchestration import policy as policy_mod
-from game_agent.llm.context_window import BUDGET_RATIO, budget_for, resolve_window
+from game_agent.llm.context_window import (BUDGET_RATIO, budget_for,
+                                           merge_model_catalog_params, resolve_window)
 
 router = APIRouter(prefix="/api", tags=["sessions/runs"])
+
+
+def _profile_params(prof, providers_by_id: dict) -> dict | None:
+    """档位 params，窗口/视觉以供应商模型目录按模型名的配置为准（目录优先）。
+
+    与运行时 orchestrator._load_profile 同一口径（merge_model_catalog_params），
+    否则统计页会与压缩用的窗口打架（显示 256k、实际按 128k 压缩之类）。
+    """
+    if prof is None:
+        return None
+    params = prof.params_json or {}
+    pv = providers_by_id.get(str(prof.provider_id)) if prof.provider_id else None
+    if pv is not None:
+        params = merge_model_catalog_params(params, pv.models_json, prof.model)
+    return params
 
 
 # 动作分桶：顶栏的会话级统计和单条 run 轨迹摘要头是同一句话（「运行了 N 条命令，
@@ -57,7 +73,7 @@ def _tool_bucket(name: str | None) -> str:
 
 
 def _plain_json(v):
-    """json_extract 在不同方言的返回形态不同：MySQL 返回裸字符串，SQLite 返回带引号的 JSON 文本。
+    """json_extract 返回的是带引号的 JSON 文本（如 "\"read_file\""）。
     统一剥掉两端引号再参与分桶/展示（工具名、角色名里不会有引号）。"""
     if isinstance(v, str) and len(v) >= 2 and v[0] == '"' and v[-1] == '"':
         return v[1:-1]
@@ -65,7 +81,7 @@ def _plain_json(v):
 
 
 def _empty_activity() -> dict:
-    return {"commands": 0, "reads": 0, "writes": 0, "other": 0, "total": 0}
+    return {"commands": 0, "reads": 0, "writes": 0, "other": 0, "total": 0, "subagents": 0}
 
 
 class FileIn(BaseModel):
@@ -522,8 +538,8 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
         # 分桶口径与前端 RunTraceInline.actionSummary 一致，两边数出来必须对得上。
         # 直接聚合 events 的 tool_call（实测 4.7k 事件的会话 11ms），所以并进 /usage
         # 一次带回，不另开接口、也不建缓存表。
-        # 注意：json_unquote 只有 MySQL 有，SQLite（lite/测试/打包版）会报 no such function。
-        # 两个方言下都改成「取原始 JSON 文本再在 Python 里剥引号」，语义一致。
+        # 注意：SQLite 没有 json_unquote，会报 no such function。
+        # 所以「取原始 JSON 文本再在 Python 里剥引号」（_plain_json），语义一致。
         tool_rows = (await s.execute(
             select(func.json_extract(Event.payload_json, "$.tool"),
                    func.count())
@@ -541,23 +557,71 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
         # 关联来排除，但那张表只保留 14 天，过期后顶栏上下文又会被摘要调用带成 3%。
         # 现在直接按 llm_calls.purpose 过滤，持久可靠。
         recent = (await s.execute(
-            select(LlmCall.agent_key, LlmCall.model, LlmCall.prompt_tokens, LlmCall.call_id)
+            select(LlmCall.agent_key, LlmCall.model, LlmCall.prompt_tokens, LlmCall.call_id,
+                   LlmCall.completion_tokens, LlmCall.latency_ms, LlmCall.created_at,
+                   LlmCall.run_id, LlmCall.ttft_ms,
+                   # 末尾追加（不要插在中间）：下面的解包与下标都按位置读，插中间会连锁错位
+                   LlmCall.cached_tokens, LlmCall.cache_reported)
             .select_from(LlmCall)
             .join(Run, Run.id == LlmCall.run_id)
             .where(Run.session_id == sess.id, LlmCall.purpose != "summarize")
             .order_by(LlmCall.created_at.desc(), LlmCall.id.desc())
             .limit(500))).all()
+        # 每个角色「最近一次调用」所在 run 的档位覆盖（输入框选过模型 / 运行中切换过）：
+        # 实际压缩用的窗口来自那个档位，顶栏的占用百分比也必须按同一个窗口算，
+        # 否则会出现「顶栏 1%、却已经压缩」——显示用绑定档位、压缩用运行档位，两处打架。
+        newest_run: dict[str, str] = {}
+        for r in recent:
+            if r[7]:
+                newest_run.setdefault(r[0] or "", str(r[7]))
+        override_keys: dict[str, str] = {}
+        if newest_run:
+            opt_rows = (await s.execute(
+                select(Run.id, Run.options_json).where(
+                    Run.id.in_([_u(x) for x in set(newest_run.values())])))).all()
+            opts_by_run = {str(rid): (opts or {}) for rid, opts in opt_rows}
+            for agent_key, rid in newest_run.items():
+                pk = str((opts_by_run.get(rid) or {}).get("model_profile_key") or "").strip()
+                if pk:
+                    override_keys[agent_key] = pk
         # 角色 → 绑定的档位（含窗口参数）
         agents_cfg = (await s.execute(
             select(Agent).where(Agent.team_id == sess.team_id))).scalars().all()
         pkeys = {a.model_profile_key for a in agents_cfg if a.model_profile_key}
+        # 运行档位（输入框选过模型）也要一起取：窗口按实际压缩用的档位算
+        pkeys |= set(override_keys.values())
         profiles = {}
         if pkeys:
             profiles = {p.key: p for p in (await s.execute(
                 select(ModelProfile).where(ModelProfile.team_id == sess.team_id,
                                            ModelProfile.key.in_(pkeys)))).scalars().all()}
+        # 供应商模型目录（窗口/视觉在这里按模型名配）：档位 params 缺省时从这里补齐，
+        # 保证显示层读到的窗口与运行时（orchestrator._load_profile）完全一致。
+        providers_by_id: dict[str, LlmProvider] = {}
+        if pkeys:
+            pids = {str(p.provider_id) for p in profiles.values() if p.provider_id}
+            if pids:
+                providers_by_id = {str(pv.id): pv for pv in (await s.execute(
+                    select(LlmProvider).where(LlmProvider.id.in_(
+                        [_u(x) for x in pids])))).scalars().all()}
     calls, prompt, completion, cached, latency, reported = (int(x or 0) for x in row)
     total = prompt + completion
+    # 会话累计平均速度：全历史（含重试）——换模型后几乎不动，只作工具提示里的对照。
+    avg_speed = round(completion / (latency / 1000), 1) if latency > 0 and completion > 0 else None
+    # 瞬时速度：最近一次正文往返的「输出 token / 该轮耗时」。用户 2026-11-12 实测：
+    # 切到更快的模型后顶栏还显示 21.7 tok/s（会话平均值被历史拖住），以为切换没生效。
+    # 顶栏「速度」显示这个瞬时值；累计平均留在 tooltip 里备份对照。
+    last_call = recent[0] if recent else None
+    instant_speed = None
+    if last_call is not None:
+        _ct, _ms = int(last_call[4] or 0), int(last_call[5] or 0)
+        if _ct > 0 and _ms > 0:
+            instant_speed = round(_ct / (_ms / 1000), 1)
+    # 首 token 耗时（TTFT）：最近一轮实测值 + 会话内所有测到过的一轮的中位数。
+    # 用中位数而不是平均：偶发的一次排队/限流重试会把平均拉爆，中位数才是「常态等多久」。
+    _ttfts = sorted(int(x[8] or 0) for x in recent if int(x[8] or 0) > 0)
+    ttft_last = int(last_call[8] or 0) if last_call is not None else 0
+    ttft_median = (_ttfts[len(_ttfts) // 2] if _ttfts else 0)
 
     activity = _empty_activity()
     for name, n in tool_rows:
@@ -581,18 +645,24 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
 
     # 按角色聚合：prompt_tokens 序列保持「新→旧」（recent 是倒序）
     stats: dict[str, dict] = {}
-    for agent_key, model, pt, _cid in recent:
+    for agent_key, model, pt, _cid, _ct, _ms, _created, _rid, _ttft, _cached, _rep in recent:
         key = agent_key or ""
-        st = stats.setdefault(key, {"prompts": [], "model": model})
+        st = stats.setdefault(key, {"prompts": [], "model": model, "rows": []})
         st["prompts"].append(int(pt or 0))
         st.setdefault("model", model)
+        # 逐行留一份 (输入, 缓存, 输出, 是否上报)：下面按窗口过滤掉「端点把累计量当单次
+        # usage 上报」的异常行后再求和，否则按角色的合计会比会话总量还大。
+        st["rows"].append((int(pt or 0), int(_cached or 0), int(_ct or 0), bool(_rep)))
 
     cfg_by_key = {a.key: a for a in agents_cfg}
     by_agent = []
     for key, st in stats.items():
         cfg = cfg_by_key.get(key)
-        prof = profiles.get(cfg.model_profile_key) if cfg and cfg.model_profile_key else None
-        window, configured = resolve_window((prof.params_json or {}) if prof else {})
+        # 优先用「这个角色最近一次调用所用的档位」：压缩按它算窗口，这里也必须按它算，
+        # 否则用户看到顶栏 1%、实际却已越过预算被压缩（两处窗口不同）。
+        used_key = override_keys.get(key) or (cfg.model_profile_key if cfg else None)
+        prof = profiles.get(used_key) if used_key else None
+        window, configured = resolve_window(_profile_params(prof, providers_by_id))
         budget = budget_for(window)
         # 中转站偶尔把整轮的用量累计塞进最后一条响应的 usage（实测出现过 prompt_tokens
         # ≈ 窗口 10 倍的单行）。这种行不能当「当前上下文」，否则占用条直接爆表。
@@ -600,13 +670,23 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
         skewed = len([p for p in st["prompts"] if p > window * 1.5])
         last = plausible[0] if plausible else 0
         peak = max(plausible, default=0)
+        # 合计只算「可信行」（输入量在窗口 1.5 倍以内）：端点把整轮累计量塞进单条 usage 的
+        # 那种行，加进合计会让按角色表比会话总量还大，用户一眼就看出数不对。
+        good = [r for r in st["rows"] if 0 < r[0] <= window * 1.5]
+        n_cached = sum(r[1] for r in good)
+        n_prompt = sum(r[0] for r in good)
         by_agent.append({
             "agent_key": key or "unknown",
             "agent_label": ROLE_LABELS.get(key, key or "未知角色"),
             "model": st["model"] or (prof.model if prof else None),
-            "profile_key": cfg.model_profile_key if cfg else None,
+            "profile_key": used_key,
             "profile_label": prof.label if prof else None,
             "rounds": len(st["prompts"]),
+            # 该角色的 token/缓存合计（只统计 recent 取的最近若干轮，不是全历史）
+            "prompt_tokens": n_prompt,
+            "completion_tokens": sum(r[2] for r in good),
+            "cached_tokens": min(n_cached, n_prompt),
+            "cache_reported_rounds": sum(1 for r in good if r[3]),
             "context_window": window,
             # False = 档位没填 context_window，按 DEFAULT_CONTEXT_WINDOW 估算（猜的）
             "window_configured": configured,
@@ -633,12 +713,37 @@ async def session_usage(session_id: str, ctx: RequestContext = Depends(require(P
         "prompt_tokens": prompt,          # 输入 token（含命中缓存部分）
         "completion_tokens": completion,  # 输出 token
         "cached_tokens": cached,          # 命中前缀缓存的输入 token
+        # 未命中缓存的输入 = 输入 - 命中。写进弹层是为了让「总量 = 未缓存输入 + 缓存读取 + 输出」
+        # 这个加法关系在界面上能自己核对，而不是只给一个百分比让人猜分母。
+        "uncached_tokens": max(0, prompt - cached),
         "total_tokens": total,            # 总消耗 token = 输入 + 输出
         "latency_ms": latency,
-        "tokens_per_sec": round(completion / (latency / 1000), 1)
-        if latency > 0 and completion > 0 else None,
+        # tokens_per_sec = 瞬时速度（最近一轮往返）；换模型后下一个思考轮次就会变。
+        # tokens_per_sec_avg = 会话累计平均（全历史、含重试），只作对照，别再拿来当主显示。
+        "tokens_per_sec": instant_speed if instant_speed is not None else avg_speed,
+        "tokens_per_sec_avg": avg_speed,
+        # ---- 首 token 耗时（TTFT）----
+        # ttft_ms = 最近一轮实测（0 = 该轮没测到，如非流式端点）；ttft_median_ms = 会话内中位数。
+        # 前端顶栏显示「首字」那一格，悬浮里同时给「总往返」做对照。
+        "ttft_ms": ttft_last,
+        "ttft_median_ms": ttft_median,
+        "ttft_calls": len(_ttfts),
+        "last_round": ({
+            "agent_key": last_call[0] or "unknown",
+            "agent_label": ROLE_LABELS.get(last_call[0] or "", last_call[0] or "未知角色"),
+            "model": last_call[1],
+            "completion_tokens": int(last_call[4] or 0),
+            "latency_ms": int(last_call[5] or 0),
+            "ttft_ms": int(last_call[8] or 0),
+            # 最近一轮的输入/缓存明细：弹层里「这一轮为什么这么慢/这么贵」看的就是这几格
+            "prompt_tokens": int(last_call[2] or 0),
+            "cached_tokens": int(last_call[9] or 0),
+            "cache_reported": int(last_call[10] or 0) > 0,
+            "created_at": str(last_call[6]),
+        } if last_call is not None else None),
         # 端点没上报缓存字段时返回 None（前端显示"未知"），避免把"没上报"假报成 0% 命中
-        "cache_hit_rate": round(cached / prompt * 100, 1)
+        # 上限压到 100%：端点把累计量当单次用量上报时，cached 偶尔会大于汇总后的 prompt
+        "cache_hit_rate": round(min(cached, prompt) / prompt * 100, 1)
         if (prompt > 0 and reported > 0) else None,
         "cache_reported": reported > 0,
         # ---- 会话累计动作（命令/读取/修改/其它 + 任务墙钟合计）----
@@ -676,12 +781,25 @@ async def session_context_stats(
             select(LlmTranscript.id, LlmTranscript.call_id, LlmTranscript.agent_key,
                    LlmTranscript.model, LlmTranscript.round_no, LlmTranscript.compressed,
                    LlmTranscript.dropped_msgs, LlmTranscript.req_bytes,
-                   LlmTranscript.stats_json, LlmTranscript.created_at)
+                   LlmTranscript.stats_json, LlmTranscript.created_at,
+                   LlmTranscript.run_id)
             .select_from(LlmTranscript)
             .join(Run, Run.id == LlmTranscript.run_id)
             .where(*cond)
             .order_by(LlmTranscript.created_at.desc(), LlmTranscript.id.desc())
             .limit(1000))).all()
+        # 每轮所在 run 的档位覆盖（输入框选模型 / 运行中切换）：那一轮实际发送用的窗口
+        # 来自它，占用百分比必须按同一窗口算，否则「顶栏 21%，却在按 128k 预算压缩」。
+        run_opts: dict[str, dict] = {}
+        run_ids = {str(r[10]) for r in rows if r[10]}
+        if run_ids:
+            for rid, opts in (await s.execute(
+                select(Run.id, Run.options_json).where(
+                    Run.id.in_([_u(x) for x in run_ids])))).all():
+                run_opts[str(rid)] = opts or {}
+        override_keys = {str((o or {}).get("model_profile_key") or "").strip()
+                         for o in run_opts.values()}
+        override_keys.discard("")
         call_ids = [r[1] for r in rows if r[1]]
         real_by_call: dict[str, int] = {}
         if call_ids:
@@ -691,11 +809,20 @@ async def session_context_stats(
         agents_cfg = (await s.execute(
             select(Agent).where(Agent.team_id == sess.team_id))).scalars().all()
         pkeys = {a.model_profile_key for a in agents_cfg if a.model_profile_key}
+        pkeys |= override_keys
         profiles = {}
         if pkeys:
             profiles = {p.key: p for p in (await s.execute(
                 select(ModelProfile).where(ModelProfile.team_id == sess.team_id,
                                            ModelProfile.key.in_(pkeys)))).scalars().all()}
+        # 与 /usage 同源：供应商模型目录按模型名补齐档位缺省的窗口/视觉。
+        providers_by_id: dict[str, LlmProvider] = {}
+        if pkeys:
+            pids = {str(p.provider_id) for p in profiles.values() if p.provider_id}
+            if pids:
+                providers_by_id = {str(pv.id): pv for pv in (await s.execute(
+                    select(LlmProvider).where(LlmProvider.id.in_(
+                        [_u(x) for x in pids])))).scalars().all()}
 
     # 摘要调用是「隐形开销」：它不写 llm_calls（runtime 只给自己的往返记账），
     # 但确实烧了端点的 token。这里单独统计，否则用户会看到总量对不上。
@@ -712,13 +839,20 @@ async def session_context_stats(
 
     cfg_by_key = {a.key: a for a in agents_cfg}
 
-    def occupancy(agent_key: str | None, used: int) -> dict:
-        """把「这一轮发出去多少 token」换成「窗口占用百分之几、该不该压缩」。"""
+    def occupancy(agent_key: str | None, used: int, run_id: str | None = None) -> dict:
+        """把「这一轮发出去多少 token」换成「窗口占用百分之几、该不该压缩」。
+
+        窗口按「这一轮所在 run 实际用的档位」取（run.options_json.model_profile_key
+        覆盖角色绑定），与运行时压缩用的是同一个值。
+        """
         cfg = cfg_by_key.get(agent_key or "")
-        prof = profiles.get(cfg.model_profile_key) if cfg and cfg.model_profile_key else None
-        window, configured = resolve_window((prof.params_json or {}) if prof else {})
+        used_key = str((run_opts.get(str(run_id or "")) or {}).get("model_profile_key")
+                       or "").strip() or (cfg.model_profile_key if cfg else None)
+        prof = profiles.get(used_key) if used_key else None
+        window, configured = resolve_window(_profile_params(prof, providers_by_id))
         budget = budget_for(window)
         return {
+            "profile_key": used_key,
             "context_window": window,
             "window_configured": configured,
             "budget_tokens": budget,
@@ -733,7 +867,7 @@ async def session_context_stats(
     trend: list[dict] = []
     compress_rounds = 0
     for (tid, cid, agent_key, model, round_no, compressed, dropped,
-         req_b, stats, created) in rows:
+         req_b, stats, created, rid) in rows:
         st = stats or {}
         for name, v in (st.get("categories") or {}).items():
             acc = cat_total.setdefault(name, {"tokens": 0, "rounds": 0})
@@ -765,7 +899,7 @@ async def session_context_stats(
             "images": int(st.get("images") or 0),
             "tool_calls": st.get("tool_calls") or {},
             "compressed": bool(compressed), "dropped_msgs": int(dropped or 0),
-            **occupancy(agent_key, used),
+            **occupancy(agent_key, used, str(rid) if rid else None),
         }
 
     by_agent = sorted(latest_by_agent.values(), key=lambda x: -x["used_pct"])
@@ -859,7 +993,7 @@ async def session_runs(session_id: str, limit: int = Query(30, ge=1, le=200),
         act: dict[str, dict] = {}
         who: dict[str, list[str]] = {}
         if ids:
-            # 注意：不能用 MySQL 专属的 json_unquote（SQLite/lite/打包版直接 500）。
+            # 注意：不能用 MySQL 专属的 json_unquote（SQLite 直接 500）。
             # 取 json_extract 原始值，统一在 Python 侧剥掉 JSON 字符串的引号。
             tool = func.json_extract(Event.payload_json, "$.tool")
             agent = func.coalesce(
@@ -883,6 +1017,13 @@ async def session_runs(session_id: str, limit: int = Query(30, ge=1, le=200),
                 if not a or a == "user":
                     continue
                 who.setdefault(str(rid), []).append(str(a))
+            # 派出的只读子agent 数（Task.kind='sub' 的任务数）：收起态的摘要头加一句
+            # 「派了 N 个子agent 并行核对」——这是这轮有没有用并行调研的事实，不是猜的。
+            for rid, n in (await s.execute(
+                select(Task.run_id, func.count()).select_from(Task)
+                .where(Task.run_id.in_(ids), Task.kind == "sub")
+                .group_by(Task.run_id))).all():
+                act.setdefault(str(rid), _empty_activity())["subagents"] = int(n or 0)
         return [{
             "id": str(r.id), "session_id": str(r.session_id) if r.session_id else None,
             "status": r.status, "run_type": r.run_type,
@@ -914,8 +1055,8 @@ async def list_messages(session_id: str,
         sess = await _authorized_session(s, session_id, ctx)
         sel = select(Message).where(Message.session_id == sess.id)
         if before:
-            # 归一成「naive UTC」再比较：MySQL DATETIME 不存时区，若把带 +00:00 的字符串
-            # 直接丢给 created_at < '...' ，MySQL 的字符串→datetime 隐式转换会失败并退化成
+            # 归一成「naive UTC」再比较：库里 DATETIME 不存时区，若把带 +00:00 的字符串
+            # 直接丢给 created_at < '...'，字符串→datetime 的隐式转换不可靠，可能退化成
             # 不受限比较（第二页=第一页、has_more 永远为真）。这里解析成 UTC 后去掉 tzinfo。
             dt = None
             try:

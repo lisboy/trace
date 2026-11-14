@@ -89,7 +89,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "content": {**_STR, "description": "要写入的文件正文"},
             "mode": {**_STR, "description": "write=整体写入/覆盖（默认）；append=追加到文件末尾（分块续写大文档时用）"}},
         "required": ["path", "content"]}},
-    "edit_file": {"description": "精确替换文件中的一段文本（old_string 必须唯一命中）", "parameters": {
+    "edit_file": {"description": "精确替换文件中的一段文本（old_string 必须唯一命中）。"
+                                    "old_string 从 read_file/grep 结果里照抄真实原文，不要凭印象重写；"
+                                    "长段落只取要改的行 ±2 行，改多少贴多少。"
+                                    "只差空白（缩进/行尾空格/全角空格）时会自动对齐；"
+                                    "未命中会回传文件里最接近的段落，照它重试即可", "parameters": {
         "type": "object", "properties": {"path": _STR, "old_string": _STR, "new_string": _STR},
         "required": ["path", "old_string", "new_string"]}},
     "delete_file": {"description": "删除工作区内的一个文件（删文件就用本工具，不要用 run_command 想办法删；"
@@ -136,10 +140,12 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                                     "找文件用 glob、找内容用 grep", "parameters": {
         "type": "object", "properties": {"command": _STR}, "required": ["command"]}},
     "start_service": {"description": (
-        "后台启动服务（不阻塞，自动等端口就绪）。用于「改完代码起服务自测」："
-        "返回 pid、url、日志路径。默认策略与 run_command 一致（只拦危险动作），"
-        "带空格的引号路径也能直接起；起停命令优先看 .trace/allow_commands.txt。"
-        "起来后用 screenshot_page 截图验收，验收完 stop_service 收掉。"), "parameters": {
+        "后台启动服务（不阻塞，自动等端口就绪），返回 pid、url、日志路径。"
+        "⚠️ 起服务验收是**重手段，默认不要主动用**：改完跑编译/构建/单测等静态验证即可汇报；"
+        "只有用户明确要求看效果（起服务看看/截图给我/跑起来），或同一个问题多轮修改仍未解决时，"
+        "才起服务 + screenshot_page 实测。"
+        "默认策略与 run_command 一致（只拦危险动作），带空格的引号路径也能直接起；"
+        "起停命令优先看 .trace/allow_commands.txt。验收完 stop_service 收掉。"), "parameters": {
         "type": "object", "properties": {
             "command": {**_STR, "description": "启动命令，例：python -m uvicorn game_agent.main:app --port 8000"},
             "port": {**_INT, "description": "服务监听端口（给了就等端口可连再返回）"},
@@ -154,7 +160,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object", "properties": {"pid": _INT}}},
     "screenshot_page": {"description": (
         "无头浏览器截取页面截图，截图会作为图片直接进入你的视野——你必须真的看图判断效果对不对。"
-        "典型用法：start_service 起服务 → screenshot_page(url) → 发现不对就改代码重截。"), "parameters": {
+        "⚠️ 和 start_service 一样默认不主动用：静态验证能判断的改动不要截图验收；"
+        "只在用户明确要求看效果、或同一问题多轮修改仍没解决时，才 start_service 起服务 → screenshot_page(url)。"), "parameters": {
         "type": "object", "properties": {
             "url": {**_STR, "description": "要截的地址，例：http://127.0.0.1:8000/runs"},
             "width": {**_INT, "description": "视口宽，默认 1440"},
@@ -294,7 +301,7 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "generate_audio": {"description": (
         "直接生成真实音频（配音/CV/台词/语音/音效/BGM）。"
         "**任何配音生成都必须用本工具，这是唯一允许的配音入口**："
-        "不许自己 start_service 起 IndexTTS2、不许 curl 127.0.0.1:8860、"
+        "不许自己 start_service 起 IndexTTS2、"
         "不许跑 cv_gen.py / gen-cv-indextts.py / cv-presets.py 或自写脚本调语音接口。"
         "例外：只有用户明确说「按之前 python 脚本的方式生成」才可走老管线。"
         "kind=voice|sfx|music（默认 voice）：voice 必填 text（要念的台词）；"
@@ -318,7 +325,11 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "**情绪（IndexTTS2）**：只给音色参考音频时模型会用平静语气，台词一多就"
         "「三句一个调」。想有感情就用：emo_text=情绪描述（如「压抑着怒气的低吼」）；"
         "或 emo_vector=8 维权重（高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静）；"
-        "或 emo_audio=一段带目标情绪的工作区干声路径。三种给其一即可（emo_weight 控强度 0~1）。"), "parameters": {
+        "或 emo_audio=一段带目标情绪的工作区干声路径。三种给其一即可（emo_weight 控强度 0~1）。"
+        "**语速与语言（IndexTTS-2.5）**：speed=语速 0.5~2.0（默认 1.0；>1 更慢更从容，"
+        "<1 更快更急促，用于角色语速差异/强调重点）；lang=语言 zh/en/ja/es/ar"
+        "（默认 auto 由服务端按台词自动判定）。需要读慢一点/快一点时直接传 speed，"
+        "不用在台词里加省略号硬撑停顿。"), "parameters": {
         "type": "object", "properties": {
             "text": {**_STR, "description": "要念的台词（kind=voice 时必填；sfx/music 不需要）"},
             "prompt": {**_STR, "description": "声音描述（kind=sfx/music 时必填，如「清脆的按钮点击声」）"},
@@ -335,12 +346,15 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "emo_vector": {"type": "array", "description": "8 维情感权重，顺序：高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静（每项 0~1，总和≤0.8 效果最好）",
                            "items": {"type": "number"}},
             "emo_audio": {**_STR, "description": "情感参考音频（工作区相对路径，一段带目标情绪的干声）"},
+            "speed": {**_STR, "description": "语速 0.5~2.0（默认 1.0；>1 慢 <1 快，IndexTTS-2.5 生效）"},
+            "lang": {**_STR, "description": "语言 zh/en/ja/es/ar（默认 auto 按台词自动判定，2.5 生效）"},
             "items": {"type": "array", "description": "要合成的音频清单，顺序即合成顺序",
                       "items": {"type": "object", "properties": {
                           "slug": _STR, "text": _STR, "voice": _STR, "kind": _STR,
                           "out": _STR, "design_desc": _STR, "preset_name": _STR,
                           "emo_mode": _STR, "emo_text": _STR, "emo_vector":
                               {"type": "array", "items": {"type": "number"}},
+                          "speed": _STR, "lang": _STR,
                           "note": _STR}}}},
         # 不能把 text 设成 required：sfx/music 只传 prompt 就该放行（voice 缺 text
         # 由 generate_audio/_audio_jobs 在业务层报错）。宿主层会先按 schema 校验，
@@ -348,20 +362,27 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "required": []}},
     "report_to_user": {"description": (
         "向用户汇报最终结果（收尾总结）。**这是收尾动作**：调用后本轮执行即结束，"
-        "所以只在活确实做完、要交付时调用；待办清单还没做完就别调它（会被当成阶段汇报打回继续做）。"
+        "所以只在活确实做完、要交付时调用；待办清单还没做完就别调它"
+        "（会被当成中途进度、在界面上标成「进度」后打回继续做）。"
         "必须写清「原因 / 说明 / 风险点」，不能只罗列改了哪些文件。"
         "建议按六段写：①目标（为什么做）②改动（文件→做了什么、为什么这样改）"
         "③原因与说明（根因/方案取舍/假设前提）④风险点与影响（副作用、边界、未覆盖场景，必写）"
         "⑤验证证据（编译/单测/截图结论；哪些没验证要如实说）⑥回滚与后续（出问题怎么退、还没做完的项）。"
-        "最后一句结论说清能不能用、还要用户做什么。"), "parameters": {
+        "最后一句结论说清能不能用、还要用户做什么。"
+        "另外：活跑得久、想中途让用户知道到哪一步了，也可以调本工具发一两句口语化的进度"
+        "（不必套上面六段格式、也不用凑齐各段），界面会把它标成「进度」；说不说、说几次自己判断，"
+        "没有新进展就别硬发。真正的交付结论是全部做完后的最后一次汇报。"), "parameters": {
         "type": "object", "properties": {"report": _STR}, "required": ["report"]}},
     "spawn_agents": {"description": (
         "并行派发只读子agent 调研/核对，汇总结论返回。"
         "适用：互不依赖的多条查询/核对（并行查 N 个文件的同一类点、并行查多个资料源、"
-        "并行核对多份文档），一次性发出去、并行跑完再汇总，比主agent 一条条串行查快。"
+        "并行核对多份文档），一次性发出去、并行跑完再汇总，比主agent 一条条串行查快；"
+        "「多个问题同时处理」正是本工具的用途——只要这些子任务都是只读调研，就该并行派。"
         "子agent 只读（read/grep/glob/web/memory/view），不写文件不跑命令；"
         "items 每项 {name(子任务名), question(要核对的具体问题), note(可选)}，"
-        "一次最多 6 项。真正要改代码/生成素材/跑命令的事不要派给子agent——它们只能查和回答。"),
+        "一次最多 6 项、至少 2 项（2 条以上互不依赖的核对值得并行派；只有 1 条自己读更快）。"
+        "真正要改代码/生成素材/跑命令的事不要派给子agent——它们只能查和回答，"
+        "改代码必须主agent 自己做（拿到子agent 的核对结论后自己 edit_file 落地）。"),
         "parameters": {
             "type": "object", "properties": {
                 "items": {"type": "array", "description": "子任务清单，每项一个独立问题",
@@ -389,7 +410,8 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "ask_user": {"description": (
         "遇到你无法自行决定的事（业务口径不确定、两种方案各有取舍、缺关键信息、"
         "会影响用户预期/钱/数据的决策）时，向用户提问并等待回答——**不要自己拍板**。"
-        "调用后立即暂停等用户回答（run 落「等待回答」），用户在前端点选项或输入答案后会自动继续。"
+        "调用后本次执行会在原地暂停等用户回答（同一个任务继续，不结束本轮、不丢待办清单），"
+        "用户在前端点选项或输入答案后你就能拿到答案接着往下做。"
         "问题要具体、可回答；选项之间要互斥且各自讲清后果。能自己查证/按既有约定处理的，不要问。"),
         "parameters": {
             "type": "object", "properties": {
@@ -415,13 +437,15 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
                            "不传用档位默认；out 可指定工作区相对输出路径"
                            "（如 web/audio/cv/ur-yx-01/enter.mp3，会自动转 24k 单声道 mp3）；"
                            "情绪可用 emo_text / emo_vector / emo_audio 三种之一；"
+                           "speed=语速 0.5~2.0（>1 慢 <1 快，2.5 生效）；lang=zh/en/ja/es/ar（默认 auto）；"
                            "无供应商走占位静音", "parameters": {
         "type": "object", "properties": {"text": _STR, "voice": _STR, "slug": _STR,
                                          "out": {**_STR, "description": "工作区相对输出路径（可选）"},
                                          "emo_mode": _STR, "emo_text": _STR,
                                          "emo_weight": _STR,
                                          "emo_vector": {"type": "array", "items": {"type": "number"}},
-                                         "emo_audio": _STR}}},
+                                         "emo_audio": _STR,
+                                         "speed": _STR, "lang": _STR}}},
     "generate_sfx": {"description": "生成音效（内置合成器出真实可听波形，provider=synth；prompt 写声音描述）",
                      "parameters": {"type": "object", "properties": {
                          "slug": _STR, "prompt": _STR, "out": _STR, "placeholder": _BOOL}}},

@@ -1,31 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { useAuth } from "../store";
-import { navigate } from "../router";
 import Avatar from "./Avatar";
 
-/** 个人资料设置：名称、头像、账号密码都可以在这里自己改。
- *  保存后同步更新全局 auth store（顶栏/头像即时生效），无需重新登录。 */
+/** 本机资料设置：只是「界面怎么称呼我」——名称与头像。
+ *  这个版本没有账号/密码/登录，所以这里没有改密码、没有退出登录。
+ *  保存后同步更新全局身份缓存（顶栏/头像即时生效）。 */
 export default function ProfileTab() {
   const user = useAuth((s) => s.user);
-  const teams = useAuth((s) => s.teams);
-  const currentTeamId = useAuth((s) => s.currentTeamId);
   const setUser = useAuth((s) => s.setUser);
-  const logout = useAuth((s) => s.logout);
-  const role = teams.find((t) => t.id === currentTeamId)?.role;
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [name, setName] = useState(user?.display_name || "");
   const [avatar, setAvatar] = useState<string | null>(user?.avatar || null);
-  const [oldPwd, setOldPwd] = useState("");
-  const [newPwd, setNewPwd] = useState("");
-  const [confirmPwd, setConfirmPwd] = useState("");
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
-  const [pwdBusy, setPwdBusy] = useState(false);
-  const [pwdMsg, setPwdMsg] = useState("");
-  const [pwdErr, setPwdErr] = useState("");
 
   useEffect(() => {
     setName(user?.display_name || "");
@@ -44,7 +34,7 @@ export default function ProfileTab() {
     try {
       const r = await api.updateMe({ display_name: trimmed, avatar });
       setUser(r.user);
-      setMsg("个人资料已保存");
+      setMsg("已保存");
     } catch (e: any) {
       setErr(e?.message || "保存失败");
     } finally {
@@ -88,31 +78,6 @@ export default function ProfileTab() {
       setMsg("已恢复默认头像");
     } catch (e: any) {
       setErr(e?.message || "操作失败");
-    }
-  }
-
-  async function changePwd() {
-    setPwdMsg("");
-    setPwdErr("");
-    if (newPwd.length < 8) {
-      setPwdErr("新密码至少 8 位");
-      return;
-    }
-    if (newPwd !== confirmPwd) {
-      setPwdErr("两次输入的新密码不一致");
-      return;
-    }
-    setPwdBusy(true);
-    try {
-      await api.changePassword(oldPwd, newPwd);
-      setOldPwd("");
-      setNewPwd("");
-      setConfirmPwd("");
-      setPwdMsg("密码已修改，下次登录请使用新密码");
-    } catch (e: any) {
-      setPwdErr(e?.message || "修改密码失败");
-    } finally {
-      setPwdBusy(false);
     }
   }
 
@@ -171,17 +136,6 @@ export default function ProfileTab() {
             onChange={(e) => setName(e.target.value)}
             placeholder="你的显示名称"
           />
-          <label className="text-slate-500 text-xs">邮箱</label>
-          <input
-            className="border rounded px-2 py-1.5 max-w-sm bg-slate-50 text-slate-400"
-            value={user?.email || ""}
-            readOnly
-            title="邮箱由账号体系管理，暂不支持自行修改"
-          />
-          <label className="text-slate-500 text-xs">账号</label>
-          <div className="text-xs text-slate-500">
-            角色：{role || "成员"} · 账号 ID：<span className="mono">{user?.id || "-"}</span>
-          </div>
         </div>
 
         <div className="mt-3 flex items-center gap-2">
@@ -194,61 +148,11 @@ export default function ProfileTab() {
       </div>
 
       <div className="bg-white rounded border border-slate-200 p-4">
-        <div className="text-sm font-medium mb-1">修改密码</div>
-        <div className="text-[11px] text-slate-400 mb-3">修改后本账号的登录密码立即生效。</div>
-        <div className="grid grid-cols-[88px_1fr] gap-2 items-center text-sm">
-          <label className="text-slate-500 text-xs">当前密码</label>
-          <input
-            type="password"
-            className="border rounded px-2 py-1.5 max-w-sm"
-            value={oldPwd}
-            autoComplete="current-password"
-            onChange={(e) => setOldPwd(e.target.value)}
-          />
-          <label className="text-slate-500 text-xs">新密码</label>
-          <input
-            type="password"
-            className="border rounded px-2 py-1.5 max-w-sm"
-            value={newPwd}
-            autoComplete="new-password"
-            onChange={(e) => setNewPwd(e.target.value)}
-            placeholder="至少 8 位"
-          />
-          <label className="text-slate-500 text-xs">确认新密码</label>
-          <input
-            type="password"
-            className="border rounded px-2 py-1.5 max-w-sm"
-            value={confirmPwd}
-            autoComplete="new-password"
-            onChange={(e) => setConfirmPwd(e.target.value)}
-          />
+        <div className="text-sm font-medium mb-1">无需登录</div>
+        <div className="text-[11px] text-slate-400 leading-relaxed">
+          本版本没有账号、密码，也没有登录/登出：打开页面即可使用，数据全部保存在本机数据目录里
+          （可在「设置 / 存储空间」查看并迁移到别的磁盘）。
         </div>
-        <div className="mt-3 flex items-center gap-2">
-          <button className="ga-btn ga-btn-primary" disabled={pwdBusy} onClick={changePwd}>
-            {pwdBusy ? "提交中…" : "修改密码"}
-          </button>
-          {pwdMsg && <span className="text-xs text-green-700">{pwdMsg}</span>}
-          {pwdErr && <span className="text-xs text-red-600">{pwdErr}</span>}
-        </div>
-      </div>
-
-      <div className="bg-white rounded border border-slate-200 p-4">
-        <div className="text-sm font-medium mb-1">登录状态</div>
-        <div className="text-[11px] text-slate-400 mb-3">退出后需要重新输入邮箱和密码登录。</div>
-        <button
-          className="text-xs px-2.5 py-1.5 rounded border border-red-200 text-red-600 hover:bg-red-50"
-          onClick={async () => {
-            try {
-              await api.logout();
-            } catch {
-              /* ignore */
-            }
-            logout();
-            navigate("chat");
-          }}
-        >
-          退出登录
-        </button>
       </div>
     </div>
   );

@@ -133,7 +133,7 @@ function DiffReview({ runId, focusFile, onFocused }: {
                         {cs.map((c) => (
                           <div key={c.id} className={`ml-12 mr-3 my-1 px-2 py-1 rounded text-xs ${c.resolved ? "bg-slate-50 text-slate-400" : "bg-amber-50 text-amber-900"}`}>
                             <div className="flex items-center gap-2">
-                              <span className="font-medium">{user?.id === c.author_id ? "我" : "成员"}</span>
+                              <span className="font-medium">{user?.id === c.author_id ? "我" : "用户"}</span>
                               {!c.resolved && user && (
                                 <button className="ml-auto text-[10px] text-slate-400 hover:text-green-600"
                                   onClick={async () => { await api.resolveComment(c.id); refresh(); }}>

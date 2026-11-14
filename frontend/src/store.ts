@@ -1,18 +1,19 @@
 import { create } from "zustand";
 import type { Team, User } from "./types";
 
-const KEY = "ga_auth";
+const KEY = "ga_profile";
 
+/**
+ * 本机身份（没有登录）：只是「界面怎么称呼我」+ 当前工作区的缓存。
+ * 没有 token / 会话 / 登出——服务就是本机这一个用户，刷新页面也不需要重新认证。
+ */
 interface AuthState {
-  token: string | null;
   user: User | null;
   teams: Team[];
   currentTeamId: string | null;
-  setAuth: (token: string, user: User, teams: Team[]) => void;
+  setIdentity: (user: User, teams: Team[]) => void;
   setUser: (user: User) => void;
   setTeams: (teams: Team[]) => void;
-  setTeam: (id: string) => void;
-  logout: () => void;
 }
 
 function load(): Partial<AuthState> {
@@ -26,34 +27,28 @@ function load(): Partial<AuthState> {
 }
 
 function persist(s: AuthState) {
-  localStorage.setItem(
-    KEY,
-    JSON.stringify({
-      token: s.token,
-      user: s.user,
-      teams: s.teams,
-      currentTeamId: s.currentTeamId,
-    })
-  );
+  try {
+    localStorage.setItem(
+      KEY,
+      JSON.stringify({ user: s.user, teams: s.teams, currentTeamId: s.currentTeamId })
+    );
+  } catch {
+    /* 隐私模式/配额满：只是少了首屏缓存，不影响使用 */
+  }
 }
 
 const initial = load();
-// 历史数据可能存了空串，统一归一化为「未选择」再回退到第一个团队
+// 历史数据可能存了空串，统一归为「未选择」再回退到第一个工作区
+// （个人版：一台机器一个工作区，teams 里只会有 ≥1 条；字段名沿用 team 是为了不动后端的分片 id）
 const initialTeamId = initial.currentTeamId || initial.teams?.[0]?.id || null;
 
 export const useAuth = create<AuthState>((set, get) => ({
-  token: initial.token ?? null,
   user: initial.user ?? null,
   teams: initial.teams ?? [],
   currentTeamId: initialTeamId,
 
-  setAuth: (token, user, teams) => {
-    const next = {
-      token,
-      user,
-      teams,
-      currentTeamId: teams[0]?.id ?? null,
-    };
+  setIdentity: (user, teams) => {
+    const next = { user, teams, currentTeamId: teams[0]?.id ?? null };
     persist({ ...get(), ...next });
     set(next);
   },
@@ -73,19 +68,4 @@ export const useAuth = create<AuthState>((set, get) => ({
     persist(next);
     set(next);
   },
-  setTeam: (id) => {
-    const cur = get();
-    const next = { ...cur, currentTeamId: id || cur.teams[0]?.id || null };
-    persist(next);
-    set(next);
-  },
-  logout: () => {
-    localStorage.removeItem(KEY);
-    set({ token: null, user: null, teams: [], currentTeamId: null });
-  },
 }));
-
-export function currentRole(): string | null {
-  const { teams, currentTeamId } = useAuth.getState();
-  return teams.find((t) => t.id === currentTeamId)?.role ?? null;
-}

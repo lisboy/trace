@@ -33,6 +33,8 @@ from game_agent.llm.context_window import (
 from game_agent.llm.openai_compat import (
     NO_VISION_NOTE, _RetryableLLMError, _classify_http_error,
     _new_llm_client, _proxy_env_disabled, _system_proxy, _ProxyRefused,
+    _ContentPartsUnsupported, _WafBlocked, _is_waf_response, PARTS_OFF_NOTE,
+    mark_session_direct, session_is_direct,
 )
 from game_agent.llm.text_tool_calls import parse_text_calls
 from game_agent.llm.transcript import build_record
@@ -101,8 +103,15 @@ class AnthropicMessagesLLM(LLM):
         self.max_tokens = max_tokens or DEFAULT_MAX_TOKENS
         self.tool_names: set[str] = set()
         self.media_budget = MEDIA_BYTES_BUDGET
+        # 端点是否接受图片块：某些「anthropic 协议」中转站背后其实是 OpenAI/SGLang 内核，
+        # 图片块会被翻成 content 数组、被内核以「content 必须是字符串」400 拒绝。命中后
+        # 本轮 run 内降级为「图片用文字说明代替」，避免每轮都撞一次。
+        self._allow_images = True
         # 当前 httpx 客户端是否正在走代理（连接层失败时据此决定「换直连」还是「普通重试」）
         self._using_proxy = False
+        # 本会话 id（runtime 注入）与「本会话已改用直连」标记：见 openai_compat.mark_session_direct
+        self.session_key = ""
+        self._direct_only = False
 
     # ---------- 请求体翻译 ----------
     def _content_blocks(self, content: Any) -> list[dict]:
@@ -114,12 +123,13 @@ class AnthropicMessagesLLM(LLM):
                     blocks.append({"type": "text", "text": str(p)})
                 elif p.get("type") == "image_url":
                     url = str((p.get("image_url") or {}).get("url") or "")
-                    if self.vision:
+                    if self.vision and self._allow_images:
                         img = _data_url_to_image_part(url)
                         if img is not None:
                             blocks.append(img)
                     else:
-                        blocks.append({"type": "text", "text": NO_VISION_NOTE})
+                        blocks.append({"type": "text",
+                                       "text": PARTS_OFF_NOTE if self.vision else NO_VISION_NOTE})
                 else:
                     blocks.append({"type": "text", "text": str(p.get("text", ""))})
             return blocks
@@ -220,8 +230,12 @@ class AnthropicMessagesLLM(LLM):
         # timeout_s / max_attempts：按用途收紧预算（摘要压缩用更短超时、更少重试）。
         # Anthropic 适配层目前只在 _request 里用全局上限；这里接住参数保证签名一致。
         report: dict[str, Any] = {}
-        messages = await compress_messages(messages, self.context_window,
-                                           summarizer, report, tools=tools)
+        compressed = await compress_messages(messages, self.context_window,
+                                             summarizer, report, tools=tools)
+        # 压缩/媒体裁剪结果原地写回调用方的历史（与 openai_compat 同口径）
+        messages[:] = compressed
+        if report.get("compressed"):
+            self._notify_compressed(ctx, report, "pre_send")
         messages, media_dropped = fit_media(messages, max_bytes=self.media_budget)
         if media_dropped:
             report["media_dropped"] = int(report.get("media_dropped") or 0) + media_dropped
@@ -237,13 +251,29 @@ class AnthropicMessagesLLM(LLM):
         try:
             resp = await self._request(body, headers, on_delta, t0, on_retry=retry_hook,
                                        timeout_s=timeout_s, max_attempts=max_attempts)
+        except _ContentPartsUnsupported as e:
+            # 「anthropic 协议」中转站背后是 OpenAI/SGLang 内核时，图片块会被翻成
+            # content 数组、被内核 400 拒绝（content 必须是字符串）。这不是请求内容错，
+            # 是格式不兼容：把图片降级成文字说明、按纯文本重建后重发一次即可（与
+            # openai_compat 的 parts 降级同口径），不能让它把整个 run 直接打崩。
+            if not self._allow_images:
+                raise
+            self._allow_images = False
+            log.warning("端点拒绝图片块（content 必须是字符串），降级为纯文本后重试: %s", e)
+            body = self._to_anthropic(messages, tools)
+            t0 = time.monotonic()
+            resp = await self._request(body, headers, on_delta, t0, on_retry=retry_hook,
+                                       timeout_s=timeout_s, max_attempts=max_attempts)
         except LlmContextOverflow as e:
             log.warning("端点报上下文超限，按半预算重压后重试: %s", e)
-            retry_report: dict[str, Any] = {}
-            messages = await compress_messages(
+            retry_report: dict[str, Any] = {"source": "endpoint_overflow",
+                                            "overflow_error": str(e)[:300]}
+            compressed = await compress_messages(
                 messages, self.context_window, summarizer, retry_report,
                 tools=tools, budget_ratio=BUDGET_RATIO * 0.5)
+            messages[:] = compressed
             report.update({k: v for k, v in retry_report.items() if k != "est_before"})
+            self._notify_compressed(ctx, retry_report, "endpoint_overflow")
             body = self._to_anthropic(messages, tools)
             t0 = time.monotonic()
             resp = await self._request(body, headers, on_delta, t0, on_retry=retry_hook,
@@ -265,6 +295,16 @@ class AnthropicMessagesLLM(LLM):
         resp.trace_id = uuid.uuid4().hex
         await self._report(ctx, body.get("messages") or [], body.get("tools") or [], resp, report)
         return resp
+
+    def _notify_compressed(self, ctx: Ctx, report: dict, source: str) -> None:
+        """适配层压缩了历史时通知 runtime（与 openai_compat 同口径，失败不影响主流程）。"""
+        hook = getattr(ctx, "on_llm_compressed", None)
+        if hook is None:
+            return
+        try:
+            hook(dict(report, source=source), source)
+        except Exception:  # noqa: BLE001
+            log.exception("on_llm_compressed hook failed")
 
     async def _report(self, ctx: Ctx, sent_msgs: list[dict], oa_tools: list[dict],
                       resp: LLMResponse, report: dict) -> None:
@@ -301,6 +341,9 @@ class AnthropicMessagesLLM(LLM):
             raise self._net_error(e) from e
         if resp.status_code == 200:
             return resp
+        if _is_waf_response(resp.status_code, resp.headers, resp.text):
+            raise _WafBlocked(f"被 Cloudflare 人机验证拦下（HTTP {resp.status_code}，"
+                              f"不是 Key 问题）；入口={self.base_url}")
         raise _classify_http_error(resp.status_code, resp.text,
                                    resp.headers.get("retry-after"))
 
@@ -322,7 +365,15 @@ class AnthropicMessagesLLM(LLM):
         last_err = ""
         # 代理自动模式：系统配了代理就先走代理，没配就直连；走代理连接失败当次立刻改直连。
         # 详见 openai_compat._request 的同名注释。
-        proxy = None if _proxy_env_disabled() else await asyncio.to_thread(_system_proxy)
+        proxy: str | None = None
+        if self._direct_only or session_is_direct(self.session_key):
+            # 会话级记忆：这条会话早前已从代理降级成直连（代理不通 / 被 Cloudflare 拦下），
+            # 后面所有往返一律直连，不再每条请求先白撞一次代理。
+            if not self._direct_only:
+                self._direct_only = True
+                log.info("本会话已改用直连：后续 LLM 请求不再尝试代理（%s）", self.base_url)
+        elif not _proxy_env_disabled():
+            proxy = await asyncio.to_thread(_system_proxy)
         self._using_proxy = bool(proxy)
         async with _new_llm_client(proxy, self.user_agent) as client:
             downgraded = False
@@ -336,9 +387,12 @@ class AnthropicMessagesLLM(LLM):
                             return await asyncio.wait_for(
                                 self._chat_stream(client, body, headers, on_delta, t0),
                                 timeout=call_timeout)
-                        except (LlmAuthError, LlmContextOverflow, LlmPayloadTooLarge):
+                        except (LlmAuthError, LlmContextOverflow, LlmPayloadTooLarge,
+                                _ContentPartsUnsupported):
                             raise
                         except _ProxyRefused:
+                            raise
+                        except _WafBlocked:
                             raise
                         except asyncio.TimeoutError:
                             raise
@@ -369,6 +423,32 @@ class AnthropicMessagesLLM(LLM):
                             pass
                         client = _new_llm_client(None, self.user_agent)
                         self._using_proxy = False
+                        # 本会话从此只走直连：后面的往返连「先撞一次代理」都省掉
+                        self._direct_only = True
+                        mark_session_direct(self.session_key)
+                        if on_retry:
+                            try:
+                                on_retry(attempt, max_attempts, 0.0, last_err)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        continue
+                    last_err = str(e)
+                except _WafBlocked as e:
+                    # 走代理被人机验证拦截：代理出口 IP 是根源，换直连通常就 200（不消费重试次数）
+                    if proxy and not downgraded:
+                        downgraded = True
+                        attempt -= 1
+                        last_err = f"经代理被 Cloudflare 人机验证拦截（{proxy}），已自动改直连重试"
+                        log.warning("经代理被 WAF 拦截，自动降级直连: %s", e)
+                        try:
+                            await client.aclose()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        client = _new_llm_client(None, self.user_agent)
+                        self._using_proxy = False
+                        # 被 Cloudflare 拦不是偶发抖动：本会话别再拿代理试了
+                        self._direct_only = True
+                        mark_session_direct(self.session_key)
                         if on_retry:
                             try:
                                 on_retry(attempt, max_attempts, 0.0, last_err)
@@ -403,12 +483,19 @@ class AnthropicMessagesLLM(LLM):
         # content block index -> {"type","id","name","json"}
         blocks: dict[int, dict] = {}
         usage: dict = {}
+        ttft_ms = 0  # 首 token 耗时（第一个文本/思考增量到达时刻）
         async with client.stream("POST", _messages_url(self.base_url),
                                  json=stream_body, headers=headers) as resp:
-            if resp.status_code in (401, 403):
-                raw = (await resp.aread())[:200].decode("utf-8", "ignore")
-                raise LlmAuthError(
-                    f"LLM 端点拒绝访问（HTTP {resp.status_code}）：请检查 API Key 与账户额度。{raw}")
+            if resp.status_code in (401, 403, 429, 503):
+                raw = (await resp.aread())[:2000].decode("utf-8", "ignore")
+                if _is_waf_response(resp.status_code, resp.headers, raw):
+                    raise _WafBlocked(f"被 Cloudflare 人机验证拦下（HTTP {resp.status_code}，"
+                                      f"不是 Key 问题）；入口={self.base_url}")
+                if resp.status_code in (401, 403):
+                    raise LlmAuthError(
+                        f"LLM 端点拒绝访问（HTTP {resp.status_code}）：请检查 API Key 与账户额度。{raw[:200]}")
+                raise _classify_http_error(resp.status_code, raw,
+                                           resp.headers.get("retry-after"))
             if resp.status_code != 200:
                 raw = (await resp.aread())[:200].decode("utf-8", "ignore")
                 raise _classify_http_error(resp.status_code, raw,
@@ -437,9 +524,13 @@ class AnthropicMessagesLLM(LLM):
                                        "name": cb.get("name") or "",
                                        "json": ""}
                         if cb.get("type") == "text" and cb.get("text"):
+                            if not ttft_ms:
+                                ttft_ms = max(1, int((time.monotonic() - t0) * 1000))
                             text_parts.append(cb["text"])
                             _safe_delta(on_delta, "", cb["text"])
                         elif cb.get("type") == "thinking" and cb.get("thinking"):
+                            if not ttft_ms:
+                                ttft_ms = max(1, int((time.monotonic() - t0) * 1000))
                             reason_parts.append(cb["thinking"])
                             _safe_delta(on_delta, cb["thinking"], "")
                     elif et == "content_block_delta":
@@ -449,11 +540,15 @@ class AnthropicMessagesLLM(LLM):
                         if dt == "text_delta":
                             t = delta.get("text") or ""
                             if t:
+                                if not ttft_ms:
+                                    ttft_ms = max(1, int((time.monotonic() - t0) * 1000))
                                 text_parts.append(t)
                                 _safe_delta(on_delta, "", t)
                         elif dt == "thinking_delta":
                             t = delta.get("thinking") or ""
                             if t:
+                                if not ttft_ms:
+                                    ttft_ms = max(1, int((time.monotonic() - t0) * 1000))
                                 reason_parts.append(t)
                                 _safe_delta(on_delta, t, "")
                         elif dt == "input_json_delta":
@@ -479,7 +574,8 @@ class AnthropicMessagesLLM(LLM):
         if not tcs and text_out:
             text_out, tcs = parse_text_calls(text_out, self.tool_names)
         return LLMResponse(text=text_out, reasoning="".join(reason_parts),
-                           tool_calls=tcs, usage=_normalize_usage(usage), latency_ms=latency_ms)
+                           tool_calls=tcs, usage=_normalize_usage(usage), latency_ms=latency_ms,
+                           ttft_ms=ttft_ms)
 
 
 def _is_tool_result(block: Any) -> bool:

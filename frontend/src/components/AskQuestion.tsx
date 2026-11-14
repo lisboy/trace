@@ -7,7 +7,8 @@ import type { RunQuestion } from "../types";
  *
  * 两个区块，都放在输入框上方（和待办清单同区）：
  *  1) 待回答面板：问题 + 互斥选项 + 自由输入 + 「跳过 / 提交」；
- *     提交后后端把答案写成 user 消息并重新入队一个 run，组长带着答案继续干。
+ *     提交后后端会**唤醒同一个 run**（它一直原地暂停等你回答），组长带着答案接着做——
+ *     不结束本轮、不起新 run、待办清单和轨迹都保留。
  *  2) 已回答记录（可折叠）：「提问 · 2/2 已回答」，点开能看到每题当时选了哪个方案 —— 留痕可追溯。
  */
 export default function AskQuestion({
@@ -80,9 +81,9 @@ export default function AskQuestion({
             <span className="rounded bg-amber-200 px-1.5 py-0.5 text-[11px] font-medium">
               提问 · 等待回答
             </span>
-            <span className="text-[11px] text-amber-600">组长停在这里等你拍板，回答后自动继续</span>
+            <span className="text-[11px] text-amber-600">组长已在本轮原地暂停，回答后接着做（计划与对话都不会中断）</span>
           </div>
-          <div className="whitespace-pre-wrap text-slate-800">{q.question}</div>
+          <div className="whitespace-pre-wrap [overflow-wrap:anywhere] text-slate-800">{q.question}</div>
           <div className="mt-2 space-y-1">
             {q.options.map((o, i) => (
               <label

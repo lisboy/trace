@@ -1,3 +1,9 @@
+"""附件上传 / 附件消息的回归测试。
+
+这个版本彻底没有登录：请求不带任何凭证（没有 Cookie / Bearer / 角色），服务端永远用
+「本机那一个身份」（``ensure_local_identity``，owner 全权限）。所以这里的数据一律挂到
+**本机身份的 team** 下——另造一个 team 的会话/项目只用于验证 team 维度的隔离（404/403）。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -18,35 +24,29 @@ from sqlalchemy import func, select
 
 from game_agent.api.routers import sessions
 from game_agent.api.state import state
-from game_agent.auth.service import AuthService
+from game_agent.auth.local import ensure_local_identity
 from game_agent.config import PROJECTS_ROOT
 from game_agent.core.context import RequestContext
-from game_agent.db.models import Message, Project, Run, Session, Team, TeamMember, User
+from game_agent.db.models import Message, Project, Run, Session, Team
 
 
 @pytest.fixture
 def api(session_factory, monkeypatch):
-    auth = AuthService(session_factory)
-
     async def seed():
         key = uuid4().hex
         async with session_factory() as db:
-            team = Team(name="Uploads", slug=f"uploads-{key}")
+            # 无凭证身份：拿本机 user/team（请求时 deps 解析出来的就是它），
+            # 项目和会话必须挂在这个 team 下，否则接口一律 403/404。
+            user, team = await ensure_local_identity(db)
             foreign_team = Team(name="Foreign", slug=f"foreign-{key}")
-            users = {role: User(email=f"{role}-{key}@example.com", display_name=role)
-                     for role in ("owner", "developer", "viewer", "outsider")}
-            db.add_all([team, foreign_team, *users.values()])
+            db.add(foreign_team)
             await db.flush()
-            for role, user in users.items():
-                db.add(TeamMember(user_id=user.id,
-                                  team_id=foreign_team.id if role == "outsider" else team.id,
-                                  role="owner" if role == "outsider" else role))
             projects = {}
             for name in ("project", "other", "foreign"):
                 projects[name] = Project(
                     name=name, slug=f"{name}-{key}", repo_path=f"uploads-{name}-{key}",
                     team_id=foreign_team.id if name == "foreign" else team.id,
-                    created_by=users["owner"].id,
+                    created_by=user.id,
                 )
             db.add_all(projects.values())
             await db.flush()
@@ -63,46 +63,47 @@ def api(session_factory, monkeypatch):
             ids = {name: str(p.id) for name, p in projects.items()}
             workspaces = {name: PROJECTS_ROOT / p.repo_path for name, p in projects.items()}
             session_ids = {name: str(s.id) for name, s in existing.items()}
-            user_ids = {role: str(u.id) for role, u in users.items()}
-        headers = {}
-        for role, uid in user_ids.items():
-            token = await auth.create_session(uid, None, None)
-            headers[role] = {"Cookie": f"ga_session={token}"}
-        return ids, workspaces, session_ids, headers
+            # ctx.project_ids 的真实口径：该 team 下的全部项目 id
+            project_ids = [str(x) for x in (await db.scalars(
+                select(Project.id).where(Project.team_id == team.id)))]
+            team_id, user_id = str(team.id), str(user.id)
+        return SimpleNamespace(ids=ids, workspaces=workspaces, session_ids=session_ids,
+                               team_id=team_id, user_id=user_id, project_ids=project_ids)
 
-    ids, workspaces, session_ids, headers = asyncio.run(seed())
-    for workspace in workspaces.values():
+    seeded = asyncio.run(seed())
+    for workspace in seeded.workspaces.values():
         workspace.mkdir(parents=True)
         assert workspace.resolve().is_relative_to(PROJECTS_ROOT.resolve())
     queue = SimpleNamespace(enqueue=AsyncMock())
     monkeypatch.setattr(state, "session_factory", session_factory)
-    monkeypatch.setattr(state, "auth", auth)
     monkeypatch.setattr(state, "services", SimpleNamespace(queue=queue))
     app = FastAPI()
     app.include_router(sessions.router)
-    return SimpleNamespace(app=app, ids=ids, ws=workspaces["project"], workspaces=workspaces,
-                           session_ids=session_ids, headers=headers, queue=queue,
+    return SimpleNamespace(app=app, ids=seeded.ids, ws=seeded.workspaces["project"],
+                           workspaces=seeded.workspaces, session_ids=seeded.session_ids,
+                           team_id=seeded.team_id, user_id=seeded.user_id,
+                           project_ids=seeded.project_ids, queue=queue,
                            session_factory=session_factory)
 
 
-def request(api, method, path, *, role="owner", **kwargs):
+def request(api, method, path, **kwargs):
+    """本机单用户版：不带任何认证头（只有 Idempotency-Key 这类业务头会传进来）。"""
+
     async def send():
-        headers = dict(api.headers.get(role, {}))
-        headers.update(kwargs.pop("headers", {}))
         transport = httpx.ASGITransport(app=api.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            return await client.request(method, path, headers=headers, **kwargs)
+            return await client.request(method, path, **kwargs)
 
     return asyncio.run(send())
 
 
-def upload(api, data=b"attachment", name="data.txt", *, role="owner", project="project"):
-    return request(api, "POST", f"/api/projects/{api.ids[project]}/uploads", role=role,
+def upload(api, data=b"attachment", name="data.txt", *, project="project"):
+    return request(api, "POST", f"/api/projects/{api.ids[project]}/uploads",
                    files={"file": (name, data, "application/octet-stream")})
 
 
-def chat(api, *, role="owner", project="project", headers=None, **body):
-    return request(api, "POST", f"/api/projects/{api.ids[project]}/chat", role=role,
+def chat(api, *, project="project", headers=None, **body):
+    return request(api, "POST", f"/api/projects/{api.ids[project]}/chat",
                    headers=headers or {}, json={"content": "", **body})
 
 
@@ -184,7 +185,7 @@ def test_long_chinese_name_fits_filesystem_and_display_limits(api):
 
 
 @pytest.mark.parametrize("case,status", [("success", None), ("empty", 400),
-                                       ("oversized", 413), ("foreign", 404),
+                                       ("oversized", 413), ("foreign", 403),
                                        ("git_failure", 500)])
 def test_upload_stream_lifecycle_and_authorization_order(api, case, status):
     threads = []
@@ -204,10 +205,9 @@ def test_upload_stream_lifecycle_and_authorization_order(api, case, status):
     main_thread = threading.get_ident()
 
     async def invoke():
-        async with api.session_factory() as db:
-            project = await db.get(Project, UUID(api.ids["project"]))
-            ctx = RequestContext(user_id=str(project.created_by), team_id=str(project.team_id),
-                                 role="owner", project_ids=list(api.ids.values()))
+        # 与 get_current_context 产出的 ctx 同形（本机 owner；project_ids = 本机 team 的项目）
+        ctx = RequestContext(user_id=api.user_id, team_id=api.team_id, role="owner",
+                             project_ids=api.project_ids)
         pid = api.ids["foreign"] if case == "foreign" else api.ids["project"]
         file = UploadFile(file=stream, filename="data.txt")
         if status is None:
@@ -221,6 +221,7 @@ def test_upload_stream_lifecycle_and_authorization_order(api, case, status):
     asyncio.run(invoke())
     assert stream.closed
     if case == "foreign":
+        # 越权判断在读取字节流之前就拦下：一个字节都没读，别的工作区也没被写过
         assert not threads
         assert not (api.workspaces["foreign"] / ".trace").exists()
     else:
@@ -255,10 +256,11 @@ def test_chat_metadata_roundtrip_uses_server_facts(api):
             assert message.meta_json == messages[0]["meta"]
 
     asyncio.run(verify_db())
-    assert request(api, "GET", f"/api/sessions/{run['session_id']}/messages",
-                   role="outsider").status_code == 404
-    assert request(api, "GET", f"/api/sessions/{run['session_id']}/messages",
-                   role="viewer").status_code == 200
+    # 没有角色概念了，但「会话属于当前 team/project」这条隔离仍在：别的团队的会话 404
+    assert request(api, "GET",
+                   f"/api/sessions/{api.session_ids['other_team']}/messages").status_code == 404
+    assert request(api, "GET",
+                   f"/api/sessions/{api.session_ids['wrong_team']}/messages").status_code == 404
 
 
 def test_attachment_only_new_session_and_idempotency(api):
@@ -399,27 +401,17 @@ def test_chat_rejects_hardlink_to_foreign_file(api):
     assert response.status_code == 400, response.text
 
 
-@pytest.mark.parametrize("role,status", [("anonymous", 401), ("viewer", 403),
-                                       ("outsider", 403)])
-def test_permissions_precede_file_validation_and_writes(api, role, status):
-    before = counts(api)
-    assert upload(api, data=b"", role=role).status_code == status
-    response = chat(api, role=role, files=[{"path": "../secret"}])
-    assert response.status_code == status, response.text
-    assert not (api.ws / ".trace").exists()
-    assert counts(api) == before
-    api.queue.enqueue.assert_not_awaited()
-
-
-@pytest.mark.parametrize("role", ["owner", "developer"])
-def test_authorized_team_roles_can_upload_and_chat(api, role):
-    response = upload(api, role=role)
+def test_upload_and_chat_work_without_any_credentials(api):
+    """本机单用户：上传 + 发消息都不需要任何认证头（原来按 owner/developer 角色各跑一遍）。"""
+    response = upload(api)
     assert response.status_code == 200, response.text
-    response = chat(api, role=role, files=[response.json()])
+    response = chat(api, files=[response.json()])
     assert response.status_code == 200, response.text
+    assert response.json()["dup"] is False
 
 
-def test_foreign_project_is_forbidden(api):
+def test_other_team_project_is_invisible(api):
+    """别的团队的项目不在这台机器的 project_ids 里：上传/发消息都进不去，也不留任何文件。"""
     assert upload(api, project="foreign").status_code == 403
     assert chat(api, project="foreign", content="hello").status_code == 403
     assert not (api.workspaces["foreign"] / ".trace").exists()

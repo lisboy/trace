@@ -1,7 +1,6 @@
 """数据库初始化 / 迁移。
 
-lite 模式与快速起步用 ``create_all``（设计 §2.1 允许）；
-server 模式生产建议改用 Alembic（``game_agent/db/alembic`` 预留）。
+用 ``create_all`` 建表（幂等），再串一串轻量幂等迁移把老库补到当前 schema。
 这里统一暴露 ``init_db()`` 供启动时调用。
 """
 from __future__ import annotations
@@ -12,7 +11,7 @@ from pathlib import Path
 
 from sqlalchemy import select, text
 
-from game_agent.config import DATABASE_URL, is_sqlite
+from game_agent.config import DATABASE_URL
 from game_agent.db.models import Base
 from game_agent.db.session import engine
 from game_agent.logging_setup import get_logger
@@ -68,7 +67,7 @@ async def _migrate_chat_images() -> None:
 
     try:
         async with SessionLocal() as s:
-            # 只捞带 image_paths 的消息：JSON 里含关键字的行（MySQL/SQLite 都可用的 LIKE）
+            # 只捞带 image_paths 的消息：JSON 里含关键字的行（走 LIKE 最快也最省事）
             rows = (await s.execute(
                 text("SELECT id, session_id, meta_json FROM messages "
                      "WHERE CAST(meta_json AS CHAR) LIKE '%image_paths%'"))).all()
@@ -190,6 +189,12 @@ async def _ensure_columns() -> None:
         # 用量统计按它把摘要的小 prompt 从「上下文占用」里排除（llm_transcripts 14 天会清）。
         ("llm_calls", "ALTER TABLE llm_calls ADD COLUMN purpose VARCHAR(16) "
                       "NOT NULL DEFAULT 'agent'"),
+        # 首 token 耗时（毫秒）：顶栏「首字」那一格。0 = 该轮没测到（非流式端点/历史数据）。
+        ("llm_calls", "ALTER TABLE llm_calls ADD COLUMN ttft_ms INTEGER NOT NULL DEFAULT 0"),
+        # 单个子agent 独立停止位：用户在界面上单独点掉某个子agent 时置位，
+        # 该 task 自己的取消看门狗看到就掐断它（不影响主agent / 其它子agent）。
+        ("tasks", "ALTER TABLE tasks ADD COLUMN cancel_requested BOOLEAN "
+                  "NOT NULL DEFAULT FALSE"),
     ]
     for table, ddl in stmts:
         try:
@@ -203,6 +208,10 @@ async def _ensure_columns() -> None:
     await _fix_event_seq()
     await _deround_role_prompts()
     await _refresh_role_prompts()
+    await _migrate_spawn_min_items()
+    await _migrate_no_stop_wording()
+    await _migrate_diagnose_tools_unrestricted()
+    await _migrate_sub_report_prompt()
     await _collapse_agent_roles()
     await _sweep_transcripts()
     await _backfill_llm_providers()
@@ -294,7 +303,7 @@ async def _backfill_llm_providers() -> None:
                     "VALUES (:id, :t, :k, :l, :p, :u, :a, 1, '[]', CURRENT_TIMESTAMP)"),
                     {"id": new_id, "t": team_id, "k": pkey, "l": label,
                      "p": provider, "u": url or None, "a": key or None})
-                remove = "JSON_REMOVE"  # MySQL / SQLite 内置函数名均不区分大小写
+                remove = "JSON_REMOVE"  # SQLite 内置函数 json_remove（名字不区分大小写）
                 for pid in profile_ids:
                     await conn.execute(text(
                         f"UPDATE model_profiles SET provider_id = :pv, base_url = NULL, "
@@ -346,24 +355,17 @@ async def _dedupe_auto_memories() -> None:
 async def _relax_artifacts_run_id() -> None:
     """artifacts.run_id 需可空（素材导入/外置拉取不关联 run）。
 
-    SQLite 不能直接改列约束，需重建表；MySQL 用 MODIFY COLUMN 即可。
+    SQLite 不能直接改列约束，走「建新表 → 拷贝 → 换名」重建。
     """
-    is_sqlite = DATABASE_URL.startswith("sqlite")
-    if is_sqlite:
-        async with engine.begin() as conn:
-            rows = (await conn.execute(
-                text("PRAGMA table_info(artifacts)"))).mappings().all()
-        col = next((r for r in rows if r["name"] == "run_id"), None)
-        if col is None or not col["notnull"]:
-            return  # 表不存在（首次建库走 create_all）或已可空
+    async with engine.begin() as conn:
+        rows = (await conn.execute(
+            text("PRAGMA table_info(artifacts)"))).mappings().all()
+    col = next((r for r in rows if r["name"] == "run_id"), None)
+    if col is None or not col["notnull"]:
+        return  # 表不存在（首次建库走 create_all）或已可空
     try:
         async with engine.begin() as conn:
-            if not is_sqlite:
-                await conn.execute(text(
-                    "ALTER TABLE artifacts MODIFY COLUMN run_id CHAR(32) NULL"))
-                log.info("migrated: artifacts.run_id nullable (mysql)")
-                return
-            # SQLite：建新表 → 拷贝 → 换名 → 重建索引
+            # 建新表 → 拷贝 → 换名 → 重建索引
             await conn.execute(text(
                 "CREATE TABLE artifacts_new ("
                 "id CHAR(32) NOT NULL PRIMARY KEY, "
@@ -394,21 +396,13 @@ async def _fix_event_seq() -> None:
     迁移：对存在重复 seq 的项目按时间重编 seq，然后建 (project_id, seq) 唯一索引
     兜底（配合 repository.append_event 的冲突重试）。
     """
-    is_sqlite = DATABASE_URL.startswith("sqlite")
     try:
         async with engine.begin() as conn:
             # 找出有重复 seq 的项目
-            if is_sqlite:
-                dups = (await conn.execute(text(
-                    "SELECT DISTINCT project_id FROM events "
-                    "WHERE project_id IS NOT NULL GROUP BY project_id, seq "
-                    "HAVING COUNT(*) > 1"))).scalars().all()
-            else:
-                dups = (await conn.execute(text(
-                    "SELECT DISTINCT project_id FROM ("
-                    "  SELECT project_id, seq FROM events "
-                    "  WHERE project_id IS NOT NULL GROUP BY project_id, seq "
-                    "  HAVING COUNT(*) > 1) t"))).scalars().all()
+            dups = (await conn.execute(text(
+                "SELECT DISTINCT project_id FROM events "
+                "WHERE project_id IS NOT NULL GROUP BY project_id, seq "
+                "HAVING COUNT(*) > 1"))).scalars().all()
             for pid in dups:
                 ids = (await conn.execute(text(
                     "SELECT id FROM events WHERE project_id = :pid "
@@ -419,18 +413,9 @@ async def _fix_event_seq() -> None:
                         {"seq": i, "eid": eid})
                 log.info("events seq renumbered for project %s (%d rows)", pid, len(ids))
             # 建唯一索引（幂等）
-            if is_sqlite:
-                await conn.execute(text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_project_seq "
-                    "ON events (project_id, seq)"))
-            else:
-                exists = (await conn.execute(text(
-                    "SELECT COUNT(*) FROM information_schema.statistics "
-                    "WHERE table_schema = DATABASE() AND table_name = 'events' "
-                    "AND index_name = 'uq_events_project_seq'"))).scalar()
-                if not exists:
-                    await conn.execute(text(
-                        "CREATE UNIQUE INDEX uq_events_project_seq ON events (project_id, seq)"))
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_events_project_seq "
+                "ON events (project_id, seq)"))
         if dups:
             log.info("migrated: events seq deduped (%d projects)", len(dups))
     except Exception:  # noqa: BLE001
@@ -531,13 +516,38 @@ async def _refresh_role_prompts() -> None:
                 if res.rowcount:
                     log.info("migrated: main 汇报第九节升级为含原因/说明/风险点 (%d rows)",
                              res.rowcount)
+            # 2026-11-13：中途进度口径改版——"阶段汇报"改称「进度」，并明确这类消息只是让用户
+            # 知道做到哪一步、不必套六段格式、由模型自己决定说不说。同样只做精确子串替换：
+            # 第九节标题 + 紧随其后的第一句仍是出厂原文才插这段，管理员改过就整体不动。
+            _h9 = "═══ 九、汇报（report_to_user，收尾总结必须写清 原因 / 说明 / 风险点）═══\n"
+            _first = "收尾这段是用户唯一会完整读的结论"
+            _ins = (
+                "**中途同步进度（可选，别当成交付）**：活跑得久、想让用户此刻知道到哪一步了，"
+                "就直接写一两句\n"
+                "口语化的进度（「现在在改 X，前面 Y 已经跑通了」），"
+                "**不用套下面这套六段格式、也不用凑齐各段**；\n"
+                "说不说、说几次由你判断，没有新进展就别硬发。这类消息在界面上标成「进度」，\n"
+                "只是让用户知道你在干什么——真正的交付结论必须是全部做完后的最后一次汇报。\n"
+            )
+            # 两版出厂原文都要兜（标题后紧跟正文 / 标题后隔一个空行），各替换一次；
+            # 产物与当前默认逐字一致（标题后一个空行 + 进度段 + 空行 + 原文首句），
+            # 这样后端的 _is_stock_ancestor「纯新增」判定也能认出这些行没有管理员改动。
+            for _gap in ("", "\n"):
+                res = await conn.execute(text(
+                    "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
+                    "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                    {"old": _h9 + _gap + _first,
+                     "new": _h9 + "\n" + _ins + "\n" + _first,
+                     "pat": "%═══ 九、汇报（report_to_user，收尾总结必须写清%"})
+                if res.rowcount:
+                    log.info("migrated: main 新增「中途同步进度」口径 (%d rows)", res.rowcount)
             # v3.2 数据修复：把团队唯一的音频/图像档位自动补绑到 main 的 params_json
             # （角色合并时旧行里本来就没有 *_profile 字段 → 档位明明配了，
             # generate_audio/generate_image 却解析不到、静默走占位）。
             # 管理员已显式绑定的不动；该 kind 有多个档位时不猜，留给用户绑。
-            # 用「先读后写」的 Python 循环而不是 UPDATE...JOIN：MySQL 的
-            # `UPDATE agents a SET a.col=...` 在 SQLite 上是语法错误（打包版首启即报
-            # near "a"，2026-10-30 实测），Python 侧处理两库都稳。
+            # 用「先读后写」的 Python 循环而不是 UPDATE...JOIN：
+            # `UPDATE agents a SET a.col=...` 这种带表别名的写法在 SQLite 上是语法错误
+            # （打包版首启即报 near "a"，2026-10-30 实测），Python 侧处理最稳。
             # ⚠️ params_json 可能存的是 JSON 文档 `null`（不是 SQL NULL），所以解析后
             # 非 dict 一律当空对象，再 JSON_SET 回写。
             for kind in ("audio", "image"):
@@ -655,8 +665,283 @@ async def _refresh_role_prompts() -> None:
                 if up3:
                     log.info("migrated: main prompt upgraded to v3.4 (multi-view views + negative_prompt, %d rows)",
                              up3)
+            # 2026-11-14：出厂词 v3.5 —— 「起服务验收」降级为重手段（用户口径：除非用户说了，
+            # 或者同一个问题多轮都没改好，否则不要起服务验收）。这是替换，不是纯新增；各团队
+            # 库里还停在不同出厂版本，所以按「已知出厂旧段 → 当前默认新段」逐段做字符串替换：
+            # 只动自测/证据那几行，管理员改过的其它章节一律不受影响，匹配不上就不动。
+            if "默认不起服务，静态验证过关就收工" in newp:
+                _pairs = _v35_prompt_pairs()
+                if _pairs:
+                    res = await conn.execute(text(
+                        "SELECT team_id, system_prompt FROM agents WHERE `key` = 'main'"))
+                    up4 = 0
+                    for team_id, sp in res.all():
+                        cur = sp or ""
+                        if not cur or "默认不起服务" in cur:
+                            continue  # 空 / 已经是新口径
+                        before = cur
+                        cur = _apply_v35_pairs(cur, _pairs)
+                        if cur == before:
+                            continue  # 那几段被管理员改过 / 版本更老 → 整行不动
+                        await conn.execute(text(
+                            "UPDATE agents SET system_prompt = :np "
+                            "WHERE `key` = 'main' AND team_id = :t"), {"np": cur, "t": team_id})
+                        up4 += 1
+                    if up4:
+                        log.info("migrated: main prompt upgraded to v3.5 (service start is opt-in, %d rows)",
+                                 up4)
     except Exception:  # noqa: BLE001
         log.exception("角色提示词 v3 迁移失败（忽略）")
+
+
+async def _migrate_sub_report_prompt() -> None:
+    """子agent 提示词升级：要求它用 report_to_user 交结论（2026-11-12）。
+
+    背景：用户问「子agent 真的反馈给主agent 了吗？子agent 自己的总结呢？我咋没看到」。
+    实测 run 54fbf901：6 个子agent 全是模型在最后一条普通回复里给结论，没有调
+    report_to_user；旧提示词虽然白名单带这个工具，却没写「必须调用」，子agent 就按
+    「最后说一段话」结束。现在提示词把它写成硬规则，并把结论结构固定为
+    「核对范围 / 结论 / 建议」——运行时收到调用即收尾，这段文字会同时进入
+    task_done.summary（界面展示）和 spawn_agents 回给主agent 的汇总（同源）。
+    只升级「仍是出厂旧文案」的行：管理员自定义过的（旧行匹配不上）不动。
+    """
+    from game_agent.agents.roles import ROLE_PROMPTS
+
+    old = """你是主agent 派出的只读调研子agent，一次只核对一个问题，回答就结束。
+规则：
+- 只用只读工具（read_file/grep/glob/list_dir/parse_document/web_search/web_fetch/memory_read/load_skill/view_image(s)）。
+- 不要写文件、不要跑命令、不要改任何东西；你的结论就是返回值。
+- 结论要具体可引用：给路径、行号、数值、原文摘录；不知道就说不知道，不要编。
+- 输出一段简洁 Markdown 结论（≤400字），不要用 report_to_user 之外的协作工具。
+- 把你负责的那一条说清楚即可，不要扩展开去研究无关内容。"""
+    new = ROLE_PROMPTS.get("sub") or ""
+    if not new or new == old:
+        return
+    try:
+        async with engine.begin() as conn:
+            res = await conn.execute(text(
+                "SELECT team_id, system_prompt, params_json FROM agents WHERE `key` = 'sub'"))
+            up = 0
+            for team_id, sp, pj in res.all():
+                if not sp or sp == new:
+                    continue
+                if isinstance(pj, str):
+                    try:
+                        pj = json.loads(pj)
+                    except ValueError:
+                        pj = None
+                if (pj or {}).get("prompt_custom") is True:
+                    continue
+                if not _is_stock_ancestor(sp, new):
+                    log.info("sub prompt kept as custom (team=%s)", str(team_id)[:8])
+                    continue
+                await conn.execute(text(
+                    "UPDATE agents SET system_prompt = :np "
+                    "WHERE `key` = 'sub' AND team_id = :t"), {"np": new, "t": team_id})
+                up += 1
+            if up:
+                log.info("migrated: sub prompt upgraded to require report_to_user (%d rows)", up)
+    except Exception:  # noqa: BLE001 - 迁移失败不影响启动
+        log.exception("子agent 提示词迁移失败（忽略）")
+
+
+async def _migrate_no_stop_wording() -> None:
+    """去掉出厂主提示词里「做几次就停」这类措辞（用户 2026-11-11 明确要求）。
+
+    用户原话：「不要限制他，为什么提示词里面老是有让他停下？」。旧出厂提示词第二节
+    写了「≤4 次工具调用……拿到行号就停」、二·五「≤4 次定位……第 5 次起必须已经在改代码」、
+    第八节「超过 6 次工具调用还没落地，就停下来说清卡点」——模型照字面执行，正读到一半
+    就把活停下、交一份定位报告，用户看到的就是「只勘察没落地」。
+    这里只对「仍原封不动带着旧原文」的行做精确子串替换（管理员改过的匹配不上，一律不动），
+    与 _migrate_spawn_min_items 同一套思路。
+    """
+    pairs = [
+        # 第二节·1 定位
+        ("1. 定位：≤4 次工具调用。用 grep(带 context) 或 read_file(offset/limit 翻页) 找准确位置，\n"
+         "   拿到「文件路径 + 函数名/类名 + 行号」就停，不要逐文件通读。",
+         "1. 定位：用 grep(带 context) 或 read_file(offset/limit 翻页) 找准确位置。拿到「文件路径 +\n"
+         "   函数名/类名 + 行号」就够，直接进下一步去改，不要逐文件通读；没定位准就继续用\n"
+         "   grep/read_file 找，别靠猜路径——活没做完，就不停下来。"),
+        # 二·五·1 小 bug 定位
+        ("1. **≤4 次工具调用定位**（与第二节一致）：从报错文案/截图 grep 出调用点，\n"
+         "   看它上面 20 行的失败分支；第 5 次起必须已经在改代码。",
+         "1. **先定位到就改**：从报错文案/截图 grep 出调用点，看它上面 20 行的失败分支，\n"
+         "   定位到就进下一步动手；没定位准就继续查，活没做完不停下来。"),
+        # 第八节 收尾措辞
+        ("- 同一件事超过 6 次工具调用还没落地，就停下来说清卡点。",
+         "- 同一件事超过 6 次工具调用还没落地，就换一种更直接的做法（直接 write_file 落第一版，\n"
+         "  或缩小范围先改最可疑的一处）；不要用「再说」来交差，把卡点写清后继续推进。"),
+    ]
+    try:
+        async with engine.begin() as conn:
+            for old, new in pairs:
+                res = await conn.execute(text(
+                    "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
+                    "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                    {"old": old, "new": new, "pat": "%" + old.splitlines()[0][:24] + "%"})
+                if res.rowcount:
+                    log.info("migrated: removed stop-wording in main prompt (%d rows)", res.rowcount)
+    except Exception:  # noqa: BLE001
+        log.exception("停手措辞提示词迁移失败（忽略）")
+
+
+async def _migrate_diagnose_tools_unrestricted() -> None:
+    """只读诊断不再剔工具：刷新库里「写工具会被剔除」那句旧文案。
+
+    2026-11-13：工具白名单只按用户手动的能力开关裁剪，轮次类型（含只读诊断）不再裁工具。
+    库里旧提示词还教模型「写工具会被剔除」，会让它在诊断时主动放弃 run_command。
+    只做精确子串替换，管理员改过的行匹配不上、原样保留。
+    """
+    old = ("**本轮不要改文件、不要起服务改配置**；等用户\n"
+           "     说「那就改吧/修一下」再动手。（系统会把这类按「只读诊断」跑，写工具会被剔除。）")
+    new = ("**本轮不要改产品文件、不要起服务改配置**；等用户\n"
+           "     说「那就改吧/修一下」再动手。（工具不受限：诊断需要编译/跑命令/看日志验证时照常执行。）")
+    try:
+        async with engine.begin() as conn:
+            res = await conn.execute(text(
+                "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
+                "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                {"old": old, "new": new, "pat": "%写工具会被剔除%"})
+            if res.rowcount:
+                log.info("migrated: diagnose prompt tools unrestricted (%d rows)", res.rowcount)
+    except Exception:  # noqa: BLE001
+        log.exception("只读诊断工具白名单提示词迁移失败（忽略）")
+
+
+async def _migrate_spawn_min_items() -> None:
+    """spawn_agents 最少条数门槛 3→2：把老安装库里「原样」的旧门槛文案替换成新文案。
+
+    为什么需要（本仓自己的运行记忆，2026-11-11 实测）：提示词/指导项一旦落库就以此为准——
+    - agents.system_prompt（roles.py 的 main 提示词）只会经 REPLACE 迁移刷新；
+    - Settings 里的 guidance 条目（policy.py DEFAULT_GUIDANCE）load_policy 只补「新 id」、
+      不刷新「老 id 的旧文案」，而 spawn-when-parallel 两条 old 文案它都见过。
+    所以光改源码，老安装仍会教模型「3 个以上才派」，与 enforce 的「≥2」自相矛盾。
+    这里只做**精确子串替换**：命中的是旧原文就换，管理员自己改过（匹配不上）的一律不动。
+    """
+    from game_agent.agents.roles import ROLE_PROMPTS
+
+    # ---- agents.system_prompt（main 提示词，roles.py）----
+    old_p = (
+        "**三处以上独立线索用 spawn_agents**：要并行核对 3 个以上互不依赖的问题（如多个文件各自\n"
+        "的同一类点、多份文档/多个资料源）时，优先调 spawn_agents 一次派出多个只读子agent 并行查，\n"
+        "等它们把结论汇总回来再自己动手改——比一条条串行读快几倍；只有 1-2 处就自己直接读，不必派。"
+    )
+    new_p = (
+        "**两处以上独立线索用 spawn_agents**：要并行核对 2 个以上互不依赖的问题（如多个文件各自\n"
+        "的同一类点、多份文档/多个资料源）时，优先调 spawn_agents 一次派出多个只读子agent 并行查，\n"
+        "等它们把结论汇总回来再自己动手改——比一条条串行读快几倍；只有 1 处就自己直接读，不必派。"
+    )
+    try:
+        async with engine.begin() as conn:
+            res = await conn.execute(text(
+                "UPDATE agents SET system_prompt = REPLACE(system_prompt, :old, :new) "
+                "WHERE `key` = 'main' AND system_prompt LIKE :pat"),
+                {"old": old_p, "new": new_p, "pat": "%三处以上独立线索用 spawn_agents%"})
+            if res.rowcount:
+                log.info("migrated: main prompt spawn 门槛 3→2 (%d rows)", res.rowcount)
+    except Exception:  # noqa: BLE001
+        log.exception("spawn 门槛提示词迁移失败（忽略）")
+
+    # ---- Settings.guidance（policy.py DEFAULT_GUIDANCE 的旧文案）----
+    old_g = ("同一问题要查 3 个以上互不依赖的线索/文件/资料时，用 spawn_agents 一次派出多个只读子agent "
+             "并行核对、汇总后自己再动手改，比一条条串行读快；只有 1-2 处就自己直接读，不必派。")
+    new_g = ("同一问题要查 2 个以上互不依赖的线索/文件/资料时，用 spawn_agents 一次派出多个只读子agent "
+             "并行核对、汇总后自己再动手改，比一条条串行读快；只有 1 处就自己直接读，不必派。")
+    try:
+        async with engine.begin() as conn:
+            rows = (await conn.execute(text(
+                "SELECT `key`, value_json FROM settings WHERE `key` = 'policy'"))).fetchall()
+            for key, vj in rows:
+                val = vj if isinstance(vj, dict) else json.loads(vj or "{}")
+                g = val.get("guidance")
+                if not isinstance(g, list):
+                    continue
+                hit = False
+                for item in g:
+                    if isinstance(item, dict) and item.get("text") == old_g:
+                        item["text"] = new_g
+                        hit = True
+                if hit:
+                    await conn.execute(text(
+                        "UPDATE settings SET value_json = :v WHERE `key` = :k"),
+                        {"v": json.dumps(val, ensure_ascii=False), "k": key})
+                    log.info("migrated: guidance spawn 门槛 3→2")
+    except Exception:  # noqa: BLE001
+        log.exception("spawn 门槛 guidance 迁移失败（忽略）")
+
+
+# ⚠️ 出厂词 v3.5（2026-11-14）：「起服务验收」降级为重手段。下面是历代出厂文案里那几段
+# 的原文，用来给存量库做逐段替换（新段从 roles.py 当前默认词里现切，见 _v35_prompt_pairs，
+# 这样 roles.py 以后再改也不会让这里悄悄留旧文案）。
+# v3.0～v3.2 的「起服务自测」段：续行缩进 3 空格（早期出厂词就是这么落的）。
+_V35_OLD_SELFTEST_V30 = (
+    "4. 起服务自测：start_service（后台起，自动等端口），拿到 url 后 screenshot_page 截图；\n"
+    "   必须真的看一眼截图判断效果对不对（截图上错就是错），不对就改代码、重起、\n"
+    "   重新截图，最多反复 3 次；验收完 stop_service 收干净。"
+)
+_V35_OLD_SELFTEST_V34 = (
+    "4. 自测与验收（**先判断这一步需不需要起服务**）：纯文案/配置/小样式改动，跑 run_command\n"
+    "   的语法/构建/单测级静态验证即可收工；只有改了 UI/交互/后端逻辑、必须看真实页面效果，\n"
+    "   才 start_service（后台起，自动等端口）→ 拿到 url 后 screenshot_page 截图。\n"
+    "   起服务后必须真的看一眼截图判断效果对不对（截图上错就是错），不对就改代码、重起、\n"
+    "   重新截图；起服务换了几种方式（看 service_logs 的报错去修）仍起不来，就**停止测试**，\n"
+    "   把起不来的原因、已试过的方法、风险点写进汇报，不要无限重试；验收完 stop_service 收干净。"
+)
+_V35_OLD_UNITTEST = "5. 有单测的项目顺带跑一遍单测；没单测就靠「服务跑起来 + 截图」当证据。"
+_V35_OLD_EVIDENCE = "2) 有真实验证证据（编译通过、单测跑过、服务真的起来并看过截图、音频/图片真实落盘）；"
+
+
+def _apply_v35_pairs(cur: str, pairs: list[tuple[str, str]]) -> str:
+    """把 v3.5 替换表应用到一条提示词上；一段都没命中就原样返回。
+
+    同时兼容 \n 与 \r\n——老库里的正文可能是 CRLF 落进去的。
+    """
+    out = cur or ""
+    for old_b, new_b in pairs:
+        if old_b in out:
+            out = out.replace(old_b, new_b)
+            continue
+        crlf_old = old_b.replace("\n", "\r\n")
+        if crlf_old in out:
+            out = out.replace(crlf_old, new_b.replace("\n", "\r\n"))
+    return out
+
+
+def _v35_prompt_pairs() -> list[tuple[str, str]]:
+    """v3.5 升级用的替换表：(出厂旧段 → 当前默认新段)。
+
+    新段从 roles.py 的当前默认提示词里现切；切不到就返回空表 —— 本轮升级空转，
+    绝不猜着往库里写。
+    """
+    from game_agent.agents.roles import ROLE_PROMPTS
+
+    lines = (ROLE_PROMPTS.get("main") or "").splitlines()
+
+    def block(start: str, stops: tuple[str, ...]) -> str:
+        for i, ln in enumerate(lines):
+            if ln.startswith(start):
+                out = [ln]
+                for nxt in lines[i + 1:]:
+                    if not nxt.strip() or any(nxt.startswith(st) for st in stops):
+                        break
+                    out.append(nxt)
+                return "\n".join(out).rstrip()
+        return ""
+
+    new_selftest = block("4. 自测与验收", ("   **不要用", "5. "))
+    new_unittest = block("5. 有单测的项目", ("6. ",))
+    new_evidence = block("2) 有真实验证证据", ("3)",))
+    pairs: list[tuple[str, str]] = []
+    if new_selftest:
+        pairs.append((_V35_OLD_SELFTEST_V34, new_selftest))
+        pairs.append((_V35_OLD_SELFTEST_V30, new_selftest))
+        # 同一段的「续行不缩进」变体（手改过格式的存量行也认）
+        pairs.append((_V35_OLD_SELFTEST_V30.replace("\n   ", "\n"), new_selftest))
+    if new_unittest:
+        pairs.append((_V35_OLD_UNITTEST, new_unittest))
+    if new_evidence:
+        pairs.append((_V35_OLD_EVIDENCE, new_evidence))
+    return pairs
 
 
 def _is_stock_ancestor(old: str, new: str) -> bool:

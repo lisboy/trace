@@ -24,6 +24,11 @@ _boxes: dict[str, list[dict]] = defaultdict(list)
 # 不能让前端塞完整 profile（含 key），否则等于让浏览器指定用哪个端点。
 _model_switches: dict[str, dict] = {}
 
+# 单条子agent 的插话邮箱（按 task_id 分）：主agent 一条插话到达后，由大模型判断
+# 「要不要同步给哪些正在跑的子agent」，命中的子任务各自从这条邮箱取走（见 interject.py）。
+# 和主邮箱分开：子agent 只 drain 自己这个 task 的信箱，绝不抢主agent 的插话。
+_task_boxes: dict[str, list[dict]] = defaultdict(list)
+
 # 运行中「改运行选项」：能力开关（自动化测试/联网/出图与配音）、会话权限（仅工作区/全部权限）、
 # 仅分析。和模型切换一样走这条邮箱，但语义是「改这一轮的运行约束」：下一轮开头由 runtime
 # 取走、重新裁剪工具白名单 / 覆盖 ToolContext.permission_scope / 换系统提示里的约束块。
@@ -88,6 +93,19 @@ def take_settings_switch(run_id: str) -> dict | None:
 
 def pending(run_id: str) -> int:
     return len(_boxes.get(str(run_id), []))
+
+
+def push_to_task(task_id: str, text: str) -> None:
+    """给**单个子agent**投一条补充要求（只有它自己 drain 得到）。"""
+    body = (text or "").strip()
+    if not body:
+        return
+    _task_boxes[str(task_id)].append({"text": body})
+
+
+def drain_task(task_id: str) -> list[dict]:
+    """取走某个子agent task 目前累积的插话（子 runtime 每轮开头调用一次）。"""
+    return _task_boxes.pop(str(task_id), [])
 
 
 def clear(run_id: str) -> None:

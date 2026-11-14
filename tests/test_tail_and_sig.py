@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from game_agent.agents.runtime import _sig_arg, _tail_keep_head
+from game_agent.agents.runtime import _call_signature, _sig_arg, _tail_keep_head
 
 
 # ---------------------------------------------------------------- _tail_keep_head
@@ -84,3 +84,31 @@ def test_sig_nested_dict_list_recursive() -> None:
     a = {"path": "D:/repo/a.txt", "ts": 20261109, "items": [1, "x" * 30]}
     b = {"items": [2, "y" * 25], "ts": 20251101, "path": "D:/repo/a.txt"}
     assert _sig_arg(a) == _sig_arg(b)
+
+
+# ---------------------------------------------------------------- _call_signature 分页不误判
+def test_call_signature_pagination_offsets_distinct() -> None:
+    """连续翻页读同一文件（offset 不同）必须是不同签名，不能被死循环检测误杀。
+
+    真实事故（2026-11-11）：读一个 685 行文件，offset=300 → 420 → 599 连翻几页，
+    offset/limit 全被归一成 #num → 三次签名完全相同 → 「重复调用」被掐停收尾、
+    还落成 failed，用户看到「上一次执行失败：只做了定位/勘察」的弹窗。
+    """
+    a = _call_signature("read_file", {"path": "index.html", "offset": 300, "limit": 400})
+    b = _call_signature("read_file", {"path": "index.html", "offset": 420, "limit": 300})
+    c = _call_signature("read_file", {"path": "index.html", "offset": 599, "limit": 120})
+    assert a != b != c and a != c
+
+
+def test_call_signature_same_pagination_still_identical() -> None:
+    """同一页（offset/limit 完全一样）连发，仍应判成同一签名——真正的重复调用照样拦。"""
+    a = _call_signature("read_file", {"path": "index.html", "offset": 300, "limit": 400})
+    b = _call_signature("read_file", {"path": "index.html", "offset": 300, "limit": 400})
+    assert a == b
+
+
+def test_call_signature_non_pagination_numbers_still_normalized() -> None:
+    """非分页参数里的数字（时间戳/长 id）仍按原规则归一，不影响既有行为。"""
+    a = _call_signature("run_command", {"cmd": "pytest -k test_run 20261109"})
+    b = _call_signature("run_command", {"cmd": "pytest -k test_run 20251101"})
+    assert a == b

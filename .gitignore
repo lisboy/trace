@@ -41,8 +41,13 @@ _tmp_smooth/
 .screenshots/
 .workbuddy/
 .idea/
-shot_rows_after.png
-_restart_backend.ps1
+# 根目录的临时验证截图 / 一次性压测脚本 / 误生成文件（不要在仓库根散落这些）
+/shot_rows_after.png
+/_restart_backend.ps1
+/_*.png
+/_*.py
+/_*.ps1
+/3000
 
 # ---- 打包产物（由 package.cmd 现场生成）----
 dist_exe/

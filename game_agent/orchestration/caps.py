@@ -1,9 +1,8 @@
 """运行能力开关：自动化测试 / 联网 / 出图配音。
 
-前端「运行选项」里的勾选，默认全开（每个新会话都是开的）。
-关闭时做两件事：
-1. 工具层硬裁剪（caps_tool_filter）——不靠 prompt 自觉；
-2. 本轮提示里写清楚（caps_hint）——说明不做什么、怎么收尾。
+原先前端「运行选项」里有这三个勾选，现在这块 UI 已移除——用哪个工具完全由模型按任务判断。
+保留本模块是为了：老客户端/API 仍可显式传 caps，传了就按它裁剪。
+缺省（不传）一律全开：工具不裁剪，只留下「你自己判断要不要跑」的引导（caps_hint）。
 """
 from __future__ import annotations
 
@@ -40,25 +39,24 @@ def caps_tool_filter(whitelist: list[str], caps: dict[str, bool]) -> list[str]:
 
 def effective_whitelist(role_whitelist: list[str], run_type: str,
                         caps: object) -> list[str]:
-    """角色全量白名单 → 本轮实际可用的工具名（analyze 剔写/生成；caps 关掉再剔）。
+    """角色全量白名单 → 本轮实际可用的工具名（只按用户手动的能力开关裁剪）。
 
-    注意：运行中把「仅分析」打开/关闭时（runtime 的 _apply_settings），这里会重新算一遍；
-    历史中已调用过的工具不会因白名单变化而消失。
+    analyze / 只读诊断不裁工具：用哪个工具由模型自己判断（诊断时也可能要跑命令验证）。
+    运行中改「仅分析 / 能力开关」时（runtime 的 _apply_settings）会在这里重算一遍。
     """
-    wl = list(role_whitelist)
-    if run_type == "analyze":
-        # WRITE_TOOLS 定义在 orchestrator（避免循环导入，这里延迟取）
-        from game_agent.orchestration.orchestrator import WRITE_TOOLS
-        wl = [w for w in wl if w not in WRITE_TOOLS]
-    return caps_tool_filter(wl, normalize_caps(caps))
+    del run_type  # 保留参数：历史调用方/测试仍按位置传，工具不再随轮次类型裁剪
+    return caps_tool_filter(list(role_whitelist), normalize_caps(caps))
 
 
 def caps_hint(caps: dict[str, bool]) -> str:
     """能力开关写进本轮提示：关掉的要说清「不做什么、怎么收尾」。"""
     parts: list[str] = []
     if caps.get("test", True):
-        parts.append("【自动化测试已开启】改完要实际验收：能起服务就起，用截图/接口/单测看结果再汇报；"
-                     "验证不过就继续修，别报「已完成」。")
+        parts.append("【自动化测试已开启】起服务做运行时验证是**重手段，默认不做**："
+                     "改完先跑 run_command 的语法/构建/单测级静态验证，过了就汇报；"
+                     "只有用户明确要求看效果，或同一个问题多轮修改仍未解决时，"
+                     "才 start_service + screenshot_page 实测。"
+                     "若起服务换了几种方式仍起不来，就**停止测试**，把起不来的原因、已试过的方法、风险点写进汇报，不要无限重试。")
     else:
         parts.append("【本轮关闭了自动化测试】不要 start_service / service_logs / screenshot_page，"
                      "也不要跑 CDP、接口或端到端测试。改完做语法/构建级静态检查即可收尾，"

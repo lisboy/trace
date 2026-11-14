@@ -114,8 +114,11 @@ if errorlevel 1 goto menu
 
 set "RC=0"
 if defined DO_WINLITE call :do_winlite
+if errorlevel 1 goto fail
 if defined DO_WINEXE  call :do_winexe
+if errorlevel 1 goto fail
 if defined DO_LINUX   call :do_linux
+if errorlevel 1 goto fail
 
 echo.
 echo [checksum] writing .sha256 ...
@@ -158,7 +161,7 @@ exit /b 0
 echo.
 echo === [win-lite] packaging ... ===
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\packaging\windows-lite\build-package.ps1" -OutDir "%OUT%" -NoBuild
-if errorlevel 1 (echo [x] win-lite FAILED & set "RC=1")
+if errorlevel 1 (echo [x] win-lite FAILED & exit /b 1)
 goto :eof
 
 :do_winexe
@@ -168,11 +171,10 @@ echo === [win-exe] packaging (PyInstaller, ~1-3 min) ... ===
 if errorlevel 1 (
   echo [x] PyInstaller is not installed. Install it, then re-run:
   echo        "%VPY%" -m pip install pyinstaller
-  set "RC=1"
-  goto :eof
+  exit /b 1
 )
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\packaging\exe\build-exe.ps1" -OutDir "%OUT%" -NoBuild
-if errorlevel 1 (echo [x] win-exe FAILED & set "RC=1")
+if errorlevel 1 (echo [x] win-exe FAILED & exit /b 1)
 goto :eof
 
 :do_linux
@@ -182,17 +184,22 @@ if not exist "%BASH%" (
   echo [!] bash not found - skipping the Linux package.
   echo     Install Git for Windows, or build it on a Linux box:
   echo        bash packaging/linux-lite/build-package.sh
-  goto :eof
+  exit /b 0
 )
 REM Relative --out, combined with the `cd` above: bash starts with cwd = repo root,
 REM so the archive path is never "D:\..." (tar would read "D:" as a remote host).
 pushd "%ROOT%"
 "%BASH%" "packaging/linux-lite/build-package.sh" --out dist_release --no-build
-if errorlevel 1 (echo [x] linux-lite FAILED & set "RC=1")
+if errorlevel 1 (echo [x] linux-lite FAILED & popd & exit /b 1)
 popd
 goto :eof
 
 :fail
+echo.
+echo ============================================================
+echo   BUILD FAILED - fix the error above, then re-run.
+echo   (No checksum was written; existing packages are untouched.)
+echo ============================================================
 echo.
 pause
 endlocal

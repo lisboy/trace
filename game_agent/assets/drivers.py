@@ -119,7 +119,7 @@ class LocalSfxLibrary:  # noqa: D101
     "indextts2", "voice", "IndexTTS2 本地部署（零样本克隆，可克隆自定音色）",
     "docs/语音接入.md",
     fields=[
-        Field("base_url", "服务地址", type="text", default="http://127.0.0.1:7860"),
+        Field("base_url", "服务地址", type="text", default="http://127.0.0.1:10189"),
         Field("preset", "音色预设名", type="text", default="",
               required=False),
         Field("reference_audio", "参考音频路径（无预设时用，3~10 秒干声）", type="text"),
@@ -130,6 +130,8 @@ class LocalSfxLibrary:  # noqa: D101
         Field("emo_vector", "八维情感（高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静；逗号分隔，emo_mode=2 时生效）",
               type="text"),
         Field("emo_audio", "情感参考音频路径（一段带目标情绪的干声，emo_mode=1 时生效）", type="text"),
+        Field("speed", "语速 0.5~2.0（>1 慢 <1 快；IndexTTS-2.5 才生效）", type="text"),
+        Field("lang", "语言 auto/zh/en/ja/es/ar（默认 auto；IndexTTS-2.5 才生效）", type="text", default="auto"),
         Field("format", "输出格式", type="select", default="wav", options=["wav"]),
     ],
 )

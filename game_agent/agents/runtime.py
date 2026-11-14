@@ -17,10 +17,16 @@ from game_agent.agents.tools import ToolContext, ToolResult, is_scratch_path
 from game_agent.agents.tools.registry import (
     build_tool_specs, execute_tool_with_timeout,
 )
-from game_agent.config import TOOL_HARD_TIMEOUT_S, MAX_TOOL_CALLS_PER_ROUND, env_brief
+from game_agent.config import (
+    TOOL_HARD_TIMEOUT_S, MAX_TOOL_CALLS_PER_ROUND, env_brief,
+    TOOL_RESULT_SHRINK_CHARS, TOOL_RESULT_SHRINK_KEEP, TOOL_RESULT_SHRINK_PRESSURE,
+    TOOL_MEMO_ENABLED, TOOL_MEMO_MAX_ENTRIES,
+    LLM_REASONING_STEP_DOWN_AFTER,
+)
 from game_agent.llm.base import Ctx, LLMResponse
 from game_agent.llm.context_window import (
-    DEFAULT_CONTEXT_WINDOW, DIGEST_SECTIONS, VIEWBACK_MARK, compress_messages,
+    BUDGET_RATIO, DEFAULT_CONTEXT_WINDOW, DIGEST_SECTIONS, VIEWBACK_MARK,
+    compress_messages, message_tokens, tools_tokens,
 )
 from game_agent.llm.factory import build_llm
 from game_agent.llm.text_tool_calls import contains_unparsed_calls
@@ -40,6 +46,20 @@ _TOOL_RESULT_EVENT_CAP = 2000
 # （长搜索结果尤其常见：中文 10 条结果轻松破 1200 字，用户实测有的搜索有来源、有的没有）。
 _SOURCES_EVENT_CAP = 4000
 _SOURCES_MARK = "[Sources]"
+
+# 「可由再次调用再生」的只读工具：它们的输出是文件内容/命令输出/搜索结果，模型看过后
+# 可以从历史里降级成存根（需要细节就再调一次），删除不影响任务判断，只省上下文与重发量。
+# 写操作（write/edit）回执很短、评估/汇报类结果承载结论，不进此列。
+_REGENERABLE_TOOLS = frozenset({
+    "read_file", "run_command", "grep", "glob", "list_dir",
+    "service_logs", "web_search", "web_fetch",
+})
+# 降级存根的开头标记：再次遇到就跳过（幂等），也便于前端/排查识别。
+_SHRUNK_MARK = "[旧工具结果已降级]"
+
+# 推理强度档位（由强到弱）：runtime 在「长 run 后段」按轮次往下调一档，用更少思考
+# 换每步生成时间。仅当档位显式配了这些值之一时生效；未配（走端点默认）不动。
+_EFFORT_LADDER = ("high", "medium", "low", "minimal")
 
 
 def _sig_arg(arg: Any) -> Any:
@@ -78,9 +98,47 @@ def _sig_arg(arg: Any) -> Any:
     return s
 
 
+# 分页/定位类参数：这些数字表示「正在读第几页/第几行」，是**实质不同的操作**，绝不能
+# 像时间戳那样被归一成 #num。否则连续翻页读取会塌成同一个签名——
+# 实测 2026-11-11：读一个 685 行文件，offset=300 → 420 → 599 连翻 4 页，
+# _sig_arg 把 offset/limit 全归一成 #num，死循环检测误判「同一调用重复 3 次」，
+# 把一个正在正常读代码的任务掐停收尾，最后还落成 failed（用户看到「上一次执行失败」弹窗）。
+_PAGINATION_KEYS = ("offset", "limit", "start", "end", "line", "page", "cursor")
+
+# 结果记忆的单个条目上限（字符）：再大的结果重复塞一遍只会撑上下文，不如让它重跑
+_TOOL_MEMO_MAX_CHARS = 24_000
+
+
+def _memo_sig(args: Any) -> str:
+    """结果记忆用的**精确**签名：参数原样序列化，不做数字归一。
+
+    和死循环检测的 `_call_signature` 刻意不同：那边把 offset=300/420 归一成同一个签名
+    （为了识别「翻页」不算重复），而这里 offset 不同就是**不同内容**，必须区分开，
+    否则第二次读另一页会拿到第一页的正文——比不缓存更糟。
+    """
+    try:
+        return json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(args)
+
+
 def _call_signature(name: str, args: Any) -> str:
     try:
-        return f"{name}:{json.dumps(_sig_arg(args), sort_keys=True, ensure_ascii=False)}"
+        norm = _sig_arg(args)
+        # 只在 dict 参数上覆写：分页参数保留真实数值，让「翻到不同页」可区分。
+        if isinstance(norm, dict) and isinstance(args, dict):
+            for k in _PAGINATION_KEYS:
+                if k in args:
+                    v = args[k]
+                    if isinstance(v, bool):
+                        continue
+                    if isinstance(v, (int, float)):
+                        norm[k] = f"#{int(v)}"
+                    elif str(v).strip().lstrip("-").isdigit():
+                        norm[k] = f"#{int(str(v).strip())}"
+                    else:
+                        norm[k] = v
+        return f"{name}:{json.dumps(norm, sort_keys=True, ensure_ascii=False)}"
     except Exception:  # noqa: BLE001 - 参数不可序列化时退回工具名
         return name
 
@@ -170,7 +228,8 @@ _BRAKE_MSG = (
     "1. 用已有证据下判断（修 bug：选**最可能的一个原因**，报错文案对应的调用点 → 它上面的失败分支；"
     "写文档：看过的东西够起草就先起草，别等「把整个项目读完」）；\n"
     "2. 直接 write_file / edit_file 把第一版落到该落的路径上，不要等「完全确定」；\n"
-    "3. 落完跑最小验证（起服务/跑一条命令/截图/回读一遍），不对就基于新证据改第二版。\n"
+    "3. 落完跑最小验证（编译/跑一条命令/回读一遍；只有用户要看效果时才起服务+截图），"
+    "不对就基于新证据改第二版。\n"
     "禁止：再写探针脚本、再查数据库/存档/文件修改时间、再用 search_history 找用户说过什么"
     "（需求就在最早那条用户消息里）。若确实缺只有用户能给的信息（账号/复现路径），"
     "现在就用 ask_user 问一句，不要继续猜。"
@@ -197,7 +256,7 @@ _CONVERGE_WRITE_MSG = (
     "也没有 generate_image / generate_audio 的真实产物。\n"
     "现在就把第一版做出来：素材类直接调 generate_image / generate_audio 把第一批派出去"
     "（多张/多条用 items，一次最多 24 项）；代码或文档类直接 write_file 把第一版落到"
-    "目标路径，写完再跑最小验证（编译 / 起服务 / 截图 / 回读），不对就照报错改第二版。\n"
+    "目标路径，写完再跑最小验证（编译 / 跑测试 / 回读），不对就照报错改第二版。\n"
     "禁止：继续列目录、通读文件、翻存档找线索；禁止用一份「我打算这么做」的报告代替执行。")
 
 # 工具参数 JSON 没解析出来时给模型的纠正（不是逻辑失败，别让它原样重发同样的巨型调用）。
@@ -231,74 +290,15 @@ _VIEW_VERDICT_MSG = (
     "2. 之后要复核先读这份文件；确实需要看细节时才重新 view_image 单张。\n"
     "验收结论写成文件才算数，写在思考里等于没写。")
 
-# 哪些需求算「改代码/修 bug」——只有这类才启用上面的刹车。
-# 出图/配音/批量数据处理/纯分析都不该被催着改代码，否则会误伤正常的长任务。
-# 只看需求正文的**结尾一段**：instruction 前面还拼着项目结构/记忆/历史，不是需求本身。
-_FIX_WORDS = (
-    "修", "改", "bug", "报错", "错误", "异常", "失败", "崩溃", "闪退",
-    "卡住", "卡死", "卡顿", "白屏", "没反应", "不工作", "坏了", "无效",
-)
-# 批量/生成类的大活：天然要查很多文件，不能按「小 bug」催它直接改。
-# 注意别用裸「全部/所有」：「点全部翻开卡死了」按钮名会被误判成批量任务。
-_BATCH_WORDS = ("所有角色", "全部角色", "每个角色", "批量", "全量", "重构",
-                "生成", "导出", "迁移", "所有文件", "全部文件")
-# 用户明说「只看不许动」——这种任务绝不该被刹车催着改代码。
-# 收尾守卫（orchestrator._needs_action）用同一份词表，别再抄一份。
-ANALYZE_ONLY_WORDS = ("只分析", "不要改", "别改", "先别动", "不用改", "只看看", "别动代码")
-
-# 「只检查/只排查/先诊断」这类意图：用户要的是**一个结论（哪里有问题）**，不是立刻改。
-# 它们常带「检查/排查/诊断」等动词，会被误判成「动手改代码」——于是过程刹车刚开跑就催改、
-# 收尾时没改动就判 failed / 强制重做。这里单独识别：这一类走「先出结论、要动手等你点头」。
-# ⚠️ 只认明确的「只/先/别动」话术；裸「检查一下 X」仍按可能动手处理，避免把「检查完顺手修好」
-# 的需求误判成纯勘察（那会变得一样啰嗦）。
-INSPECT_ONLY_WORDS = (
-    "只检查", "仅检查", "只排查", "仅排查", "只诊断", "仅诊断",
-    "检查一下", "检查下", "排查一下", "排查下", "诊断一下", "诊断下",
-    "先检查", "先排查", "先诊断", "先定位", "找一下原因", "找出原因", "排查一下原因",
-    "检查一下原因", "定位一下", "帮我定位", "帮我找出", "先看看问题", "看看问题出在哪",
-    "检查问题", "排查问题", "看看什么问题", "什么问题", "是什么原因", "什么原因",
-    # 「帮我查一下/确认」这类口语化诊断：要的是原因，不是马上动手。
-    # 注意不收「帮我看看/看看为什么」——太宽泛，且与既有语义（「帮我看看为什么白屏」按动手指令）冲突。
-    "帮我查一下", "帮我查查", "帮我确认", "帮我核实", "帮我查下", "查一下为什么",
-    "在哪里", "在哪", "哪一块", "哪里出",
-)
-# 同一句里出现这些「明确让我改/修」的话术时，即便有检查/排查字样也按动手指令处理。
-_IMPERATIVE_FIX_WORDS = ("修复", "修好", "修一下", "帮我修", "给我修", "改好", "改一下",
-                         "帮我改", "给我改", "解决", "搞定", "弄好", "直接改", "直接修",
-                         "改成", "改为",
-                         "优化", "重构", "实现", "新增", "接入", "接上", "补上", "调整",
-                         "删掉", "加上", "换成", "换掉",
-                         "加个", "加一个", "加一下", "搞个", "做个", "做个", "写个", "建个",
-                         "去掉", "移除", "改成", "怎么改", "怎么加", "怎么弄")
-
-
-def wants_inspect_only(text: str) -> bool:
-    """用户只要「先检查/排查/诊断出问题」，而不是马上动手改。"""
-    t = (text or "").strip()
-    if not t:
-        return False
-    if any(w in t for w in ANALYZE_ONLY_WORDS):
-        return True
-    if any(w in t for w in _IMPERATIVE_FIX_WORDS):
-        return False
-    return any(w in t for w in INSPECT_ONLY_WORDS)
-
-# 2026-10-28 会话「首页为啥还有滚动条」：疑问句里一个 _FIX_WORDS 都没有，刹车整段没
-# 启用，模型连着查了 84 轮、产品代码一行没改。用户问「为啥还有 X」不是在做学术提问，
-# 是在说 X 不该存在、把它弄掉。
-# 判定要「疑问」+「问题还在」两截同时命中，只看「为什么」会把
-# 「这个函数为什么这样写」这种纯提问也拽进刹车。
-_ASK_WORDS = ("为啥", "为什么", "为何", "怎么", "咋")
-_STILL_BROKEN_WORDS = ("还有", "仍有", "还是", "依旧", "仍然", "去不掉", "消不掉",
-                       "没去掉", "出不来", "没出来", "不显示", "显示不出", "打不开",
-                       "点不动", "加载不出", "没响应", "又出现")
-
-
-def is_symptom_complaint(text: str) -> bool:
-    """「首页为啥还有滚动条」这类疑问式故障描述：要的是动手，不是解答。"""
-    t = (text or "").strip()
-    return (any(a in t for a in _ASK_WORDS)
-            and any(s in t for s in _STILL_BROKEN_WORDS))
+    # 「这一轮到底要不要动手改」不再由系统判定（2026-11-14 改）。
+    # 旧做法是编排器先调一次模型/关键词算出 engage/fix_task，再据此开关两道过程守卫。
+    # 问题：「要不要动手」本来就是模型读完原话最清楚的事，系统判错就变成替它拍板
+    # （判成 survey 会把 run_type 降级成 analyze、并塞「本轮只排查不许改」的硬提示）。
+    # 现在工具全开、engage 恒为 True，守卫只负责**发现自相矛盾**：
+    #   · 说自己要改、清单还开着，却连续几十轮只看不写 → 提醒一句（不是禁令）；
+    #   · 真正的硬拦只剩防死循环（重复调用 / 参数坏），与「该不该动手」无关。
+    # fix_task 现在只影响措辞（走「修 bug」式还是「创建/生成」式提醒），不再决定是否启用。
+    
 
 
 _VIEW_TOOL_NAMES = ("view_image", "view_images")
@@ -379,13 +379,9 @@ def _landed_in_round(calls) -> bool:  # type: ignore[no-untyped-def]
 
 
 def _is_fix_task(instruction: str) -> bool:
-    tail = (instruction or "").strip()[-400:]
-    if any(w in tail for w in _BATCH_WORDS):
-        return False
-    # 只分析 / 只检查（要一个结论，不是马上改）：过程刹车不该催它动手。
-    if wants_inspect_only(tail):
-        return False
-    return any(w in tail for w in _FIX_WORDS) or is_symptom_complaint(tail)
+    """（保留给旧调用/测试的兼容壳）——纯关键词判定已废弃，实际是否启用过程刹车
+    改用编排器经模型推理给出的 ``engage`` 开关。新代码不应再调用本函数。"""
+    return False
 
 # 一次任务没有次数上限：以前按角色定几十次轮数（组长 60），等于亲口告诉模型
 # 「你的次数是有限的」，它就真的把 128 条语音拆成好几批、每批只做一个阶段，最后交回
@@ -409,13 +405,14 @@ _NUDGE_HANDOFF = (
     "或者把这些项用 update_plan 加回清单（置 pending 并在 note 里写清卡在哪），"
     "然后再给最终答复。不要交一份「下一步怎么做」的报告就收工。")
 
-# 清单还没做完就调 report_to_user：这是阶段汇报，不是交付。汇报已经给用户看了，
+# 清单还没做完就调 report_to_user：这是一次「中途进度同步」，不是交付。这段话已经给用户看了，
 # 但不代表可以收工——继续把剩下几项做完，最后再汇报一次。
 _NUDGE_STAGE_REPORT = (
     "（系统提示）你刚才调用了 report_to_user，但待办清单还有 {n} 项没完成：{items}。"
-    "这段汇报会被当作**阶段汇报**，不是最终交付——现在还没到收尾的时候。\n"
-    "请继续把剩下的项做完：每做完一项用 update_plan 把该项置 completed（整体覆盖清单），"
-    "全部完成后，再用 report_to_user 写一份完整的最终汇报。"
+    "这段话已作为**进度**发给用户了（界面上标成「进度」，只是个进度同步，不是交付）——"
+    "现在还没到收尾的时候，继续把剩下的项做完：每做完一项用 update_plan 把该项置 completed"
+    "（整体覆盖清单），全部完成后，再用 report_to_user 写一份完整的最终汇报。"
+    "过程中你想再同步一次进度也可以，写一两句口语化的话就行，不用套六段格式。"
     "如果确实卡住了，就在对应项的 note 里写清卡点，并在最终汇报里如实说明哪些没做完。")
 
 
@@ -424,9 +421,16 @@ class AgentRuntime:
     def __init__(self, role: str, whitelist: list[str], system_prompt: str,
                  instruction: str, tctx: ToolContext, ctx: Ctx,
                  extra_tool_specs: dict | None = None,
-                 base_whitelist: list[str] | None = None) -> None:
+                 base_whitelist: list[str] | None = None,
+                 engage: bool = True, fix_task: bool = True) -> None:
         self.role = role
         self.whitelist = whitelist
+        # engage：盘查判成「纯问答」时为 False，不装「只勘察不动手」的催促（不逼它改文件）；
+        # 但它**不是闸门**——工具全开，模型想改随时能改（2026-11-14 拍板：盘查只当提示）。
+        # fix_task 只影响提醒的措辞（修 bug 式 / 创建生成式）。
+        # 另：两道过程守卫还额外要求 plan_committed（模型自己立过清单）才介入，见 execute()。
+        self.engage = engage
+        self.fix_task = fix_task
         # 角色全量白名单（未裁剪 analyze / caps）：运行中改「仅分析 / 能力开关」时在它上面重算。
         # 不传时退回本次生效白名单（老调用方行为不变，只是运行中开关重算会受限）。
         self.base_whitelist = list(base_whitelist if base_whitelist is not None else whitelist)
@@ -446,11 +450,21 @@ class AgentRuntime:
         self.instruction = instruction
         self.tctx = tctx
         self.ctx = ctx
-        # 端点 503/限流退避重试时，往运行轨迹发一条内联提醒（系统日志只留 WARNING）
+        # 端点 503/限流退避重试时落一条轨迹事件：**界面不再显示**（用户要求这类会自己恢复的
+        # 情况后台静默），只留作导出 md / LLM 往返排查用；系统日志同时留 WARNING。
         self.ctx.on_llm_retry = self._emit_llm_retry
+        # 适配层压缩了历史（发送前估算超预算 / 端点拒收 400 超长按半预算重压）时
+        # 往轨迹发事件：端点拒收以前完全静默，用户看到「压缩处理中」却不知道为什么。
+        self.ctx.on_llm_compressed = self._on_adapter_compacted
+        # 最近一次正文往返端点实报的 prompt_tokens：压缩事件的「上一轮实报」用它
+        self._last_prompt_tokens = 0
         self.llm = build_llm(role, ctx)
+        self._bind_llm_session()
         self.tools = build_tool_specs(whitelist, extra_tool_specs)
         self._summary_cache: dict[str, str] = {}  # 压缩摘要缓存（按内容 hash），同 run 不重复调 LLM
+        # 同 run 内「同工具 + 同参数」的只读结果缓存（见 config.TOOL_MEMO_ENABLED 的实测依据）。
+        # 任何写/执行类工具跑过就清空：改完文件还读回旧内容会把模型带进沟里。
+        self._tool_memo: dict[tuple[str, str], str] = {}
         self._compact_noted = False  # 本次压缩周期是否已发过「正在压缩」进度提示
         self._compact_deadline = 0.0  # 本次压缩周期的墙钟截止（monotonic），超出改用要点兜底
         # 本轮真实执行轨迹的轻量账本：模型只吐 reasoning、不吐文字时，用它生成
@@ -460,6 +474,26 @@ class AgentRuntime:
         self._trace_commands = 0                 # 执行命令条数（验证证据）
         self._trace_screens = 0                  # 页面截图次数
         self._trace_tool_counts: dict[str, int] = {}
+        # 上一段「临时回复」的正文：等后台子agent 回收期间，模型可能连续吐多段文字，
+        # 同样的内容不重复落进聊天流。
+        self._last_interim_text = ""
+
+    def _bind_llm_session(self) -> None:
+        """把本会话 id 交给适配器，让「本次会话已改直连」这个决定跨 run 有效。
+
+        代理不通 / 被 Cloudflare 拦下后适配器会自动降级直连；但如果只靠进程级 120s 冷却，
+        一次长 run 会反复过期、每两分钟又去撞一次代理（界面上是一阵阵无缘无故的卡顿）。
+        适配器拿到会话 id 后就把「这条会话只走直连」记下来，后续往返直接直连。
+        拿不到会话 id 时留空，行为退回原来的冷却逻辑。
+        """
+        try:
+            key = str(self.tctx.run_ctx.session_id or "")
+        except Exception:  # noqa: BLE001 - 取不到就退回进程级冷却
+            key = ""
+        try:
+            setattr(self.llm, "session_key", key)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _make_summarizer(self):  # type: ignore[no-untyped-def]
         """全局摘要压缩的摘要器：把被合并的历史压成「按骨架」的要点摘要。
@@ -538,6 +572,89 @@ class AgentRuntime:
 
         return summarize
 
+    def _round_effort_override(self, rnd: int) -> str:
+        """长 run 后段按轮次下调推理强度（每步省一点生成时间）。
+
+        只在「档位显式配了 reasoning_effort」且开关 GA_REASONING_STEP_DOWN_AFTER>0 时生效：
+        第 N 轮起降一档（high→medium→low→minimal），之后每再满 N 轮再降一档，不低于
+        minimal。不配 reasoning_effort（走端点默认）时一律返回空串，保持原行为。
+        """
+        n = int(LLM_REASONING_STEP_DOWN_AFTER or 0)
+        if n <= 0 or rnd < n:
+            return ""
+        base = (getattr(self.llm, "reasoning_effort", "") or "").strip().lower()
+        if base not in _EFFORT_LADDER:
+            return ""
+        steps = 1 + (rnd - n) // n  # 每满一个步长再降一档
+        idx = min(len(_EFFORT_LADDER) - 1, _EFFORT_LADDER.index(base) + steps)
+        return _EFFORT_LADDER[idx]
+
+    def _shrink_old_tool_results(self, messages: list[dict]) -> list[dict]:
+        """把「最近一轮之前」的可再生工具结果降级成存根，节省上下文与每轮重发量。
+
+        **只在真的有上下文压力时才做**（估算用量 > 预算 × TOOL_RESULT_SHRINK_PRESSURE）：
+        无脑降级的代价是模型失去刚读过的内容 → 反复重读同一个文件（实测一次「看看这个项目」
+        里 README.md 被按 4 个区间读了 4 遍），并且每次改写都发生在历史中段，会打断前缀缓存。
+        有压力时按**从旧到新**削，削到达标就停，尽量少改动最近的内容。
+
+        只降级**最近一轮以外**的结果：每个结果至少被模型完整看过一次（结果在生成它的
+        那一轮之后才会被送进模型），之后若需要细节它会再次 read_file/run_command 拿到
+        新鲜全文——所以这是「可再生信息」的安全删除，不影响判断。写操作回执/评估结论
+        这类工具（不在 _REGENERABLE_TOOLS）一律不动。置 TOOL_RESULT_SHRINK_CHARS=0 关闭。
+        """
+        if TOOL_RESULT_SHRINK_CHARS <= 0:
+            return messages
+        # 压力门控：宽松时原样返回（已经削过的存根保持不变，幂等，不会来回抖动）
+        window = int(getattr(self.llm, "context_window", 0) or 0) or DEFAULT_CONTEXT_WINDOW
+        budget = int(window * BUDGET_RATIO)
+        est = sum(message_tokens(m) for m in messages) + tools_tokens(self.tools)
+        target = int(budget * TOOL_RESULT_SHRINK_PRESSURE)
+        if est <= target:
+            return messages
+        # tool_call_id → 工具名（由 assistant.tool_calls 反查）；最近一轮（最后一个带
+        # tool_calls 的 assistant 及其后的 tool 结果）保留原文，其余才降级。
+        name_by_id: dict[str, str] = {}
+        last_unit_start = len(messages)
+        for i in range(len(messages) - 1, -1, -1):
+            m = messages[i]
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                last_unit_start = i
+                break
+        out = list(messages)
+        changed = False
+        keep = max(0, TOOL_RESULT_SHRINK_KEEP)
+        for i, m in enumerate(out):
+            role = m.get("role")
+            if role == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    tid = str((tc or {}).get("id") or "")
+                    if tid:
+                        name_by_id[tid] = str((tc or {}).get("name") or "")
+                continue
+            if role != "tool" or i >= last_unit_start:
+                continue
+            # 削到预算以下就收手：越靠后（越新）的内容越有用，不该跟着一起削
+            if est <= target:
+                break
+            tool_name = name_by_id.get(str(m.get("tool_call_id") or ""), "")
+            if tool_name not in _REGENERABLE_TOOLS:
+                continue
+            content = m.get("content")
+            if not isinstance(content, str) or len(content) <= TOOL_RESULT_SHRINK_CHARS:
+                continue
+            if content.startswith(_SHRUNK_MARK):
+                continue
+            stub = (f"{_SHRUNK_MARK}{tool_name} 的完整结果共 {len(content)} 字符已省略"
+                    f"（保留前 {keep} 字符）。若关键信息已在上面看到，**不要整读一遍重来**，"
+                    f"只按需用 offset/limit 精读缺失那一段。\n"
+                    f"---- 前缀 ----\n{content[:keep]}")
+            out[i] = {**m, "content": stub}
+            # 估算同步下调（按字符数近似：中文约 1 token/字，英文约 4 字符/token，
+            # 这里只用于「够了就停」的相对判断，不需要精确）
+            est -= max(1, (len(content) - len(stub)) // 2)
+            changed = True
+        return out if changed else messages
+
     async def _compact(self, messages: list[dict]) -> list[dict]:
         """把整条历史压进模型窗口，并把压缩结果**写回** messages。
 
@@ -547,13 +664,27 @@ class AgentRuntime:
         并给轨迹发一条 context_compacted 事件（前端「已压缩上下文」分隔行）。
         """
         window = int(getattr(self.llm, "context_window", 0) or 0) or DEFAULT_CONTEXT_WINDOW
-        rep: dict = {}
+        # 触发口径与 compress_messages 一致：下一轮待发请求的估算（含每轮重发的工具定义）
+        est_now = sum(message_tokens(m) for m in messages) + tools_tokens(self.tools)
+        budget_now = int(window * BUDGET_RATIO)
         self._compact_noted = False  # 新一次压缩周期：允许再发一条「正在压缩」进度提示
+        if est_now > budget_now:
+            # 触发即报数：用户只在轨迹看到「上下文压缩处理中」，对着顶栏的「最近一次输入」
+            # 想不通为什么压缩。其实触发看的是**待发**估算——上一轮之后新增的工具结果
+            # （大文件读取/命令输出）可能一下子把估算顶过线。两个数都亮出来。
+            self._compact_noted = True  # 带数字的提示已发，摘要器里那条通用提示就不重复了
+            k = lambda n: f"{n / 1000:.1f}k" if n >= 1000 else str(n)  # noqa: E731
+            prev = int(self._last_prompt_tokens or 0)
+            self._emit("status", {"status": "running", "note":
+                f"本轮待发上下文估算 {k(est_now)} tok，超过预算线 {k(budget_now)}"
+                f"（窗口 {k(window)}）→ 正在压缩较早历史（这一步要调一次模型，稍候）"
+                + (f"；上一轮端点实报 {k(prev)} tok，差额来自上一轮之后新增的内容" if prev else "")})
         # 整次压缩（含所有分块摘要调用）的墙钟截止：超出就停止再调模型，用已生成的
         # 摘要 + 要点节选兜底——压缩这一步本身不能变成几分钟的假死。
         import time as _time
         from game_agent.config import LLM_SUMMARY_CYCLE_BUDGET_S
         self._compact_deadline = _time.monotonic() + LLM_SUMMARY_CYCLE_BUDGET_S
+        rep: dict = {}
         try:
             out = await compress_messages(messages, window, self._make_summarizer(),
                                           rep, tools=self.tools,
@@ -568,6 +699,9 @@ class AgentRuntime:
         if rep.get("compressed"):
             self._emit("context_compacted", {
                 "agent_key": self.role, "round": int(self.ctx.llm_round or 0),
+                # 上一轮端点实报的输入规模：触发看的是待发估算，两者差多少就是
+                # 「上一轮之后新增内容」的量级——这是「莫名其妙压缩」的答案
+                "prev_prompt_tokens": int(self._last_prompt_tokens or 0),
                 "merged_msgs": int(rep.get("dropped") or 0),
                 "merged_tokens": int(rep.get("dropped_tokens") or 0),
                 "digest_tokens": int(rep.get("digest_tokens") or 0),
@@ -576,6 +710,9 @@ class AgentRuntime:
                 "after": int(rep.get("est_tokens") or 0),
                 "window": int(rep.get("window") or window),
                 "budget": int(rep.get("budget") or 0),
+                # 档位没配窗口时压缩用的是 DEFAULT_CONTEXT_WINDOW：前端据此提示
+                # 「窗口按默认值」——否则用户看到 49.7k 就压缩，会以为没到阈值
+                "window_default": not bool(int(getattr(self.llm, "context_window", 0) or 0)),
                 # 摘要质量与覆盖面：merged_tokens 大而 summarized_chars 小 = 又有历史没进摘要器
                 "digest_ok": bool(rep.get("digest_ok")),
                 "chunks": int(rep.get("chunks") or 0),
@@ -622,6 +759,33 @@ class AgentRuntime:
             "delay_ms": int(delay_s * 1000), "error": str(error)[:300],
         })
 
+    def _on_adapter_compacted(self, report: dict, source: str) -> None:
+        """适配层压缩了历史（写入回调用方的 messages 后）发轨迹事件。
+
+        source='endpoint_overflow'：端点拒收（HTTP 400 超长）后按半预算重压——
+        说明端点的实际上限比配置的窗口小，轨迹必须明说，否则用户对着顶栏
+        「上下文 21%」想不通为什么在压缩。source='pre_send'：发送前估算超预算
+        （runtime._compact 没压住时适配层兜底，少见）。
+        """
+        if not report.get("compressed"):
+            return
+        self._emit("context_compacted", {
+            "agent_key": self.role, "round": int(self.ctx.llm_round or 0),
+            "source": source,
+            "overflow_error": str(report.get("overflow_error") or ""),
+            "merged_msgs": int(report.get("dropped") or 0),
+            "merged_tokens": int(report.get("dropped_tokens") or 0),
+            "digest_tokens": int(report.get("digest_tokens") or 0),
+            "before": int(report.get("est_before") or report.get("est_tokens") or 0),
+            "after": int(report.get("est_tokens") or 0),
+            "window": int(report.get("window") or 0),
+            "budget": int(report.get("budget") or 0),
+            "window_default": not bool(int(getattr(self.llm, "context_window", 0) or 0)),
+            "digest_ok": bool(report.get("digest_ok")),
+            "chunks": int(report.get("chunks") or 0),
+            "prev_prompt_tokens": int(self._last_prompt_tokens or 0),
+        })
+
     def _emit(self, kind: str, payload: dict, ephemeral: bool = False) -> None:  # type: ignore[no-untyped-def]
         from game_agent.core.abstractions import EventEnvelope
         rc = self.tctx.run_ctx
@@ -634,10 +798,12 @@ class AgentRuntime:
             log.exception("emit event failed: %s", kind)
 
     async def _post_stage_report(self, text: str, *, round_no: int, open_count: int) -> None:
-        """把一段「阶段汇报」落成会话里的一条 agent 消息（聊天流按完整 Markdown 渲染）。
+        """把模型中途同步的一段「进度」落成会话里的一条 agent 消息（聊天流按完整 Markdown 渲染）。
 
-        与最终汇报（orchestrator._post_reply）的区别：这里带 `meta.kind=stage_report`，
-        前端据此把它调成与最终汇报不同的外观、并标明「还有 N 项没做完，继续执行」，
+        口径：这**不是**一份格式化的汇报，就是让用户知道「现在做到哪一步了」——正文是
+        模型自己写的一两句口语化进度，前端标成「进度」并注明还有几项没做完。
+        与最终汇报（orchestrator._post_reply）的区别：这里带 `meta.kind=stage_report`
+        （沿用旧键，老数据不用迁移），前端据此调成更淡的外观，
         同时**不接管该 run 的执行轨迹宿主**（轨迹仍挂在最后那条收尾消息上）。
         失败只记日志、绝不打断本 run 的继续执行。
         """
@@ -659,7 +825,100 @@ class AgentRuntime:
                          "author_type": "agent", "kind": "stage_report"},
             ))
         except Exception:  # noqa: BLE001 - 落消息失败不影响主流程
-            log.exception("写入阶段汇报消息失败", extra={"run_id": rc.run_id})
+            log.exception("写入中途进度消息失败", extra={"run_id": rc.run_id})
+
+    async def _post_interim_reply(self, text: str) -> None:
+        """把运行中的一段临时答复落进聊天流（meta.kind=interim_reply）。
+
+        场景：spawn_agents 改为后台派发后，主agent 在等子agent 回收时仍会正常跑 LLM
+        轮次。它对用户插话的回应、或者「已派出、等结论」这类说明，如果只留在内部
+        消息里，用户在聊天流里什么都看不到（正是「主agent 没去处理」的观感）。
+        这里落成一条**不接管轨迹宿主**的临时消息，前端标成「执行中 · 临时回复」。
+        失败只记日志，绝不打断执行。
+        """
+        rc = self.tctx.run_ctx
+        body = (text or "").strip()
+        if not rc.session_id or not body or body == self._last_interim_text:
+            return
+        self._last_interim_text = body
+        try:
+            msg = await rc.repo.create_message(
+                session_id=rc.session_id, run_id=rc.run_id,
+                author_type="agent", author_id=None, agent_key=self.role,
+                content=body[:8000], meta_json={"kind": "interim_reply"})
+            from game_agent.core.abstractions import EventEnvelope
+            await rc.bus.emit(EventEnvelope(
+                team_id=rc.team_id, project_id=rc.project_id, run_id=rc.run_id,
+                task_id=self.tctx.task_id, type="message_new",
+                payload={"session_id": str(rc.session_id), "message_id": str(msg.id),
+                         "author_type": "agent", "kind": "interim_reply"},
+            ))
+        except Exception:  # noqa: BLE001 - 落消息失败不影响主流程
+            log.exception("写入临时回复消息失败", extra={"run_id": rc.run_id})
+
+    # ---------- 后台子agent 批次（spawn_agents 派发即返回） ----------
+
+    def _pending_spawns(self) -> list:  # type: ignore[no-untyped-def]
+        """还没回收完的子agent 批次。"""
+        return [b for b in getattr(self.tctx, "spawn_batches", []) if not b.ready()]
+
+    async def _harvest_spawns(self, messages: list) -> None:  # type: ignore[no-untyped-def]
+        """把已回收批次的结论作为一条 user 消息注入对话，供模型汇总进最终答复。"""
+        batches = list(getattr(self.tctx, "spawn_batches", []))
+        if not batches:
+            return
+        ready = [b for b in batches if b.ready()]
+        if not ready:
+            return
+        self.tctx.spawn_batches = [b for b in batches if not b.ready()]
+        for b in ready:
+            log.info("spawn batch harvested (%s subagents)", len(b.tasks),
+                     extra={"run_id": str(self.tctx.run_ctx.run_id)})
+            self._emit("status", {"status": "running",
+                                  "note": f"{len(b.tasks)} 个只读子agent 已回收，结论已送达"})
+            messages.append({"role": "user", "content": (
+                "（系统提示）你派出的只读子agent 已全部回收，结论如下。"
+                "请把它们汇总进你的答复（这是它们的核对结果，不是用户的新要求）：\n\n"
+                + b.aggregate())})
+
+    async def _wait_spawns(self, messages: list, *, wake_on_steer: bool) -> bool:  # type: ignore[no-untyped-def]
+        """等后台子agent 批次回收；期间把用户插话并入对话。
+
+        返回 True = 收到了插话并提前返回（主循环马上跑一轮处理它），False = 批次已全部回收。
+        为什么不直接 await：子agent 可能跑十几分钟，用户在这期间插话必须能被主agent
+        立刻看到（用户 2026-11-12 实测：「主agent 还是没有去处理」）。
+        """
+        rc = self.tctx.run_ctx
+        started = time.monotonic()
+        last_beat = 0.0
+        got_steer = False
+        while True:
+            notes = steering.drain(str(rc.run_id))
+            if notes:
+                for note in notes:
+                    self._emit("status", {"status": "running", "note":
+                                          "收到你的插话，已并入当前执行"})
+                    messages.append(_steer_message(note))
+                got_steer = True
+                if wake_on_steer:
+                    return True
+            pending = self._pending_spawns()
+            if not pending:
+                return got_steer
+            left = sum(len(b.tasks) for b in pending)
+            waited = int(time.monotonic() - started)
+            if waited - last_beat >= 9:
+                last_beat = waited
+                self._emit("status", {
+                    "status": "running",
+                    "note": f"还有 {left} 个子agent 在后台跑，等它们回收（已等待 {waited} 秒）…",
+                    "waiting": True, "waited": waited, "agent_key": self.role},
+                    ephemeral=True)
+            tasks = [t_ for b in pending for t_ in b.tasks if not t_.done()]
+            if not tasks:
+                continue
+            await asyncio.wait(tasks, timeout=1.5,
+                               return_when=asyncio.FIRST_COMPLETED)
 
     async def _assert_fencing(self) -> None:
         f = self.tctx.run_ctx.fencing
@@ -696,15 +955,20 @@ class AgentRuntime:
         if orch is None:
             return
         pkey = note.get("profile_key") or None
-        effort = (note.get("effort") or "").strip()
+        # user_effort = 用户这次手点选的强度（会写回 meta 传给子agent）；
+        # effort = 本轮真正下发的强度（可能来自角色默认，那就只影响主agent）。
+        user_effort = (note.get("effort") or "").strip()
+        effort = user_effort
         rc = self.tctx.run_ctx
         try:
             if pkey:
                 profile = await orch._load_profile(rc.team_id, pkey)
             else:
-                # 空串=回到「跟随角色绑定默认」
-                profile = await orch._load_profile(
-                    rc.team_id, await orch._agent_profile_key(rc.team_id, self.role))
+                # 空串=回到「跟随角色绑定默认」：推理强度也一起回角色默认（设置→智能体），
+                # 否则切回默认后仍沿用别处的强度，和设置页显示的「默认模型」不一致。
+                def_key, def_effort = await orch._agent_defaults(rc.team_id, self.role)
+                profile = await orch._load_profile(rc.team_id, def_key)
+                effort = user_effort or def_effort
             if effort:
                 profile = {**profile,
                            "params": {**(profile.get("params") or {}),
@@ -712,9 +976,24 @@ class AgentRuntime:
             self.ctx.model_profile = profile
             self.ctx.model = profile.get("model") or self.ctx.model
             self.llm = build_llm(self.role, self.ctx)
+            self._bind_llm_session()
+            # 写回 run_ctx.meta：spawn_agents 派生子agent 时用 meta 里的 model_profile_key
+            # 重新解析档位（orchestrator._resolve_profile_key）。不写回的话，切换后新派出的
+            # 子agent 仍拿旧档位——用户看到「下一个思考还是旧模型」就是这么来的。
+            # 强度只写「用户手点的那一个」：角色默认强度不该变成整轮覆盖，否则子agent
+            # 也被拉高（它们的默认是 GA_SUB_REASONING_EFFORT=none，省 token）。
+            if isinstance(rc.meta, dict):
+                if pkey:
+                    rc.meta["model_profile_key"] = pkey
+                else:
+                    rc.meta.pop("model_profile_key", None)
+                if user_effort:
+                    rc.meta["reasoning_effort"] = user_effort
+                else:
+                    rc.meta.pop("reasoning_effort", None)
             label = profile.get("model") or "角色默认模型"
             self._emit("status", {"status": "running",
-                                  "note": f"已切换模型 → {label}（本轮后续对话生效）"})
+                                  "note": f"已切换模型 → {label}（下一个思考轮次生效）"})
             log.info("runtime model switched", extra={"run_id": rc.run_id, "role": self.role,
                                                       "model": self.ctx.model,
                                                       "effort": effort or None})
@@ -933,6 +1212,9 @@ class AgentRuntime:
         界面上轨迹一动不动，用户就以为「卡死了」。心跳会在「模型处理中，已等待 N 秒…」
         里报出已等待时长，让人知道它还在跑。心跳只走 WS（ephemeral），不落库、不刷屏；
         只要有真实的思考增量在流，就不额外发（避免和思考流重复）。调用一结束立即停。
+
+        N = 距上一次增量的静默时长，不是本轮调用的累计时长（那会把「流式吐了
+        140 秒 + 最近静默 16 秒」误报成「已等待 156 秒」，用户实测确实这么理解错了）。
         """
         start = time.monotonic()
         state = {"last": start}
@@ -953,12 +1235,18 @@ class AgentRuntime:
                     return
                 except asyncio.TimeoutError:
                     pass
-                if time.monotonic() - state["last"] < 8:
+                idle = time.monotonic() - state["last"]
+                if idle < 8:
                     continue
-                waited = int(time.monotonic() - start)
+                waited = int(idle)
+                # agent_key/waited 必须带上：主agent 与 5 个子agent 各发各的心跳，
+                # 前端以前不区分是谁，几路「已等待 N 秒」交替顶同一个提示行 →
+                # 界面上那行字一直跳（用户实测）。带上身份后，主agent 的显示在轨迹头/尾，
+                # 子agent 的显示在各自那一行。
                 self._emit("status", {"status": "running",
                                       "note": f"{label}处理中，已等待 {waited} 秒…",
-                                      "waiting": True}, ephemeral=True)
+                                      "waiting": True, "waited": waited,
+                                      "agent_key": self.role}, ephemeral=True)
 
         # 只在调用方明确收紧预算时才传这两个参数：老实现/测试替身没有它们时也能照常跑，
         # 不会因为多了两个 None 关键字参数抛 TypeError。
@@ -1018,6 +1306,11 @@ class AgentRuntime:
         """
         rc = self.tctx.run_ctx
         try:
+            if purpose == "agent":
+                # 上一轮端点实报的输入规模：压缩事件的「上一轮实报」用它——
+                # 压缩触发看的是下一轮待发请求的估算（含新产生的工具结果），
+                # 可能比上一轮实报大很多，事件里两个数都给才能解释「为什么压缩」。
+                self._last_prompt_tokens = int(resp.usage.get("prompt_tokens", 0) or 0)
             repo = rc.repo
             await repo.record_usage(
                 team_id=rc.team_id, run_id=rc.run_id, agent_key=self.role,
@@ -1033,6 +1326,8 @@ class AgentRuntime:
                     cached_tokens=int(resp.usage.get("cached_tokens", 0)),
                     cache_reported=1 if resp.usage.get("cache_reported") else 0,
                     latency_ms=int(resp.latency_ms),
+                    # 首 token 耗时：用户「点了发送干等多久」的实测值（非流式端点记 0）
+                    ttft_ms=int(getattr(resp, "ttft_ms", 0) or 0),
                     purpose=purpose,
                     # 与 llm_transcripts.call_id 对齐：计数行和大字段行说的是同一次往返
                     **({"call_id": resp.trace_id} if resp.trace_id else {}),
@@ -1074,12 +1369,13 @@ class AgentRuntime:
                              "cached_tokens": 0, "latency_ms": 0}
         recent_sigs: list[str] = []  # 工具调用签名（工具+参数），用于死循环检测
         plan_nudges = 0  # 已就「活没做完就交卷」打回几次（上限 MAX_PLAN_NUDGES）
-        stage_reports = 0  # 清单未完成时连续遇到的「阶段汇报」次数（超过 MAX_PLAN_NUDGES 就当最终收尾）
+        stage_reports = 0  # 清单未完成时连续遇到的「中途进度」次数（超过 MAX_PLAN_NUDGES 就当最终收尾）
         empty_nudges = 0  # 本段执行里「模型只吐思考、不吐正文」已重问几次（上限 MAX_EMPTY_NUDGES）
         explore_calls = 0  # 自上次改产品代码以来，累计的只读/探针调用次数
         explore_brakes = 0  # 已发过几次「只排查不动手」刹车
         probe_rounds = 0   # 连续几次往返只读不落地（D 收敛守卫，创建/生成类任务）
         probe_nudges = 0   # 这段「没落地」期间已催过几次
+        plan_committed = False  # 模型自己立过待办清单（= 它自己说「这些我要做」）
         view_rounds = 0    # 连续几轮只在看图（看图不落字守卫）
         view_nudges = 0    # 这段看图期间已催过几次写结论
         arg_retries = 0    # 工具参数 JSON 没解析出来、已要求换写法重做几次
@@ -1087,6 +1383,9 @@ class AgentRuntime:
         self.ctx.on_llm_request = self._record_transcript
         for rnd in itertools.count():
             self.ctx.llm_round = rnd
+            # 推理强度覆盖先清空：摘要压缩（_compact 内部）与收尾调用都按默认档位，
+            # 只有下面真正的主对话轮次才按「长 run 后段」策略降档。
+            self.ctx.reasoning_effort_override = ""
             await self._assert_fencing()
             await self._check_cancel()
             # 运行中切换模型：用户在执行中改了模型选择 → 下一轮 LLM 调用换新档位。
@@ -1097,6 +1396,9 @@ class AgentRuntime:
                 # 顺序保证同一次请求里「关掉出图 + 切模型 + 插话」都按新约束生效。
                 await self._apply_settings()
                 await self._apply_model_switch()
+                # 后台子agent 批次回收：派发即返回，结论在这里补进对话（作为 user 消息），
+                # 让模型下一步就能汇总/继续——不阻塞主agent 处理插话和其他工作。
+                await self._harvest_spawns(messages)
                 # 用户插话：不取消当前执行，只是把这句话并入这一轮的上下文（模型接着做，不重来）
                 for note in steering.drain(str(self.tctx.run_ctx.run_id)):
                     imgs = list(note.get("images") or [])
@@ -1104,11 +1406,23 @@ class AgentRuntime:
                                           (f"收到你的插话（含图 {len(imgs)} 张），已并入当前执行"
                                            if imgs else "收到你的插话，已并入当前执行")})
                     messages.append(_steer_message(note))
+            else:
+                # 子agent：只取「主agent 判定该派给它」的那部分插话（按 task_id 单独一条信箱，
+                # 绝不抢主agent 的插话邮箱）。有就并入当前这轮只读核对的上下文，接着查。
+                for note in steering.drain_task(str(self.tctx.task_id)):
+                    self._emit("status", {"status": "running", "note":
+                                          "收到新的补充要求，已并入当前核对"})
+                    messages.append(_steer_message(note))
             # system 消息按当前（可能刚被运行选项改过的）约束重建：能力提示/权限提示换了新块，
             # 这一轮就要让模型看到，否则它仍按旧的「不做什么/只能碰哪」行事。
             messages[0] = {"role": "system", "content": self._assemble_sys_prompt()}
+            # 旧工具结果降级（可再生信息，不影响判断）：在压缩之前先把上一轮之前的
+            # read_file/run_command 等大结果换成存根，降低每轮重发量、也少触发摘要压缩。
+            messages = self._shrink_old_tool_results(messages)
             # 全局压缩：把较早的历史合并成摘要、结果写回历史，下一轮从「摘要 + 最近原文」继续
             messages = await self._compact(messages)
+            # 长 run 后段降档：只对本次主对话轮次生效（压缩/收尾仍用默认档位）。
+            self.ctx.reasoning_effort_override = self._round_effort_override(rnd)
             resp: LLMResponse = await self._chat_with_heartbeat(
                 messages, self.tools, label="模型",
                 on_delta=self._make_thinking_streamer(rnd),
@@ -1125,6 +1439,15 @@ class AgentRuntime:
             if resp.text:
                 self._emit("agent_message", {"agent_key": self.role, "text": resp.text})
             if not resp.tool_calls:
+                # 还有后台子agent 没回收：这不是「交卷」，是「等结果」。先把这段正文作为
+                # 临时回复落进聊天流（用户插话后尤其需要立刻看到主agent 的回应），再等
+                # 批次回收；等待期间插话到达会立刻唤醒，继续跑一轮正常处理。
+                if self.role == "main" and self._pending_spawns():
+                    if (resp.text or "").strip():
+                        messages.append({"role": "assistant", "content": resp.text})
+                        await self._post_interim_reply(resp.text)
+                    await self._wait_spawns(messages, wake_on_steer=True)
+                    continue
                 # 空回复、或正文里仍残留没解析成功的调用协议（工具名不在白名单/参数畸形）：
                 # 端点把调用吞了。以前直接 return → run 静默「成功」，界面上就是模型把
                 # <｜｜DSML｜｜invoke ...> 当回复吐出来然后停住、用户拿不到任何结果。重问一次。
@@ -1223,12 +1546,42 @@ class AgentRuntime:
                                                    "tool": tc.name, "result": text[:2000],
                                                    "duration_ms": int((time.monotonic() - _t0) * 1000)})
                         return text
+                    # 同 run 内完全相同的只读调用：直接复用上次结果，不再真跑一遍。
+                    # 实测 15% 的轮次里存在这种重复（同文件重复整读、同 pattern 重复 grep），
+                    # 每次几百毫秒到几秒，而且重复结果再塞一遍上下文会把后续每轮都撑大。
+                    memo_key = (tc.name, _memo_sig(tc.arguments))
+                    if (TOOL_MEMO_ENABLED and tc.name in _REGENERABLE_TOOLS
+                            and memo_key in self._tool_memo):
+                        text = ("（同 run 内你已经用完全相同的参数调用过 "
+                                f"{tc.name}，下面直接给上次的结果，本次未重新执行；"
+                                "没有新信息的话不要再重复，换个参数或直接用已有结论推进。）\n"
+                                + self._tool_memo[memo_key])
+                        self._emit("tool_result", {"agent_key": self.role, "round": rnd,
+                                                   "tool": tc.name, "result": text[:2000],
+                                                   "duration_ms": 0, "memo_hit": True})
+                        return text
                     # 硬超时兜底（「无进展」语义）：工具内部各有自己的单张时限（命令 300s /
                     # 出图 600s / TTS 600s）。批量出图/配音会一张张出、每出一张推进
                     # t.progress_seq；execute_tool_with_timeout 只在「连续这么久毫无进展」
                     # 时才中止，所以十几张正常出图不会被整批误杀，只有真挂死才收。
+                    # spawn_agents 例外：它自己不产 progress，等待的是若干子agent 各自跑
+                    # LLM/工具，单条子任务跑十几分钟是合法的（2026-11-11 run 54fbf901：
+                    # 5 个子agent 已完成，第 6 个查了 14 分钟，900s 把整批掐断 → 主agent
+                    # 一份子agent 结论都没收到）。子agent 自己的 LLM 单次超时/工具看门狗
+                    # 仍在，这里不再加整批墙钟。
+                    _timeout = None if tc.name == "spawn_agents" else TOOL_HARD_TIMEOUT_S
                     result = await execute_tool_with_timeout(
-                        tc.name, tc.arguments, self.tctx, TOOL_HARD_TIMEOUT_S)
+                        tc.name, tc.arguments, self.tctx, _timeout)
+                    # 缓存/作废：只读工具的结果可复用；写/执行类工具动过工作区，
+                    # 之前读到的内容一律作废（否则「改完再读还是旧内容」是最难查的坑）。
+                    if TOOL_MEMO_ENABLED:
+                        _txt = result.text if isinstance(result, ToolResult) else str(result)
+                        if tc.name in _REGENERABLE_TOOLS:
+                            if (len(_txt) <= _TOOL_MEMO_MAX_CHARS
+                                    and len(self._tool_memo) < TOOL_MEMO_MAX_ENTRIES):
+                                self._tool_memo[memo_key] = _txt
+                        elif tc.name != "spawn_agents":
+                            self._tool_memo.clear()
                     # 谁先跑完谁先落 tool_result 事件。以前是整批 gather 完才统一发：
                     # 同一轮里「查看目录」（毫秒）和「派发美术」（几分钟）并行时，前者明明早完了
                     # 却在轨迹上一直挂「执行中…」（任务一停，那两条结果就永远没记录，用户实测困惑）。
@@ -1278,68 +1631,107 @@ class AgentRuntime:
             # 收尾优先用 _summaries 里这段较早的汇报当 final_summary，后面做的事根本没被
             # 写进总结。现在把汇报当成交卷信号：
             #   · 清单已无未完成项 → 直接以这段汇报结束本轮（或交给 _final_text 兜底）；
-            #   · 清单还挂着未完成项 → 退化为「阶段汇报」，提示它继续做，做完再汇报一次。
-            if self.role == "main":
-                reported = next(
-                    (tc for tc in resp.tool_calls if tc.name == "report_to_user"), None)
-                if reported is not None:
-                    # 工具层的失败结果不会被当成汇报：只有「已汇报给用户」才算数
-                    rep_text = ""
-                    for tc, r in zip(all_calls, all_results):
-                        if tc is reported:
-                            rep_text = (r.text if isinstance(r, ToolResult) else str(r))
-                    ok = rep_text.startswith("已汇报")
-                    if ok:
-                        open_items = await self._open_plan_items() \
-                            if "update_plan" in self.whitelist else []
-                        if open_items and stage_reports < MAX_PLAN_NUDGES:
-                            stage_reports += 1
-                            listed = "；".join(
-                                f"{i}. {str(it.get('content') or '')[:40]}"
-                                for i, it in enumerate(open_items, 1))[:600]
-                            log.info("stage report with %s open plan items, continue",
-                                     len(open_items),
-                                     extra={"run_id": str(self.tctx.run_ctx.run_id)})
-                            # 阶段汇报也要像最终汇报那样在会话流里出一份完整的 Markdown 报告
-                            # （此前只在轨迹里留一行被截断的纯文本，用户看不到排版后的正文）。
-                            # 正文取自本次 report_to_user 入参的 report 字段，落成一条带
-                            # meta.kind=stage_report 的 agent 消息；前端照常 Markdown 渲染。
-                            stage_body = ""
-                            try:
-                                a = reported.arguments or {}
-                                if isinstance(a, str):
-                                    a = json.loads(a)
-                                stage_body = str(a.get("report") or "")
-                            except Exception:  # noqa: BLE001 - 取不到正文就跳过落消息
-                                stage_body = ""
-                            if stage_body.strip():
-                                await self._post_stage_report(
-                                    stage_body, round_no=rnd,
-                                    open_count=len(open_items))
-                            self._emit("status", {"status": "running",
-                                                  "note": f"这是阶段汇报，清单还有 {len(open_items)} 项没做完，继续执行"})
-                            messages.append({"role": "user", "content":
-                                _NUDGE_STAGE_REPORT.format(n=len(open_items), items=listed)})
-                            continue
-                        # 清单已完成（或预算用尽）→ 以这段汇报作为本轮最终结论收尾。
-                        # 注意不能用工具回执「已汇报给用户。」当正文——那是工具的应答，
-                        # 真正写给用户的汇报正文在工具入参 report 里（orchestrator 也已存进
-                        # _summaries）。这里取回来当 AgentResult.text，_prefer_summary 才会
-                        # 直接用它当 final_summary（而不是被那句回执顶掉）。
+            #   · 清单还挂着未完成项 → 只是「中途进度」：落一条进度消息，提示它继续做，做完再汇报一次。
+            # 子agent 同理：它调 report_to_user 就是「把结论交给主agent」的交付动作，
+            # 收到就结束（否则它汇报完还会继续查，主agent 等更久、结论也可能被后面的
+            # 空收尾覆盖）。子agent 没有待办清单，不存在中途进度分支。
+            reported = next(
+                (tc for tc in resp.tool_calls if tc.name == "report_to_user"), None)
+            if reported is not None:
+                rep_text = ""
+                for tc, r in zip(all_calls, all_results):
+                    if tc is reported:
+                        rep_text = (r.text if isinstance(r, ToolResult) else str(r))
+                ok = rep_text.startswith("已汇报")
+                if ok and self.role == "sub":
+                    report_body = ""
+                    try:
+                        a = reported.arguments or {}
+                        if isinstance(a, str):
+                            a = json.loads(a)
+                        report_body = str(a.get("report") or "")
+                    except Exception:  # noqa: BLE001 - 取不到正文就退回模型文字
                         report_body = ""
+                    final_text, fallback = self._final_text(report_body or resp.text)
+                    log.info("subagent finalized by report_to_user",
+                             extra={"run_id": str(self.tctx.run_ctx.run_id)})
+                    return AgentResult(text=final_text, usage=total_usage,
+                                       fallback=fallback)
+                if ok and self.role == "main":
+                    # 工具层的失败结果不会被当成汇报：只有「已汇报给用户」才算数
+                    pending = self._pending_spawns()
+                    if pending:
+                        # 子agent 还没回来：这份汇报只能是阶段性的（结论都不齐，不能当交付）。
+                        # 落成临时回复让用户马上看到，然后继续等回收，回收后再写最终总结。
+                        left = sum(len(b.tasks) for b in pending)
+                        interim_body = ""
                         try:
                             a = reported.arguments or {}
                             if isinstance(a, str):
                                 a = json.loads(a)
-                            report_body = str(a.get("report") or "")
-                        except Exception:  # noqa: BLE001 - 取不到正文就退回模型文字
-                            report_body = ""
-                        final_text, fallback = self._final_text(report_body or resp.text)
-                        log.info("run finalized by report_to_user (open_plan=%s)",
+                            interim_body = str(a.get("report") or "")
+                        except Exception:  # noqa: BLE001 - 取不到正文就跳过落消息
+                            interim_body = ""
+                        if interim_body.strip():
+                            await self._post_interim_reply(interim_body)
+                        self._emit("status", {"status": "running",
+                                              "note": f"还有 {left} 个子agent 在跑，"
+                                                      "这份汇报先作为临时答复，回收后一并总结"})
+                        messages.append({"role": "user", "content": (
+                            f"（系统提示）你还有 {left} 个子agent 在后台核对，结论还没回来。"
+                            "刚才那段汇报已作为临时答复发给用户；等子agent 回收后再把它们的"
+                            "结论汇总成最终答复（现在先继续等或处理别的事）。")})
+                        continue
+                    open_items = await self._open_plan_items() \
+                        if "update_plan" in self.whitelist else []
+                    if open_items and stage_reports < MAX_PLAN_NUDGES:
+                        stage_reports += 1
+                        listed = "；".join(
+                            f"{i}. {str(it.get('content') or '')[:40]}"
+                            for i, it in enumerate(open_items, 1))[:600]
+                        log.info("stage report with %s open plan items, continue",
                                  len(open_items),
                                  extra={"run_id": str(self.tctx.run_ctx.run_id)})
-                        return AgentResult(text=final_text, usage=total_usage,
-                                           fallback=fallback)
+                        # 中途进度也要像最终汇报那样在会话流里出一份完整正文
+                        # （此前只在轨迹里留一行被截断的纯文本，用户看不到排版后的内容）。
+                        # 正文取自本次 report_to_user 入参的 report 字段，落成一条带
+                        # meta.kind=stage_report（沿用旧键）的 agent 消息；前端标成「进度」。
+                        stage_body = ""
+                        try:
+                            a = reported.arguments or {}
+                            if isinstance(a, str):
+                                a = json.loads(a)
+                            stage_body = str(a.get("report") or "")
+                        except Exception:  # noqa: BLE001 - 取不到正文就跳过落消息
+                            stage_body = ""
+                        if stage_body.strip():
+                            await self._post_stage_report(
+                                stage_body, round_no=rnd,
+                                open_count=len(open_items))
+                        self._emit("status", {"status": "running",
+                                              "note": f"这是中途进度，清单还有 {len(open_items)} 项没做完，继续执行"})
+                        messages.append({"role": "user", "content":
+                            _NUDGE_STAGE_REPORT.format(n=len(open_items), items=listed)})
+                        continue
+                    # 清单已完成（或预算用尽）→ 以这段汇报作为本轮最终结论收尾。
+                    # 注意不能用工具回执「已汇报给用户。」当正文——那是工具的应答，
+                    # 真正写给用户的汇报正文在工具入参 report 里（orchestrator 也已存进
+                    # _summaries）。这里取回来当 AgentResult.text，_prefer_summary 才会
+                    # 直接用它当 final_summary（而不是被那句回执顶掉）。
+                    report_body = ""
+                    try:
+                        a = reported.arguments or {}
+                        if isinstance(a, str):
+                            a = json.loads(a)
+                        report_body = str(a.get("report") or "")
+                    except Exception:  # noqa: BLE001 - 取不到正文就退回模型文字
+                        report_body = ""
+                    final_text, fallback = self._final_text(report_body or resp.text)
+                    log.info("run finalized by report_to_user (open_plan=%s)",
+                             len(open_items),
+                             extra={"run_id": str(self.tctx.run_ctx.run_id)})
+                    return AgentResult(text=final_text, usage=total_usage,
+                                       fallback=fallback)
             # 死循环检测：同一「工具+参数」连续出现 3 次 → 掐停收尾。
             # 有进展的长任务（每次调用都不同）不受影响，这是唯一的次数相关止损。
             # 参数解析失败的调用**不计入签名**：它们参数是空 {}，连续几次都长得一模一样，
@@ -1372,6 +1764,11 @@ class AgentRuntime:
                     "请停止重试，基于已有信息如实给出当前结论，并说明哪部分还没落盘。"})
                 break
             arg_retries = 0  # 这一轮参数都正常：把截断重试额度清零（长任务里偶发两次不该累计）
+            # 本轮模型立/更新了待办清单 → 记下「它自己承诺过要做这些」。
+            # 下面的过程守卫只在这个前提下才催它落地，避免系统替无关任务拍板。
+            if any(tc.name == "update_plan" and not tc.arguments_error
+                   for tc in resp.tool_calls):
+                plan_committed = True
             for tc in resp.tool_calls:
                 if tc.arguments_error:  # 混合轮里的坏调用：不参与死循环签名
                     continue
@@ -1386,10 +1783,18 @@ class AgentRuntime:
                     "请停止重复，换一种方法，或基于已有信息直接给出最终结论。"})
                 break
             # 「只排查不动手」刹车：只看代码/写探针脚本不算进展。见 EXPLORE_BRAKE_AT 注释。
-            # analyze 模式用户明确只要分析，不该被逼着改代码；出图/配音/跑批也不是修 bug。
+            # 2026-11-14 起不再按系统预判的意图开关它，但**只在模型自己立过清单时**才催：
+            # 清单是模型自己写下的「我要做这些」，一直只看不写属于自相矛盾；
+            # 纯问答/只给方案的任务根本不会立清单，也就不会被催着改代码。
+            # analyze 是用户亲手点的「仅分析」，整段不启用。
             if self.role == "main" and self.tctx.run_ctx.run_type != "analyze" \
-                    and _is_fix_task(self.instruction):
+                    and self.engage and plan_committed:
                 if _landed_in_round(resp.tool_calls):
+                    explore_calls = 0
+                    explore_brakes = 0
+                elif any(tc.name == "spawn_agents" for tc in resp.tool_calls):
+                    # 派只读子agent 并行调研是「有组织地推进」，不是无脑串行读：不累计勘察计数。
+                    # 否则模型越是用子agent 提速，越早撞上「只排查不动手」刹车（与用户要的相反）。
                     explore_calls = 0
                     explore_brakes = 0
                 else:
@@ -1413,12 +1818,15 @@ class AgentRuntime:
                     self._emit("status", {"status": "running",
                                           "note": f"已排查 {explore_calls} 次仍无改动，要求直接动手修"})
                     messages.append({"role": "user", "content": _BRAKE_MSG.format(n=explore_calls)})
-            # D 收敛守卫：上面的刹车只管「修 bug」类需求（_is_fix_task），创建/生成类
-            # 完全落在它外面——实测「新建两个 ur 角色」连着 84 次往返只读不写，
-            # 12 分多钟一张图都没出，全程没有任何东西拦它。
-            # 这段只催不停：任务没有次数上限，掐停只有停止/写锁/死循环三种。
-            elif self.role == "main" and self.tctx.run_ctx.run_type != "analyze":
-                committed = any(tc.name in ("update_plan", "ask_user", "report_to_user")
+            # 收敛守卫：与上面的刹车互补——上面只在模型立过清单时管「修 bug」，
+            # 这段管「创建/生成」类（实测「新建两个 ur 角色」连着 84 次往返只读不写，
+            # 12 分多钟一张图都没出，全程没有任何东西拦它）。
+            # 触发条件同样不再看系统预判：只在**模型自己立过清单**时介入（它自己说了要做），
+            # 且只催不停：任务没有次数上限，掐停只有停止/写锁/死循环三种。
+            elif self.role == "main" and self.tctx.run_ctx.run_type != "analyze" \
+                    and self.engage and plan_committed:
+                committed = any(tc.name in ("update_plan", "ask_user", "report_to_user",
+                                            "spawn_agents")
                                 for tc in resp.tool_calls)
                 if _landed_in_round(resp.tool_calls):
                     probe_rounds = 0
@@ -1459,6 +1867,11 @@ class AgentRuntime:
                     messages.append({"role": "user", "content":
                                      _VIEW_VERDICT_MSG.format(n=VIEW_NUDGE_AT)})
         # 只有上面死循环 break 才会走到这里（正常任务是模型自己交卷后 return）。
+        # 掐停收尾前也要等后台子agent 回收：否则「循环收尾」会把还没回来的结论整批丢掉
+        # （用户在等这几份核对结果，收尾报告却一个字都提不到）。
+        if self.role == "main" and self._pending_spawns():
+            await self._wait_spawns(messages, wake_on_steer=False)
+            await self._harvest_spawns(messages)
         # 措辞刻意避开「本阶段/信息收集到此为止」这类说法：实测模型会照着它交回一份
         # 「本轮汇报（截至信息收集与执行阶段结束）」+「四、下一步」，把半成品当交付。
         messages.append({"role": "user", "content":

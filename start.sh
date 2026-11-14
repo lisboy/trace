@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 循迹（Trace）· lite 模式一键启动（单机 / 小团队，SQLite + 进程内服务）。
+# 循迹（Trace）· lite 模式一键启动（单机个人版，SQLite + 进程内服务）。
 # 用法： bash start.sh
 set -e
 cd "$(dirname "$0")"

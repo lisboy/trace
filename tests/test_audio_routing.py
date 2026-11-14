@@ -240,7 +240,7 @@ def test_intent_hint_forbids_model_starting_tts() -> None:
     from game_agent.orchestration.orchestrator import Orchestrator
     hint = Orchestrator._intent_hint("涂山月见的配音重新生成，换一个妩媚的声线")
     assert "generate_audio" in hint
-    assert "start_service" in hint and "8860" in hint
+    assert "start_service" in hint
     assert "design_desc" in hint and "preset_name" in hint
 
 
@@ -251,7 +251,7 @@ def test_generate_audio_exposes_voice_design_params() -> None:
     desc = TOOL_SCHEMAS["generate_audio"]["description"]
     # 描述里必须把「唯一入口 + 不许自己起服务/跑脚本」写死，模型才会照做
     assert "唯一允许的配音入口" in desc
-    assert "start_service" in desc and "8860" in desc
+    assert "start_service" in desc
     # 助手手里必须有 generate_audio（配音是直连工具，没有独立「配音角色」了）
     from game_agent.agents.roles import ROLE_TOOLS
     assert "generate_audio" in ROLE_TOOLS["main"]

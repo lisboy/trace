@@ -18,6 +18,8 @@ type Status = {
   emo_weight: number;
   emo_vector: string;
   has_emo_audio: boolean;
+  default_speed?: number | null;
+  default_lang?: string | null;
   error?: string | null;
   base_url?: string;
 };
@@ -85,6 +87,7 @@ export default function VoiceGenPanel(
   const [emoAudioFile, setEmoAudioFile] = useState<File | null>(null);
   const [emoAudioTrial, setEmoAudioTrial] = useState("");
   const emoAudioRef = useRef<HTMLInputElement>(null);
+  const [speed, setSpeed] = useState(1.0);   // 语速 0.5~2.0（IndexTTS-2.5 的 duration_factor）
   const [label, setLabel] = useState("");
   const [enhance, setEnhance] = useState(false);
   const [starting, setStarting] = useState(false);
@@ -141,6 +144,8 @@ export default function VoiceGenPanel(
       if (!preset && s.default_preset) setPreset(s.default_preset);
       if (s.emo_mode && emoMode === "0" && s.emo_mode !== "0") setEmoMode(s.emo_mode);
       if (s.emo_weight) setEmoWeight(s.emo_weight);
+      // .env 里若配了默认语速（IndexTTS-2.5 的 duration_factor），初始化到滑块上
+      if (typeof s.default_speed === "number" && Number.isFinite(s.default_speed)) setSpeed(s.default_speed);
       // .env 里若配了默认八维向量，初始化到滑块上，方便用户看到当前基线
       if (s.emo_vector) {
         const v = String(s.emo_vector).split(/[,\s]+/).filter(Boolean).map(Number);
@@ -200,6 +205,7 @@ export default function VoiceGenPanel(
         emo_weight: emoWeight,
         emo_vector: emoMode === "2" ? emoVec : undefined,
         emo_audio: emoAudio,
+        speed: Math.abs(speed - 1.0) < 0.005 ? undefined : Number(speed.toFixed(2)),
         label: label || "voice",
         job_id: jobId,
       });
@@ -386,7 +392,7 @@ export default function VoiceGenPanel(
         <div className="lg:col-span-2 space-y-3">
           <textarea
             className="w-full border border-slate-200 rounded px-2 py-1.5 text-sm h-24 resize-y"
-            placeholder="要合成的台词。Markdown 符号会自动清掉（对话里点「朗读」就是这么走的）。"
+            placeholder="要合成的台词。Markdown 符号会自动清掉。"
             value={text}
             onChange={(e) => setText(e.target.value)}
           />
@@ -434,6 +440,12 @@ export default function VoiceGenPanel(
                 <span className="text-slate-500">{emoWeight.toFixed(2)}</span>
               </label>
             )}
+            <label className="flex items-center gap-1.5" title="语速控制（IndexTTS-2.5 生效）：大于 1 更慢更从容，小于 1 更快更急促">
+              语速
+              <input type="range" min={0.5} max={2} step={0.05} value={speed}
+                onChange={(e) => setSpeed(Number(e.target.value))} />
+              <span className="text-slate-500">{speed.toFixed(2)}×</span>
+            </label>
             <input className="border border-slate-200 rounded px-2 py-1 text-xs w-28"
               placeholder="文件名标签" value={label} onChange={(e) => setLabel(e.target.value)} />
           </div>

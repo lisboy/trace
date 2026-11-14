@@ -20,13 +20,12 @@ export class ProjectSocket {
   wantedSeq = 0;
 
   constructor(private projectId: string) {
-    const token = useAuth.getState().token;
     const teamId = useAuth.getState().currentTeamId;
     const proto = location.protocol === "https:" ? "wss" : "ws";
+    // 没有登录：不再传 token；team_id 仅用于日志/兼容，后端以本机身份为准
     this.url =
       `${proto}://${location.host}/ws/projects/${projectId}` +
-      `?token=${encodeURIComponent(token || "")}` +
-      `&team_id=${encodeURIComponent(teamId || "")}`;
+      `?team_id=${encodeURIComponent(teamId || "")}`;
   }
 
   on(cb: (e: WSEvent) => void) {
@@ -83,7 +82,7 @@ export class ProjectSocket {
           seq: e.seq ?? 0,
           type: e.type,
           run_id: runId,
-          task_id: null,
+          task_id: e.task_id ?? null,
           agent: e.payload?.agent_key ?? null,
           payload: e.payload ?? {},
         });

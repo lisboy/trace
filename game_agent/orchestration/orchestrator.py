@@ -15,9 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from game_agent.core.registry import get_agent_config
 from game_agent.agents.roles import ROLE_TOOLS
-from game_agent.agents.runtime import (
-    AgentResult, ANALYZE_ONLY_WORDS, is_symptom_complaint, wants_inspect_only,
-)
+from game_agent.agents.runtime import AgentResult
+from game_agent.orchestration.intent import (IntentResult, classify_intent,
+                                             hint_for as intent_hint_for)
 from game_agent.agents.tools.question import AskUserStop
 from game_agent.config import (AUTO_CONTINUE_MAX, COMFYUI_BASE_URL, LOCK_TTL_S, LOCK_WAIT_S,
                                LLM_MODEL, MAX_CONCURRENT_RUNS, PLATFORM,
@@ -50,9 +50,19 @@ ROLE_LABELS = {
 }
 
 # 开跑前注入的「会话历史」块最多多少 token。以前按窗口的一半算（32k 窗口 → 16k），
-# 默认窗口涨到 128k 后一半就是 64k，会把 run 自己的预算吃光；运行期已有全局摘要
+# 默认窗口提到 256k 后一半就是 128k，会把 run 自己的预算吃光；运行期已有全局摘要
 # 压缩兜住长对话，这里没必要贪多。
 SESSION_HISTORY_MAX_TOKENS = 12000
+
+# 接口认的推理强度档位。空串 = 不传该字段（走端点默认），两者语义不同：
+# 「设置 → 智能体」里清空推理等级就是回到端点默认，不能当成 0/'' 透传出去。
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high")
+
+
+def _norm_effort(v) -> str:  # type: ignore[no-untyped-def]
+    """推理强度归一：只认 5 个档位，其它（None / '' / 'Default' / 脏值）一律视为「不指定」。"""
+    s = str(v or "").strip().lower()
+    return s if s in REASONING_EFFORTS else ""
 
 
 def _clip_keep_tail(text: str, cap: int) -> str:
@@ -99,7 +109,7 @@ def _run_usage_json(usage: dict | None) -> dict:
     return out
 
 
-# analyze 模式剔除一切写/生成工具
+# 写/生成类工具（用于「有没有落地」统计；不随轮次类型裁剪——工具选择交给模型）
 WRITE_TOOLS = {
     "write_file", "edit_file", "run_command", "start_service",
     "generate_image", "generate_audio",
@@ -169,8 +179,11 @@ def caps_hint(caps: dict[str, bool]) -> str:
     """能力开关写进本轮提示：关掉的要说清「不做什么、怎么收尾」。"""
     parts: list[str] = []
     if caps.get("test", True):
-        parts.append("【自动化测试已开启】改完要实际验收：能起服务就起，用截图/接口/单测看结果再汇报；"
-                     "验证不过就继续修，别报「已完成」。")
+        parts.append("【自动化测试已开启】起服务做运行时验证是**重手段，默认不做**："
+                     "改完先跑 run_command 的语法/构建/单测级静态验证，过了就汇报；"
+                     "只有用户明确要求看效果，或同一个问题多轮修改仍未解决时，"
+                     "才 start_service + screenshot_page 实测。"
+                     "若起服务换了几种方式仍起不来，就**停止测试**，把起不来的原因、已试过的方法、风险点写进汇报，不要无限重试。")
     else:
         parts.append("【本轮关闭了自动化测试】不要 start_service / service_logs / screenshot_page，"
                      "也不要跑 CDP、接口或端到端测试。改完做语法/构建级静态检查即可收尾，"
@@ -193,45 +206,13 @@ _READONLY_CMD_PREFIXES = (
 # 回复消息正文的硬上限（只作病态保护；正常报告几 K 字一律完整落库）。
 _REPLY_MAX_CHARS = 20000
 
-# 用户这句话里出现这些词 = 他要求「动手做」，不是「给我讲讲」
-_ACTION_WORDS = (
-    "改", "加", "删", "放", "生成", "换成", "换掉", "替换", "修", "接入", "落位", "放到",
-    "重启", "做到位", "处理好", "处理", "弄", "补", "更新", "同步", "转", "导出", "安装",
-    "接入", "接进", "登记", "配置", "调", "跑一遍", "执行", "优化", "重构", "排查",
-    # 2026-10-28：「出战提示操作失败」这种「只描述现象」的 bug 报告不含上面任何动词，
-    # _needs_action 判成 False，导致「只勘察不动手」守卫整轮没启用。故障描述本身就是
-    # 最高优先级的动手指令。
-    "失败", "报错", "错误", "异常", "崩溃", "闪退", "卡住", "卡死", "卡顿", "白屏",
-    "没反应", "不工作", "不好使", "坏了", "无效", "bug", "修复",
-)
-# 明确「只要看/不要动」的句子，不触发守卫（词表与过程刹车共用一份）
-_NO_ACTION_WORDS = ANALYZE_ONLY_WORDS
-
-# 纯提问句式（「这个报错怎么回事？」）不算动手指令；但「改好了吗？」里带明确动作动词，
-# 仍按「要求动手」处理——用户是在追问进度，不是要分析。
-_QUESTION_WORDS = ("为什么", "为啥", "为何", "怎么", "咋", "什么", "如何", "是否", "哪", "吗", "呢", "？", "?")
-# 疑问句里「仍然算动手指令」的祈使式动作词。注意不含「处理」：
-# 实测 run 9a9656bc，「一次接口请求，能完成查重**处理**和编制完成吗？为什么…没用？」
-# 是纯代码问答（「处理」是「查重处理」这个名词的一部分），却因命中「处理」被当成
-# 动手指令 → 跳过纯提问豁免 → 把 5 分钟的正确答案强行推翻重做成 23 分钟的代码改造。
-# 「处理」留在 _ACTION_WORDS 里（「帮我处理这个问题」无问号，仍判 True），只是不再
-# 作为疑问句的豁免例外。真祈使式（改/修/加/帮我…）不受影响。
-_EXPLICIT_ACTION_WORDS = ("改", "修", "加", "删", "弄", "换", "调", "补", "重启",
-                          "排查", "帮我", "帮忙", "看一下", "看看")
-
-# 显式「只看不动」的验证/查询请求：交付物就是回答本身。
-# 实测（2026-11-02）：用户说「只读验证：用一句话回答这一轮权限是什么」，
-# 「验证」命中动作词 → 被判成动手指令 → 跑完只有勘察、没有落地 → 落 failed。
-# 这类话术必须在动作词之前先豁免掉，否则越守规矩的只读请求越会被判失职。
-_READ_ONLY_MARKS = ("只读", "只查看", "只看", "不要改", "别改", "不要修改", "别修改",
-                    "不改动", "不要动", "别动", "不要做任何修改", "只回答", "仅回答",
-                    "告诉我", "回答我", "是什么", "是哪一")
-
-# 「跑测试/编译/打包/重启/部署」类请求：交付物是命令结果本身，不该被「只勘察不动手」守卫误杀
-_RUN_ONLY_HINTS = ("测试", "单测", "构建", "编译", "打包", "部署", "重启", "启动服务",
-                   "停止服务", "跑一遍", "test", "build", "lint")
-# 真正要求改代码的词（出现在同一句里就仍按「必须动手」处理）
-_CODE_CHANGE_WORDS = ("改", "修", "加", "删", "替换", "新增", "接入", "补", "更新", "调整", "优化")
+# 「这一轮要不要动手落地」不再按关键词猜：交给大模型推理（game_agent/orchestration/intent.py），
+# 得到 IntentResult(intent=modify|survey, mode=fix|build)。execute_run 据此决定：
+#   · intent=survey → 把本轮降级成只读诊断（run_type=analyze），收尾不逼落地、不判 failed；
+#   · intent=modify → 启用「只勘察不动手」收尾纠正 + 过程刹车（mode=fix 走修 bug 刹车，
+#     build 走创建/生成收敛守卫）。
+# 关键词永远补不完中文表达（实测 2026-11-10「移除…导入…」两个动词都不在旧词表里，
+# 守卫全程没启用 → 只勘察没落地，被用户投诉「我明确要求他改了」）。判定交给模型推理。
 
 
 class Orchestrator:
@@ -242,36 +223,29 @@ class Orchestrator:
         self._sf = session_factory
         self._test_reports: dict[str, Any] = {}
         self._summaries: dict[str, str] = {}
+        # 子agent 自己的收尾结论（按 task_id 分）。不能和主agent 共用 _summaries：
+        # 那个字典按 run_id 存，子agent 一调 report_to_user 就会把主agent 的最终汇报顶掉。
+        self._sub_summaries: dict[str, str] = {}
         # 已落成聊天消息的回复（run_id, 正文）→ 幂等去重：同一段回复绝不重复落两条。
         self._posted_replies: set[tuple[str, str]] = set()
         # 结构扫描缓存：workspace -> 指纹对应的纯结构块（不含技能块）。
         # 指纹变了才重扫，避免每个 run 都全量递归列目录（P0 快赢，见 DESIGN-OPTIMIZATION §4.1）。
         self._structure_cache: dict[str, str] = {}
+        # 「进程内提问暂停」：question_id -> Future。ask_user 工具提问后在此挂起当前 run，
+        # 用户在 /questions/{id}/answer 作答时 set_result 唤醒——同一 run、同一轨迹、同一份
+        # 待办清单接着跑，不再把提问当成「上一轮结束 + 新起一个 run」（用户 2026-11-10 要求）。
+        # 仅同进程有效：服务重启/多进程 server 模式下拿不到 future，answer 端点自动回退到旧逻辑。
+        self._pending_answers: dict[str, asyncio.Future] = {}
 
     # ---------- 「只勘察不动手」守卫 ----------
     @staticmethod
     def _needs_action(text: str) -> bool:
-        """用户这句话是否要求「动手落地」（而不是只要分析/聊天）。"""
-        t = (text or "").strip()
-        if len(t) < 2:
-            return False
-        if any(k in t for k in _NO_ACTION_WORDS):
-            return False
-        # 「只检查/只排查/先诊断」这类意图：用户要的是一个结论（问题在哪），不是马上改。
-        # 不豁免它，就会被当成动手指令——只勘察后判 failed / 强制重做，越守规矩越被误伤。
-        if wants_inspect_only(t):
-            return False
-        if any(k in t for k in _READ_ONLY_MARKS):
-            return False
-        # 疑问式故障描述（「首页为啥还有滚动条」）要的是把它弄掉，不是要一个解释，
-        # 所以不吃「纯提问」这条豁免。
-        if (any(k in t for k in _QUESTION_WORDS) and not any(k in t for k in _EXPLICIT_ACTION_WORDS)
-                and not is_symptom_complaint(t)):
-            return False
-        if any(k in t for k in _RUN_ONLY_HINTS) and not any(k in t for k in _CODE_CHANGE_WORDS):
-            # 「跑一遍测试 / 编译一下」：交付物就是命令结果，不要求改代码
-            return False
-        return is_symptom_complaint(t) or any(w in t for w in _ACTION_WORDS)
+        """兼容壳：旧的关键词判定已废弃。真正的意图由模型推理（classify_intent）给出。
+
+        保留该静态方法只为不打断外部引用；调用它等于「无法判断，按动手处理」（安全兜底）。
+        新代码请不要再用它，改用 execute_run 里的意图推理结果（IntentResult）。
+        """
+        return bool((text or "").strip())
 
     @staticmethod
     def _cmd_is_readonly(cmd: str) -> bool:
@@ -327,13 +301,16 @@ class Orchestrator:
         # 输入框模型选择器：本轮显式选了档位/推理等级时优先用它（覆盖角色绑定），
         # 空值仍跟随角色绑定档位——保证「不改选择器 = 行为完全不变」。
         run_opts = dict(getattr(run, "options_json", None) or {})
+        # 角色默认（设置 → 智能体）：绑定档位 + 默认推理等级。一次查库拿全，别拆两次。
+        agent_key, agent_effort = await self._agent_defaults(run.team_id, "main")
         session_profile = await self._load_profile(
-            run.team_id,
-            run_opts.get("model_profile_key") or (await self._agent_profile_key(run.team_id, "main")))
-        if run_opts.get("reasoning_effort"):
+            run.team_id, run_opts.get("model_profile_key") or agent_key)
+        # 推理等级：本轮显式选择 > 角色默认（输入框切模型会写回这里）> 档位自带
+        effort = _norm_effort(run_opts.get("reasoning_effort")) or agent_effort
+        if effort:
             session_profile = {**session_profile,
                                "params": {**(session_profile.get("params") or {}),
-                                          "reasoning_effort": run_opts["reasoning_effort"]}}
+                                          "reasoning_effort": effort}}
         # 会话挂载技能（渐进式披露）：None=未指定（跟随项目默认）；名单=只注入这些
         session_skills: list[str] | None = None
         # 会话权限作用域（workspace/full）：run 选项优先，其次会话已存值；都没有走安全默认
@@ -392,13 +369,31 @@ class Orchestrator:
         elif continue_brief:
             # 无触发消息的续跑：从续跑说明里取回「上次请求原文」，用于素材意图/计划提示
             latest = self._brief_original_request(continue_brief)
-        # 只检查/只排查/先诊断：把这一轮按「只读诊断」跑——先给结论，要动手等用户点头。
-        # 只按 run_type==analyze 走才生效；用户显式要求修复/修改时 wants_inspect_only 为 False。
-        # 优先级高于素材预判：否则「检查一下配音为什么没声音」会被 _intent_hint 误路由成
-        # generate_audio（见 _AUDIO_WORDS 含「配音/语音」）。
-        inspect_only = (run.run_type != "analyze" and wants_inspect_only(latest))
+        # 意图盘查（2026-11-14 用户拍板「保留判别、但不当闸门」）：
+        # 结论**只用于两件事**——(1) 给模型一句软提示；(2) 决定「只勘察不动手」刹车开不开。
+        # 明确**不做**的三件事（去掉了以前的硬闸门）：
+        #   · 不把 run_type 降级成 analyze（判成 survey 也只提醒，不替模型决定「本轮不许改」）；
+        #   · 不塞「本轮不要修改产品文件」这类禁手硬提示（用户说「检查一下然后改掉」不再被禁手）；
+        #   · 不裁任何工具（caps.effective_whitelist 本就不按轮次类型裁剪）。
+        # 唯一仍然照办的硬约束是**用户亲手点「仅分析」**（run_type 由前端写入，不是本层猜的）。
+        inspect_only = run.run_type == "analyze"
         if inspect_only:
-            run.run_type = "analyze"
+            intent = IntentResult(intent="survey", mode="build",
+                                  reason="用户显式仅分析", decided_by="explicit")
+        else:
+            try:
+                profile = await self._load_profile(
+                    run.team_id, run_opts.get("model_profile_key")
+                    or (await self._agent_profile_key(run.team_id, "main")))
+            except Exception:  # noqa: BLE001 - 取档位失败就交给 factory 兜底
+                profile = {}
+            intent = await classify_intent(latest, profile=profile)
+            # 软提示：拿不准/纯问答时只说一句「你自己判断」，绝不出现禁手词（见 intent.hint_for）
+            soft = intent_hint_for(intent)
+            if soft:
+                requirement = f"{soft}\n\n---\n{requirement}"
+        if inspect_only:
+            # 用户亲手点了「仅分析」：那是显式指令，照办——只给结论，不动产品文件。
             requirement = f"{self._inspect_hint()}\n\n---\n{requirement}"
         else:
             hint = self._intent_hint(latest)
@@ -421,7 +416,14 @@ class Orchestrator:
             meta={"caps": caps_mod.normalize_caps(run_opts.get("caps")),
                   "model_profile_key": run_opts.get("model_profile_key"),
                   "reasoning_effort": run_opts.get("reasoning_effort"),
-                  "permission_scope": perm_scope},
+                  "permission_scope": perm_scope,
+                  # 意图盘查结论（2026-11-14）：只用于提示措辞与刹车开关，不封锁任何动作。
+                  # engage=False（盘查判纯勘察）时 runtime 不装「只勘察不动手」刹车——
+                  # 用户只要一个结论时不该被催着改文件；engage=True 才催落地。
+                  # 用户显式「仅分析」时 decided_by=explicit、intent=survey → engage 也是 False。
+                  "intent": intent.intent, "intent_mode": intent.mode,
+                  "engage": intent.intent == "modify",
+                  "fix_task": intent.is_fix},
         )
         # 能力开关（测试/联网/媒体）写进本轮提示：关掉的明确「不做什么」
         cap_hint = caps_mod.caps_hint(caps_mod.normalize_caps(run_ctx.meta.get("caps")))
@@ -447,12 +449,19 @@ class Orchestrator:
                                      final_summary=final_text,
                                      usage_json=_run_usage_json(usage))
                 self._summaries[run_id] = final_text
-                # 先落回复消息（聊天流立即可见），再做耗时的 AI 记忆合并
+                # 先落回复消息（聊天流立即可见），紧接着发 run_done。
+                # 为什么 run_done 必须紧贴回复落地：前端的完成提醒（提示音 + 桌面通知）
+                # 就是靠这个事件触发的。以前它排在 AI 记忆合并之后，而记忆合并是一次
+                # 模型调用（最长 90s）——用户看着回复已经出现在聊天里，提醒却要等一两分钟，
+                # 表现就是「都结束了还没提醒」。
                 await self._post_reply(run_ctx, run, final_text)
-                await self._remember(run.project_id, run.team_id, run_id,
-                                     await self._memory_input_text(run_id, final_text))
-                remembered = True
                 await self._emit(run_ctx, "run_done", {"status": "succeeded"})
+                remembered = True  # 记忆合并失败也要置位：否则 finally 里会再烧一次模型调用
+                try:
+                    await self._remember(run.project_id, run.team_id, run_id,
+                                         await self._memory_input_text(run_id, final_text))
+                except Exception:  # noqa: BLE001 - 收尾慢活失败不许改写已成功的 run
+                    log.exception("收尾记忆合并失败", extra={"run_id": run_id})
                 return
 
             # modify：平台不接管 git，改动直接落在工作区上（改动审阅/回滚走写前快照）。
@@ -481,45 +490,57 @@ class Orchestrator:
             # 彻底消失（实测 run 9a9656bc：5 分钟的准确诊断报告，被 23 分钟的强制重做顶掉，
             # 用户在聊天里根本看不到）。只在**确实要纠正重跑**时才先把这份答复发出去，
             # 正常一次收尾的路径完全不变；_posted_replies 去重保证它不会被收尾那条重复。
-            will_correct = (self._needs_action(latest)
-                            and await self._landed_actions(run_id) == 0)
+            # 收尾不再按「系统预判的意图」逼模型动手（2026-11-14 改）。
+            # 旧逻辑：intent=modify 且零落地 → 强制重跑最多 2 次。问题是「要不要落地」本来就是
+            # 模型该自己判断的（用户问「这个项目是干嘛的」也会被当成要动手，白重跑两轮）。
+            # 现在只纠正一种**自相矛盾**的情况：模型自己说要改（立了清单/说改完），却一个产品
+            # 改动都没落。纯问答/只给方案不在此列——那是模型对需求的正常判断，不该被推翻。
+            plan_items_now = await self._plan_items(run_id)
+            open_items_now = [i for i in plan_items_now if str(i.get("status")) != "completed"]
+            claimed_action = self._claims_action(main_res, self._summaries.get(run_id) or "")
+            landed = await self._landed_actions(run_id)
+            will_correct = bool(open_items_now) or (claimed_action and landed == 0)
             if will_correct and self._summaries.get(run_id):
                 await self._post_reply(run_ctx, run, self._summaries[run_id])
             # 「只勘察、不动手」守卫（用户最常抱怨的失职）：
-            # 用户明确要求动手，但这一轮除读/查以外什么都没落地 → 纠正（最多 2 次），
-            # 逼它出产物，而不是把「本轮只完成现场勘察 + 给你 A 方案/B 方案」当成交付。
+            # 但触发条件改成模型自己的承诺：清单里还有未完成项，或汇报里明确说了「已改/已生成」。
             nudge = (
                 "【系统纠正】你刚才只做了定位/勘察，没有任何落地动作"
-                "（没写文件、没生成素材、没起服务）。用户要的是「改完能用」，不是勘察报告。现在立刻执行：\n"
+                "（没写文件、没生成素材、没起服务），"
+                "但你的待办清单/汇报里还留着要做的事。用户要的是「改完能用」，不是勘察报告。现在立刻执行：\n"
                 "· 要改代码：自己用 write_file / edit_file 直接改（路径/行号你已经查到了）；\n"
                 "· 要素材：generate_image / generate_audio 直接生成；\n"
-                "· 改完自己验证：run_command 跑测试/编译，start_service 起服务 + screenshot_page 截图看效果，"
-                "发现问题接着改；最后 report_to_user 汇报改了什么、产物路径、验证结果。\n"
+                "· 改完自己验证：run_command 跑测试/编译就够（起服务 + 截图是重手段，"
+                "用户明确要看效果或同一问题多轮没改好时才用），发现问题接着改；"
+                "最后 report_to_user 汇报改了什么、产物路径、验证结果。\n"
                 "「没拿到确切行号 / 读不到文件某段 / 不确定 class 名」都不是停工理由："
                 "用 read_file(path, offset, limit) 按行翻页、grep(pattern, path, context) 带上下文定位。\n"
-                "禁止再输出勘察表格，禁止用「A 方案/B 方案你选」收尾，禁止把「已核实的事实」当交付。"
+                "如果用户这一轮本来只要你给结论/方案（不要求动文件），把清单里那些项改成"
+                "「不涉及改动」并说明即可，不要为了凑数去改代码。"
             )
             for attempt in range(1, 3):
-                if not (self._needs_action(latest) and await self._landed_actions(run_id) == 0):
+                open_items_now = [i for i in await self._plan_items(run_id)
+                                  if str(i.get("status")) != "completed"]
+                if not (open_items_now or (
+                        self._claims_action(main_res, self._summaries.get(run_id) or "")
+                        and await self._landed_actions(run_id) == 0)):
                     break
                 await self._emit(run_ctx, "status",
                                  {"status": "running", "note": f"补齐落地动作（第 {attempt} 次纠正）"})
                 main_res = await self.run_agent(
                     "main", None, f"{requirement}\n\n---\n{nudge}", run_ctx, images=images)
                 usage = _merge_usage(usage, getattr(main_res, "usage", None))
-            # 纠正完仍然只有勘察、没有任何落地 → 不能把「勘察报告」当成功交付
-            # （否则用户只看到「执行完毕」，实际什么都没改）。落成 failed，界面直接给出「重试」按钮。
-            if self._needs_action(latest) and await self._landed_actions(run_id) == 0:
-                err = "这次只做了定位/勘察，没有任何实际改动或产物；请重试，或给出更具体的指示"
-                await repo.update_run(run_id, status="failed", error=err, finished_at=_now(),
-                                      final_summary=(main_res.text or "")[:2000],
-                                      usage_json=_run_usage_json(usage))
-                await self._post_system_error(run_ctx, run, err)
-                await self._emit(run_ctx, "run_done", {"status": "failed", "error": err})
-                log.warning("run stalled in survey-only mode", extra={"run_id": run_id})
-                return
-            # report_to_user 的汇报（_summaries）是模型亲口写给用户的总结；runtime 的
-            # 空收尾兜底只是「按轨迹汇总」的次选，不能把已汇报的内容顶掉。
+            # 纠正完仍然只有勘察、没有任何落地：**不要把 run 判死成 failed**。
+            # 用户明确要求「不要限制他」——把一个还在读代码、正在定位的任务标成「执行失败」，
+            # 再在输入框上方弹出「这次只做了定位/勘察…请重试」的浮层，既误导（让人以为这条
+            # 任务废了、要重新描述），又违背「系统自己接着往下推」的收尾原则。
+            # 改法：不落 failed、不弹失败浮层，照常收尾；由下面的 _auto_continue 自动续跑，
+            # 把没做完的活接着做完（若它连清单都没立，就临时造一条待办驱动续跑）。
+            landed_zero = await self._landed_actions(run_id) == 0
+            if landed_zero:
+                log.info("run finished without product change; auto-continue will keep pushing "
+                         "only if the plan is still open",
+                         extra={"run_id": run_id})
             final_summary = self._prefer_summary(main_res, run_id)
             await repo.update_run(run_id, final_summary=final_summary,
                                   usage_json=_run_usage_json(usage))
@@ -537,13 +558,8 @@ class Orchestrator:
                                  change_report_json=cr, final_summary=final_summary,
                                  usage_json=_run_usage_json(usage))
             plan_items, open_items = await self._close_out_plan(run_ctx)
-            # 先落回复消息（聊天流立即可见），再做耗时的 AI 记忆合并
+            # 先落回复消息（聊天流立即可见），收尾的慢活全部挪到 run_done 之后再干。
             await self._post_reply(run_ctx, run, final_summary)
-            await self._remember(run.project_id, run.team_id, run_id,
-                                 await self._memory_input_text(run_id, final_summary, cr))
-            remembered = True
-            await self._harvest_notes(run_ctx, run.team_id, workspace, latest,
-                                      final_summary, cr, run_id)
             if hb is not None:
                 hb.cancel()
             if token is not None:
@@ -551,12 +567,34 @@ class Orchestrator:
                     await self.svcs.locks.release(project.id, run.id, token)
                 except Exception:  # noqa: BLE001
                     pass
-            # 清单没做完 = 活儿没做完：直接排队续跑一轮，而不是等用户自己发现再点「继续」
-            await self._auto_continue(run_ctx, run, plan_items, open_items,
+            # 清单没做完 = 活儿没做完：直接排队续跑一轮，而不是等用户自己发现再点「继续」。
+            # survey-only（只勘察没落地）也一样要续：哪怕它根本没立清单，也造一条「把活做完」
+            # 的待办塞进续跑，确保这次「不判 failed」不会被理解成「这次就到此为止了」。
+            # 续跑只是入队（毫秒级），留在 run_done 之前，保证「排队续跑」的提示先到、终态后到。
+            ac_open = open_items
+            if landed_zero and not ac_open:
+                ac_open = [{"content": "把上一轮只做了勘察/定位、还没落地的活做完",
+                            "status": "pending", "note": "上一轮未落地"}]
+            await self._auto_continue(run_ctx, run, plan_items, ac_open,
                                       final_summary, workspace)
+            # run_done 必须紧贴「回复已落地 + 续跑已入队」发出：前端的完成提醒
+            # （提示音 + 桌面通知）就是靠它触发的。以前它排在 AI 记忆合并（最长 90s）
+            # 和经验沉淀（最长 60s）之后，用户看着回复早出来了、提醒却要等一两分钟——
+            # 表现就是「都结束了还没提醒」。
             await self._emit(run_ctx, "run_done", {"status": "succeeded",
                                                   "change_report": cr})
             log.info("run succeeded", extra={"run_id": run_id})
+            # run_done 之后只剩慢活（各一次模型调用）和落库：全部兜底，任何一件失败都不许
+            # 把已经成功的 run 再判成 failed —— 那会额外发一条 run_done(failed)，
+            # 界面把刚做完的活标成失败，比不提醒更糟。
+            remembered = True  # 记忆合并失败也要置位：否则 finally 里会再烧一次模型调用
+            try:
+                await self._remember(run.project_id, run.team_id, run_id,
+                                     await self._memory_input_text(run_id, final_summary, cr))
+                await self._harvest_notes(run_ctx, run.team_id, workspace, latest,
+                                          final_summary, cr, run_id)
+            except Exception:  # noqa: BLE001 - 收尾慢活失败不影响已完成状态
+                log.exception("run 收尾慢活失败", extra={"run_id": run_id})
         except FencingLost:
             await repo.update_run(run_id, status="failed", error="锁丢失，已中止以防双写",
                                  finished_at=_now(), usage_json=_run_usage_json(usage))
@@ -575,6 +613,10 @@ class Orchestrator:
         except asyncio.CancelledError:
             # 区分「用户取消」和「服务关闭」：两者都表现为 CancelledError，但事实不同，
             # 措辞不能一概说成「已按你的要求取消」（那会让重启后看到一堆假取消记录）。
+            # 整轮停止时，主agent 的取消会向下传播到各子agent；但传播有极小概率漏掉
+            # 某个「刚好切换 task/正在收尾」的子任务，这里再兜底扫一遍：把仍 running 的子
+            # task 落 cancelled 并补 task_done，保证前端子agent 分组不会永远停在「运行中」。
+            await self._close_open_tasks(run_ctx, run_id)
             from game_agent.core.shutdown import is_shutting_down
             _shutdown = is_shutting_down()
             if _shutdown:
@@ -743,18 +785,30 @@ class Orchestrator:
     # ---------- 嵌套子任务（媒体/纠错等内部复用入口） ----------
     async def run_agent(self, role: str, parent_task_id: Optional[str], instruction: str,
                         run_ctx: RunContext, payload: dict | None = None,
-                        images: list[str] | None = None) -> AgentResult:
+                        images: list[str] | None = None,
+                        task_title: str | None = None) -> AgentResult:
         repo = self.svcs.repo
+        _init_result = None
+        if payload and payload.get("question"):
+            _init_result = {"question": payload.get("question")}
         task = await repo.create_task(
             run_id=run_ctx.run_id, parent_task_id=parent_task_id, kind=role,
-            agent_key=role, title=f"{role} 执行", status="running", attempt=1, started_at=_now(),
+            agent_key=role, title=task_title or f"{role} 执行", status="running",
+            attempt=1, started_at=_now(), result_json=_init_result,
         )
-        await self._emit(run_ctx, "task_start", {"task_id": str(task.id), "role": role, "kind": role})
+        await self._emit(run_ctx, "task_start", {
+            "task_id": str(task.id), "role": role, "kind": role,
+            "parent_task_id": str(parent_task_id) if parent_task_id else None,
+            # spawn_agents 派发时传进来的子任务名/问题：前端把它显示成组标题，
+            # 用户才知道每个子agent 各自负责哪条线索（而不是一串相同的 sub 标签）
+            "title": task_title or None,
+            "question": (payload or {}).get("question") or None,
+        })
 
         # 角色全量白名单（不做任何裁剪）：运行中改「仅分析 / 能力开关」时，runtime 要在这份
         # 全量基础上重算生效白名单，而不是在已裁剪的集合上再裁（否则关掉再打开也回不来）。
         role_whitelist = list(ROLE_TOOLS.get(role, []))
-        # 本轮生效白名单：analyze 剔写/生成工具，caps 关掉的工具直接不给
+        # 本轮生效白名单：只按用户手动的能力开关裁剪，轮次类型不裁
         whitelist = caps_mod.effective_whitelist(
             role_whitelist, run_ctx.run_type, (run_ctx.meta or {}).get("caps"))
 
@@ -762,24 +816,29 @@ class Orchestrator:
             cfg = await get_agent_config(s, run_ctx.team_id, role)
         # 本轮选项（输入框模型选择器）覆盖角色绑定档位：只在用户显式选择时生效
         opts = run_ctx.meta or {}
-        profile = await self._load_profile(
-            run_ctx.team_id, opts.get("model_profile_key") or cfg.model_profile_key)
-        if opts.get("reasoning_effort"):
+        profile_key = await self._resolve_profile_key(
+            run_ctx.team_id, role, opts, own_key=cfg.model_profile_key)
+        profile = await self._load_profile(run_ctx.team_id, profile_key)
+        # 推理强度：本轮显式选择 > 本角色默认（agents.params_json，见 _agent_defaults）。
+        # 按「本角色」而不是主agent 取：子agent 的默认仍是 factory 里的
+        # GA_SUB_REASONING_EFFORT（默认 none，省 token），不会被主agent 的默认带跑。
+        effort = (_norm_effort(opts.get("reasoning_effort"))
+                  or _norm_effort((cfg.params_json or {}).get("reasoning_effort")))
+        if effort:
             profile = {**profile,
                        "params": {**(profile.get("params") or {}),
-                                  "reasoning_effort": opts["reasoning_effort"]}}
+                                  "reasoning_effort": effort}}
 
         project = await repo.get_project(run_ctx.project_id)
         workspace = PROJECTS_ROOT / project.repo_path
         python_bin = project.python_bin or default_python_bin() or None
 
-        # MCP 动态工具：项目 MCP 配置（界面 CRUD / .trace/mcp.json 兜底）声明即注册；
-        # analyze 模式剔除（MCP 工具可能有副作用）
+        # MCP 动态工具：项目 MCP 配置（界面 CRUD / .trace/mcp.json 兜底）声明即注册
         extra_specs: dict[str, dict] = {}
         try:
             from game_agent.agents.tools.mcp_client import get_mcp_manager
             mgr = await get_mcp_manager(run_ctx.project_id, workspace)
-            if mgr is not None and run_ctx.run_type != "analyze":
+            if mgr is not None:
                 for mt in await mgr.list_tools():
                     extra_specs[mt["name"]] = {"description": mt["description"],
                                                "parameters": mt["schema"]}
@@ -836,41 +895,79 @@ class Orchestrator:
                               # 角色全量白名单：运行中改运行选项时在它上面重算（MCP 工具由
                               # runtime 用 extra_specs 另加），而不是在已裁剪的 whitelist 上
                               # 二次裁剪（否则关掉再打开回不来）
-                              base_whitelist=role_whitelist)
+                              base_whitelist=role_whitelist,
+                              # 意图推理结论：决定是否启用「只勘察不动手」过程刹车
+                              engage=bool((run_ctx.meta or {}).get("engage", True)),
+                              fix_task=bool((run_ctx.meta or {}).get("fix_task", True)))
 
-        async def _watch_cancel(task: "asyncio.Task") -> None:
+        # 取消来源：'run' = 用户点了整轮停止（主+子一起停）；'task' = 用户只点掉这个子agent。
+        # 看门狗写入，CancelledError 分支据此决定「向上抛（连带整轮）」还是「就地止损只回
+        # 一段说明（让主agent 继续）」。为什么不区分就必出错：子agent 被单独点掉时若直接
+        # raise，CancelledError 会穿过 spawn_agents 的 asyncio.gather，把主agent 一起打断。
+        cancel_scope: dict[str, str | None] = {"scope": None}
+
+        async def _watch_cancel(rt_task: "asyncio.Task") -> None:
             """取消看门狗：用户点「取消」后立即把 agent 任务掐掉。
 
             为什么必须做：只在工具轮次之间检查 cancel_requested 是不够的——一次 LLM 调用
             （长思考/长上下文）或一次长工具调用就能挂几分钟，用户点了取消却「看着它继续跑」。
-            这里 1s 轮询一次，置位即 task.cancel()，中断正在进行的 HTTP 流。
+            这里 1s 轮询一次，置位即 rt_task.cancel()，中断正在进行的 HTTP 流。
+
+            两种取消都要看：
+              · run 级（runs.cancel_requested）—— 停止整轮，主agent 与所有子agent 一起停；
+              · task 级（tasks.cancel_requested）—— 只停这个子agent，其余照跑。
+
+            参数名不能叫 task：外层 DB 任务对象也叫 task，子agent 分支查库要用它的 id。
+            以前参数就叫 task，`str(task.id)` 实际作用在 asyncio.Task 上 →
+            AttributeError → 看门狗第一次轮询就永久退出 → 单个子agent 的「停止」永远不生效
+            （2026-11-12 用户实测：5 个子agent 全部卡在「停止中…」）。
+            单次轮询失败也不能退出：一次 DB 抖动就把看门狗打死，整轮停止会跟着失效。
             """
-            try:
-                while not task.done():
+            while not rt_task.done():
+                try:
                     await asyncio.sleep(1.0)
                     cur = await repo.get_run(run_ctx.run_id)
                     if cur is not None and getattr(cur, "cancel_requested", False):
-                        log.info("cancel requested, aborting agent task immediately",
+                        cancel_scope["scope"] = "run"
+                        log.info("run cancel requested, aborting agent task immediately",
                                  extra={"run_id": run_ctx.run_id, "role": role})
-                        task.cancel()
+                        rt_task.cancel()
                         return
-            except asyncio.CancelledError:
-                return
-            except Exception:  # noqa: BLE001 - 看门狗失败不影响主流程
-                log.exception("cancel watcher failed")
+                    if role == "sub":
+                        # 单个子agent 的独立停止位：只影响这一条子任务。
+                        tcur = await repo.get_task(str(task.id))
+                        if tcur is not None and getattr(tcur, "cancel_requested", False):
+                            cancel_scope["scope"] = "task"
+                            log.info("subagent task cancel requested, stopping it only",
+                                     extra={"run_id": run_ctx.run_id,
+                                            "role": role, "task_id": str(task.id)})
+                            rt_task.cancel()
+                            return
+                except asyncio.CancelledError:
+                    if rt_task.done():
+                        return
+                    raise
+                except Exception:  # noqa: BLE001 - 单次轮询失败不影响下一轮
+                    log.exception("cancel watcher poll failed, retrying")
 
         agent_task = asyncio.create_task(runtime.run())
         watcher = asyncio.create_task(_watch_cancel(agent_task))
         try:
             result = await agent_task
         except asyncio.CancelledError:
-            # run 级取消（看门狗掐掉任务）：标记任务取消后向上抛，由 execute_run 落终态
             await repo.update_task(str(task.id), status="cancelled", finished_at=_now())
             await self._emit(run_ctx, "task_done",
                              {"task_id": str(task.id), "role": role, "status": "cancelled"})
+            # 单个子agent 被用户单独点掉：不向上抛（否则会连带打断主agent），
+            # 回一段「已停止」的说明给主agent，让它知道这条线索没跑完、可以自己接手或再派。
+            if role == "sub" and cancel_scope["scope"] == "task":
+                return AgentResult(text="[sub] 已按用户要求停止这个子agent（本次核对未完成）。")
             raise
         except FencingLost:
             await repo.update_task(str(task.id), status="failed", finished_at=_now())
+            await self._emit(run_ctx, "task_done",
+                             {"task_id": str(task.id), "role": role, "status": "failed",
+                              "error": "锁丢失，已中止"})
             raise
         except AskUserStop as stop:
             # 助手提问：任务按"完成"收口（不算失败），问题本身已由 ask_user 落库广播
@@ -879,29 +976,74 @@ class Orchestrator:
             await self._emit(run_ctx, "task_done",
                              {"task_id": str(task.id), "role": role, "status": "question"})
             raise
-        except LlmAuthError:
-            # 端点认证/额度错误：直接让 run 失败，不能把错误文本当正常回复
+        except LlmAuthError as e:
+            # 端点认证/额度错误：不能把错误文本当正常回复。
             await repo.update_task(str(task.id), status="failed", finished_at=_now(),
                                   result_json={"error": "LLM 端点认证/额度错误"})
+            await self._emit(run_ctx, "task_done",
+                             {"task_id": str(task.id), "role": role, "status": "failed",
+                              "error": "LLM 端点认证/额度错误"})
+            # 子agent 端点报错不该带崩整轮：回错误文本交给主agent 判断（它可能换个线索、
+            # 或自己接手），而不是让 run 直接 failed。主agent 仍按原逻辑抛出让 run 落 failed。
+            if role == "sub":
+                return AgentResult(text=f"[sub] 执行出错：LLM 端点认证/额度错误（{e}）")
             raise
         except asyncio.TimeoutError:
             # 单次 LLM/工具调用的超时在各自适配层内部已吞掉重试，能冒到这里说明
             # 是真的挂住了：落成 failed，让看门狗之外还有一条明确的失败路径。
             await repo.update_task(str(task.id), status="failed", finished_at=_now())
+            await self._emit(run_ctx, "task_done",
+                             {"task_id": str(task.id), "role": role, "status": "failed",
+                              "error": "调用挂住超时"})
+            if role == "sub":
+                return AgentResult(text="[sub] 执行出错：调用挂住超时")
             raise RuntimeError("run_agent 调用挂住超时")
         except Exception as e:  # noqa: BLE001
             await repo.update_task(str(task.id), status="failed", finished_at=_now(),
                                   result_json={"error": str(e)[:500]})
+            # 关键：generic 失败也要广播 task_done(failed)——否则前端子agent 分组永远停在
+            # 「运行中」（open=还没收到 task_done），用户看不到它其实已经报错了。
+            await self._emit(run_ctx, "task_done",
+                             {"task_id": str(task.id), "role": role, "status": "failed",
+                              "error": f"{type(e).__name__}: {str(e)[:300]}"})
             # 子智能体失败：返回错误文本，由父级决定重试/上报
             return AgentResult(text=f"[{role}] 执行出错：{type(e).__name__}: {e}")
         else:
+            # 子agent 的结论要带给前端：task_done 以前只带 status，用户在弹窗里只看到
+            # 工具调用流水，看不到「它最后得出了什么」。summary 与交给主agent 的
+            # spawn_agents 汇总同源（result.text），保证「界面看到的」=「主agent 收到的」。
+            summary = (result.text or "").strip()
+            if role == "sub":
+                # 模型只吐思考/空收尾时，用它在 report_to_user 里写下的结论兜底
+                saved = self._sub_summaries.get(str(task.id), "")
+                if (not summary or getattr(result, "fallback", False)) and saved:
+                    summary = saved
+                    result.text = saved
+                summary = summary[:4000]
             await repo.update_task(str(task.id), status="done", finished_at=_now(),
-                                  result_json={"text": result.text[:4000]})
+                                  result_json={"text": (summary or result.text)[:4000]})
             await self._emit(run_ctx, "task_done",
-                             {"task_id": str(task.id), "role": role, "status": "done"})
+                             {"task_id": str(task.id), "role": role, "status": "done",
+                              **({"summary": summary} if role == "sub" and summary else {})})
             return result
         finally:
             watcher.cancel()
+            # 子agent 的临时结论已在上面的成功分支消费掉：清掉，避免长驻进程里越积越多
+            if role == "sub":
+                self._sub_summaries.pop(str(task.id), None)
+            # 主agent 退出（正常/取消）时，后台 spawn 批次若还没回收：一并取消。
+            # spawn_agents 现在是派发即返回，子任务独立于工具调用存活——不取消的话，
+            # run 结束后它们会变孤儿继续烧 LLM/占连接（单任务停止位只对没退出的 run 有效）。
+            if role == "main":
+                for batch in list(getattr(tctx, "spawn_batches", [])):
+                    for sub_task in list(getattr(batch, "tasks", [])):
+                        if not sub_task.done():
+                            sub_task.cancel()
+            # 兜底：本协程被父级（整轮停止）取消时，`await agent_task` 处抛 CancelledError
+            # 并不会连带取消 agent_task——它是独立 task，不主动 cancel 会让子agent 变孤儿
+            # 继续在后台跑（用户点整轮停止，看到的却是子agent 还在动）。这里统一补一刀。
+            if not agent_task.done():
+                agent_task.cancel()
 
     # ---------- 记录 ----------
     async def update_plan(self, run_ctx: RunContext, items: list[dict], summary: str = "",
@@ -921,6 +1063,12 @@ class Orchestrator:
     async def set_final_summary(self, run_id: str, text: str) -> None:
         self._summaries[run_id] = text
 
+    async def set_sub_summary(self, task_id: str, text: str) -> None:
+        """子agent 的收尾结论单独存：报告给主agent 的那段，不能覆盖用户的最终汇报。"""
+        body = (text or "").strip()
+        if body:
+            self._sub_summaries[str(task_id)] = body
+
     def _prefer_summary(self, result: Any, run_id: str) -> str:
         """收尾用哪段文字：模型原话优先；模型只有运行时兜底时，优先用它 report_to_user 的汇报。
 
@@ -935,11 +1083,17 @@ class Orchestrator:
         return text or saved
 
     async def ask_user(self, run_ctx: RunContext, question: str, options: list[dict],
-                       allow_text: bool = True, agent_key: str = "main") -> dict:
+                       allow_text: bool = True, agent_key: str = "main",
+                       progress=None) -> dict:
         """助手拿不准就问：落库一条 run_questions + 会话里发一条问题卡片 + 广播事件。
 
-        返回问题记录；调用方（ask_user 工具）随后抛 AskUserStop 中止本轮循环，
-        run 落 blocked，等用户回答后由 /questions/{id}/answer 起新 run 继续。
+        **不再结束本轮**：问题落库、卡片广播后，这里挂起等用户回答（同一 run、同一轨迹、
+        同一份待办清单），answering 端点 set_result 唤醒后返回 ``{"answer": ...}``，agent
+        循环带着答案继续往下做。只有 future 拿不到（服务重启 / 多进程）时才回退到旧逻辑
+        （返回的 record 没有 answer，调用方抛 AskUserStop 让 run 落 blocked、起新 run 续跑）。
+
+        ``progress``：可选回调，等待期间周期调用以推进工具层「活进展」计数，避免被
+        execute_tool_with_timeout 的 900s 无进展兜底当成卡死掐掉。
         """
         async with self._sf() as s:
             q = RunQuestion(
@@ -962,12 +1116,110 @@ class Orchestrator:
             record = {"id": str(q.id), "question": question, "options": options or [],
                       "allow_text": allow_text, "session_id": str(run_ctx.session_id),
                       "run_id": str(run_ctx.run_id), "message_id": str(msg.id)}
+        # 同一 run 内的暂停：登记一个 future，让回答端点能唤醒本协程（而不是另起 run）。
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._pending_answers[str(record["id"])] = fut
         await self._emit(run_ctx, "question_asked", record)
         await self._emit(run_ctx, "message_new", {
             "session_id": str(run_ctx.session_id), "message_id": str(msg.id),
             "author_type": "agent", "kind": "question",
         })
-        return record
+        # 挂起等待（同一 run 继续）。等待期间做的事：
+        #  · 每 30s 唤一次 progress() → 工具层硬超时看门狗看到「有进展」，不会 900s 掐断；
+        #  · 每 60s 落一条持久化 status 事件 → 30 分钟静默看门狗不会把暂停的 run 判死；
+        #  · 用户点停止 → run_agent 的取消看门狗 cancel 本任务 → CancelledError 正常退场。
+        waited = 0
+        try:
+            while True:
+                try:
+                    answer = await asyncio.wait_for(asyncio.shield(fut), timeout=30)
+                    record["answer"] = answer
+                    # 落一条已回答事件：前端据此把「等你回答」状态撤掉（同一 run 继续跑）
+                    try:
+                        await self._emit(run_ctx, "question_answered", {
+                            "id": str(record["id"]), "answer": answer,
+                            "session_id": str(run_ctx.session_id),
+                            "run_id": str(run_ctx.run_id)})
+                    except Exception:  # noqa: BLE001 - 事件失败不影响继续执行
+                        pass
+                    return record
+                except asyncio.TimeoutError:
+                    waited += 30
+                    if callable(progress):
+                        try:
+                            progress()
+                        except Exception:  # noqa: BLE001 - 推进计数失败不影响等待
+                            pass
+                    if waited % 60 == 0:
+                        try:
+                            await self._emit(run_ctx, "status", {
+                                "status": "running",
+                                "note": f"已暂停，等你回答（已等待 {waited // 60} 分钟）"})
+                        except Exception:  # noqa: BLE001 - 心跳失败不影响等待
+                            pass
+        finally:
+            # 被取消 / 已作答：把登记清掉，避免 future 泄漏
+            self._pending_answers.pop(str(record["id"]), None)
+
+    def resolve_question(self, question_id: str, answer_text: str) -> bool:
+        """作答端点调用：唤醒正在 ask_user 上挂起的 run。返回是否命中了在途暂停。
+
+        命中 = 同一进程里确有一条 run 正停在此问题等回答；没命中（服务重启过 / 多进程
+        server 模式 / 问题已过期）由调用方回退到「起新 run 续跑」的老路径。
+        """
+        fut = self._pending_answers.pop(question_id, None)
+        if fut is None or fut.done():
+            return False
+        fut.set_result(answer_text)
+        return True
+
+    def take_question(self, question_id: str) -> "asyncio.Future | None":
+        """原子取走某个问题的在途等待 future（不设置结果）。命中返回 fut，否则 None。
+
+        作答端点用它做「检查并消费」一步到位，避免 has_pending_question → 提交 → resolve
+        之间被另一个请求抢走导致误判为回退路径、多起一条 run。
+        """
+        fut = self._pending_answers.pop(question_id, None)
+        if fut is None or fut.done():
+            return None
+        return fut
+
+    def has_pending_question(self, question_id: str) -> bool:
+        """该问题当前是否有 run 在本进程内暂停等它（不消费 future）。"""
+        fut = self._pending_answers.get(question_id)
+        return fut is not None and not fut.done()
+
+    async def _plan_items(self, run_id: str) -> list[dict]:
+        """读本轮待办清单（模型自己用 update_plan 写的）。
+
+        收尾纠正不再看「系统预判的意图」，改看**模型自己的承诺**：清单里还有未完成项，
+        就说明它自己也认为活儿没干完。这比系统替它猜「该不该动手」可靠。
+        """
+        try:
+            run = await self.svcs.repo.get_run(_u(run_id))
+            return [dict(i or {}) for i in (getattr(run, "plan_json", None) or [])]
+        except Exception:  # noqa: BLE001 - 读不到就当没清单，不纠错
+            log.exception("read plan failed", extra={"run_id": run_id})
+            return []
+
+    # 汇报里「自己说要动手」的说法，分两类，都只认**第一人称的具体动作**：
+    #   · 已完成类：「已修改/改好了/已生成」；
+    #   · 将要做类：「我准备改/我来改/接下来我改」。
+    # 命中却零落地 = 模型自己说要改却没改（自相矛盾），收尾纠正一次。
+    # 刻意不收「建议怎么改 / 需要改这几处」这类**给出建议**的措辞——那是纯方案汇报的正常
+    # 结尾，把它当成承诺就等于又在逼纯问答任务去改代码。
+    _CLAIM_WORDS = ("已修改", "已改完", "改好了", "已更新文件", "已写入", "已生成",
+                    "已创建", "已新增", "已删除", "已修复", "已重构", "已落盘",
+                    "改动如下", "修改文件", "已实现",
+                    # 第一人称「打算动手」：说了要改却没改，也算自相矛盾
+                    "我准备改", "我准备动手", "我来改", "我现在改", "我现在就改",
+                    "接下来我改", "接下来我来", "我将修改", "我将改")
+
+    @classmethod
+    def _claims_action(cls, res, summary: str) -> bool:
+        """模型是否自称已经落地过改动（用于识别「说了改了、其实没改」）。"""
+        text = f"{getattr(res, 'text', '') or ''}\n{summary or ''}"
+        return any(w in text for w in cls._CLAIM_WORDS)
 
     async def _close_out_plan(self, run_ctx: RunContext) -> tuple[list[dict], list[dict]]:
         """run 成功收尾：把清单里没打勾的项标上真实收尾状态，返回 (整份清单, 未完成项)。
@@ -1139,17 +1391,19 @@ class Orchestrator:
 
     @classmethod
     def _inspect_hint(cls) -> str:
-        """「只检查/只排查/先诊断」意图的前置硬提示。
+        """用户**亲手点「仅分析」**时的前置提示。
 
-        用户要的是「问题在哪、为什么」这个结论，不是马上改。真跑起来后模型常会顺手改代码，
-        而这一轮被按 analyze（只读）跑——于是要么改不动、要么把半截改动留在工作区。
-        这里明确「只查不改、最后给结论与建议」，跟静默只读白名单呼应。
+        只在 run_type=analyze（前端写入的显式选择）时使用——这不是系统猜测，而是用户按的按钮，
+        所以可以明确「本轮只查不改」。系统自动盘查判出的 survey **绝不走这里**（见 intent.hint_for）：
+        那种情况下只给软提示，模型想改就能改。
         """
         return (
-            "## 意图判定（系统预判，优先级最高）：本轮只排查、先不改\n"
-            "用户要的是**一个结论**（问题在哪、为什么、建议怎么改），不是立刻动手改。\n"
-            "本轮：只读代码/日志/配置，定位到根因，最后给出「结论 + 证据（文件:行号/日志原文）+ 建议改法」，"
-            "本轮**不要**修改任何文件、不要起服务改配置。\n"
+            "## 本轮由用户指定为「仅分析」\n"
+            "用户在前端明确选了「仅分析」，本轮请只给**结论**："
+            "问题在哪、为什么、建议怎么改。\n"
+            "本轮：读代码/日志/配置从容定位根因，需要验证（编译、跑命令、看运行日志）就照常执行；"
+            "最后给出「结论 + 证据（文件:行号/日志原文）+ 建议改法」，"
+            "本轮**不要**修改产品文件、不要起服务改配置。\n"
             "如果用户接着让你修，下一轮再动手改。"
         )
 
@@ -1178,7 +1432,7 @@ class Orchestrator:
                 "## 意图判定（系统预判，优先级最高）\n"
                 "这是【音频/配音】需求（cv / 配音 / 语音都指配音）："
                 "第一步就直接调用 **generate_audio**。\n"
-                "严禁自己 start_service 起 IndexTTS2(8860)、curl 127.0.0.1:8860、"
+                "严禁自己 start_service 起 IndexTTS2、curl 语音服务端口、"
                 "跑 cv_gen.py / gen-cv-indextts.py / cv-presets.py 或写脚本调语音接口"
                 "——语音服务由工具内部拉起，不用你管；用户要换声线/新音色也还是 "
                 "generate_audio（design_desc + preset_name，见工具说明）。\n"
@@ -1274,9 +1528,9 @@ class Orchestrator:
                     "配音一律直接调 generate_audio，产物落 assets/audio/voice/。".format(tail=tail))
         if prov in ("openai_tts",):
             return "- 已配置在线 TTS → **可出真实人声**；配音一律直接调 generate_audio。"
-        return ("- 未配置音频档位（团队设置 → 模型档位 kind=audio，再绑到助手的 "
+        return ("- 未配置音频档位（设置 → 模型配置，kind=audio，再绑到助手的 "
                 "audio_profile）→ **占位模式 ⚠️：现在调 generate_audio 只会得到静音 wav。**"
-                "正确做法：第一步先告知用户「未配置真实音频供应商，需要先在团队设置里配置配音模型」，"
+                "正确做法：第一步先告知用户「未配置真实音频供应商，需要先在设置里配置配音模型」，"
                 "并停在这一步等用户决定——不要为了交差生成一堆静音占位文件再上报；"
                 "用户明确说「先出占位也行」才继续生成，且产物必须如实标注占位。")
 
@@ -1303,7 +1557,9 @@ class Orchestrator:
             f"测试: {project.commands_json.get('test', 'python -m pytest -q')}\n"
             "（run_command 里直接写 python 即可，平台会自动换成项目解释器，不要自己拼解释器绝对路径）\n"
             "### 自测与验收\n"
-            "- 起服务: start_service（后台起、等端口就绪）→ service_logs 看日志 → "
+            "- **默认不起服务**：改完跑 run_command 的编译/构建/单测，过了就汇报；起服务验收是重手段，"
+            "只在「用户明确要求看效果」或「同一问题多轮修改仍没解决」时才用。\n"
+            "- 真要起服务: start_service（后台起、等端口就绪）→ service_logs 看日志 → "
             "screenshot_page 截图（截图会直接进入你的视野，你必须真的看图核对效果）→ stop_service 收掉\n"
             "- **绝对不要 `taskkill /IM chrome.exe` / `killall chrome` / `pkill chrome` 清场**："
             "那是按进程名全杀，会把用户自己正开着的浏览器（含本界面）一起关掉。要截图就用 "
@@ -1314,7 +1570,9 @@ class Orchestrator:
             "- 快速校验: run_command 跑 build/test 命令（可用命令头见上方白名单；"
             "缺的命令让用户加进 .trace/allow_commands.txt）\n"
             "判断规则：你要图/音频就 generate_image / generate_audio 直接生成；"
-            "改完代码必须自己起服务+截图看过再收工；标 ❌/⚠️ 的能力要如实上报。\n"
+            "改完代码默认只做静态验证（run_command 跑编译/构建/单测），别自己拉服务截图；"
+            "用户明确要看效果、或同一问题多轮修改仍没解决时才起服务+截图核对；起服务换了几种方式仍起不来就停，"
+            "把原因、试过的方法、风险点写进汇报；标 ❌/⚠️ 的能力要如实上报。\n"
             "### 大批量任务的正确做法（决定你会不会「只做到一半」）\n"
             "没有「这次先做多少条」的说法：清单还有没做完的项时，交卷 = 半成品。"
             "唯一的硬约束是 run_command 单条命令约 300 秒超时，所以：\n"
@@ -1328,6 +1586,22 @@ class Orchestrator:
         )
 
     async def _emit(self, run_ctx: RunContext, kind: str, payload: dict) -> None:  # type: ignore[no-untyped-def]
+        # run_done 必须自带 session_id：事件通道是按「项目」扇出的，前端收到 run_done 后
+        # 只有知道是哪条会话，才能让用户点提醒直接跳过去（任务完成提示音/桌面通知都靠这个）。
+        # question_asked 的载荷本来就带 session_id，这里只补 run_done，
+        # 不给每条轨迹事件都塞一份重复字段（事件是要落库的，能省则省）。
+        if kind == "run_done" and "session_id" not in payload:
+            payload = {**payload,
+            "session_id": str(run_ctx.session_id) if run_ctx.session_id else None}
+        # 外部 IM 通道提醒（微信/钉钉）：用户不在浏览器前时靠它知道任务跑完／被提问了。
+        # 用 create_task 甩出去：推送要走公网 HTTP（最长 8s 超时），绝不能让某个
+        # 通道慢/挂掉把 run 收尾拖住或改写状态；失败只落 channel_messages。
+        if kind in ("run_done", "question_asked"):
+            self._notify_channels(run_ctx, kind, payload)
+        # 注意缩进：这一步必须在 if 外面。曾经它被多缩一级套进 run_done 分支里，
+        # 结果除 run_done 外的所有事件（task_start / task_done / plan_update /
+        # status / question_asked / notes_saved）都被静默丢掉——子agent 分组拿不到
+        # task_start/task_done，界面就退化成一串「子Agent · 读网页」流水。
         try:
             await self.svcs.bus.emit(EventEnvelope(
                 team_id=run_ctx.team_id, project_id=run_ctx.project_id,
@@ -1336,10 +1610,86 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             log.exception("emit event failed: %s", kind)
 
+    def _notify_channels(self, run_ctx: RunContext, kind: str, payload: dict) -> None:
+        """把 run 收尾/提问推送到已绑定的 IM 通道（后台 task，失败不影响 run）。
+
+        为什么要单独兜一层 try：调用点在 `_emit` 里，而 `_emit` 被收尾路径的每一步使用，
+        这里抛任何异常都会污染 run 状态判定。
+        """
+        try:
+            import asyncio as _aio
+            from game_agent.integrations import channels as _ch
+            status = str(payload.get("status") or "")
+            if kind == "question_asked":
+                status = "blocked"
+            elif status == "succeeded":
+                status = "succeeded"
+            else:
+                status = status or "succeeded"
+            _aio.get_running_loop().create_task(_ch.notify_run_finished(
+                self._sf, run_id=str(run_ctx.run_id), team_id=run_ctx.team_id,
+                status=status, session_id=str(run_ctx.session_id) if run_ctx.session_id else None))
+        except Exception:  # noqa: BLE001 - 通道通知绝不影响 run
+            log.exception("schedule channel notify failed")
+
+    async def _close_open_tasks(self, run_ctx: RunContext, run_id: str) -> None:
+        """整轮结束/取消时的兜底收口：把仍 running 的子 task 落 cancelled 并补 task_done。
+
+        为什么需要：整轮停止靠 CancelledError 向下传播，但取消是并发竞争——某个子agent 可能
+        刚被 task.cancel() 还没有走到 except 分支，主agent 的 run 收尾就已把 run_done 发出去了；
+        该子 task 之后虽会被抹平，但前端没收到 task_done 就会把它一直画成「运行中」。这里统一
+        再扫一遍并补事件（幂等：已收口的 task 状态不是 running，不会被重复处理）。
+        """
+        try:
+            tasks = await self.svcs.repo.list_tasks(run_id)
+        except Exception:  # noqa: BLE001
+            return
+        for t in tasks:
+            if t.status == "running":
+                try:
+                    await self.svcs.repo.update_task(str(t.id), status="cancelled",
+                                                     finished_at=_now())
+                    await self._emit(run_ctx, "task_done",
+                                     {"task_id": str(t.id),
+                                      "role": getattr(t, "agent_key", "sub") or "sub",
+                                      "status": "cancelled"})
+                except Exception:  # noqa: BLE001
+                    log.exception("close open task failed", extra={"task_id": str(t.id)})
+
     async def _agent_profile_key(self, team_id: str, role: str) -> str | None:
+        return (await self._agent_defaults(team_id, role))[0]
+
+    async def _agent_defaults(self, team_id: str, role: str) -> tuple[str | None, str]:
+        """角色默认：绑定档位 key + 默认推理强度（agents.params_json.reasoning_effort）。
+
+        为什么推理强度要跟着角色默认走（2026-11-14）：输入框右下角切换模型时会顺手把
+        「模型 + 推理等级」写回角色默认，新会话/没单独选过的会话才和刚才那次选择一致；
+        不认这个默认的话，设置页改了等于没改，用户看到的仍是端点默认强度。
+        """
         async with self._sf() as s:
             cfg = await get_agent_config(s, team_id, role)
-            return cfg.model_profile_key
+        params = cfg.params_json or {}
+        return cfg.model_profile_key, _norm_effort(params.get("reasoning_effort"))
+
+    async def _resolve_profile_key(self, team_id: str, role: str,
+                                   opts: dict, own_key: str | None = None) -> str | None:
+        """决定这次 run_agent 用哪个模型档位（None = 用 .env 全局兜底）。
+
+        优先级：输入框显式选择 > 本角色绑定 > （子agent）主agent 绑定 > 全局兜底。
+
+        为什么子agent 必须继承主agent 的档位：sub 角色通常没有自己的绑定（老安装里甚至
+        没有 sub 的 agents 行）。不继承就会 `_load_profile(None)` → {} → build_llm 掉回
+        .env 全局端点；而全局订阅常常已失效（403 SUBSCRIPTION_NOT_FOUND）。实测 2026-11-11：
+        一轮派出 6 个子agent 全部 403、主agent 却正常——根因正是主agent 走团队绑定档位
+        （211.101.244.244），子agent 掉到了 .env 里过期的 gonode.si 老订阅。
+        """
+        key = opts.get("model_profile_key") or own_key
+        if not key and role == "sub":
+            try:
+                key = await self._agent_profile_key(team_id, "main")
+            except Exception:  # noqa: BLE001 - 取主档位失败只影响子agent 的档位选择
+                key = None
+        return key
 
     async def _load_profile(self, team_id: str, profile_key: str | None) -> dict:
         """解析角色绑定的 ModelProfile → Ctx.model_profile；未绑定返回 {}（用全局默认）。
@@ -1376,6 +1726,10 @@ class Orchestrator:
                     api_key = pv.api_key
                     user_agent, prov_label = pv.user_agent, pv.label
                     protocol = pv.protocol or protocol
+                    # 供应商模型目录里的窗口/视觉按模型名校正 params：目录是「按模型」的
+                    # 权威配置，优先于档位 params 里可能残留的旧值（用户改了目录就该生效）。
+                    from game_agent.llm.context_window import merge_model_catalog_params
+                    params = merge_model_catalog_params(params, pv.models_json, p.model)
             return {"model": p.model, "base_url": base_url,
                     # 配置页把 API Key 存在 api_key_ref 字段（lite 模式简化存储），params_json.api_key 优先
                     "api_key": params.get("api_key") or p.api_key_ref or api_key,
@@ -1537,8 +1891,8 @@ class Orchestrator:
                         break
             # 只按「id + 时间」排序，再按 id 取整行。
             # 原因（实测踩坑）：messages 行里带 base64 附图（meta_json 可达数 MB），
-            # 直接 select(Message).order_by(created_at) 会让 MySQL 对巨型行做 filesort，
-            # 触发 1038 Out of sort memory → 整个 run 在加载上下文时就崩掉。
+            # 直接 select(Message).order_by(created_at) 会让 SQLite 对巨型行做 filesort，
+            # 内存和耗时一起爆 → 整个 run 在加载上下文时卡死。
             order_rows = (await s.execute(
                 select(Message.id, Message.created_at).where(
                     Message.session_id == m.session_id,

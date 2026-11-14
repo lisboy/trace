@@ -1,54 +1,38 @@
-"""FastAPI 依赖：从 Cookie / PAT 解析出 RequestContext，并按权限闸门。"""
+"""FastAPI 依赖：解析出「本机身份」并按权限闸门。
+
+这个版本没有登录：身份来自 ``game_agent.auth.local``（本机单用户），
+请求里的 Cookie / ``Authorization`` 一律不看。``require(perm)`` 的签名保留，
+是为了让路由层不用改——owner 拥有全部权限，闸门永远放行；
+将来若要恢复多用户，只需让 :func:`get_current_context` 重新从凭证解析。
+"""
 from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import Cookie, Depends, Header, HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from game_agent.api.state import state
-from game_agent.auth.rbac import check_permission
+from game_agent.auth.local import ensure_local_identity
 from game_agent.core.context import RequestContext
-from game_agent.db.models import Team, TeamMember, User
-from game_agent.db.session import get_session
+from game_agent.db.models import Project
+from game_agent.db.session import SessionLocal
 
 
-async def get_current_context(
-    request: Request,
-    ga_session: Optional[str] = Cookie(default=None),
-    authorization: Optional[str] = Header(default=None),
-) -> RequestContext:
-    auth = state.auth
-    user: Optional[User] = None
-    if authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:]
-        user = await auth.get_user_by_pat(token)
-    elif ga_session:
-        user = await auth.get_user_by_session(ga_session)
-    if user is None:
-        raise HTTPException(status_code=401, detail="未登录")
-    if not user.is_active:
-        raise HTTPException(status_code=403, detail="账号已禁用")
+async def local_identity() -> tuple[str, str, str]:
+    """(user_id, team_id, role)：本机唯一身份，库还没有就建（幂等）。"""
+    async with SessionLocal() as s:
+        user, team = await ensure_local_identity(s)
+        return str(user.id), str(team.id), "owner"
 
-    team_id = request.headers.get("X-Team-Id")
-    # 取成员关系：指定 team 或默认第一个
-    async with state.session_factory() as s:
-        if team_id:
-            tm = await s.scalar(select(TeamMember).where(
-                TeamMember.team_id == _u(team_id), TeamMember.user_id == user.id))
-        else:
-            tm = await s.scalar(select(TeamMember).where(TeamMember.user_id == user.id))
-        if tm is None:
-            raise HTTPException(status_code=403, detail="不在任何团队")
-        role = tm.role
-        team = await s.get(Team, tm.team_id)
-        # 项目可见性：本团队全部项目
-        from game_agent.db.models import Project
-        proj_rows = await s.execute(select(Project.id).where(Project.team_id == tm.team_id))
+
+async def get_current_context(request: Request) -> RequestContext:
+    """当前请求的身份：本机默认用户，无需任何凭证。"""
+    async with SessionLocal() as s:
+        user, team = await ensure_local_identity(s)
+        proj_rows = await s.execute(select(Project.id).where(Project.team_id == team.id))
         project_ids = [str(r[0]) for r in proj_rows.all()]
     return RequestContext(
-        user_id=str(user.id), team_id=str(tm.team_id), role=role,
+        user_id=str(user.id), team_id=str(team.id), role="owner",
         project_ids=project_ids, request_id=_rid(request),
         ip=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
@@ -63,22 +47,16 @@ def require(perm: str):
     return _dep
 
 
-async def get_optional_context(
-    request: Request,
-    ga_session: Optional[str] = Cookie(default=None),
-    authorization: Optional[str] = Header(default=None),
-) -> Optional[RequestContext]:
-    """有登录态就返回 RequestContext，没有则返回 None（不抛 401）。
-
-    用于「签名 URL 自授权」的读接口：<img> 可能带不上任何 cookie/头，此时靠 URL 签名放行；
-    若恰好有登录态，则额外做团队权限校验（双保险）。"""
+async def get_optional_context(request: Request) -> Optional[RequestContext]:
+    """历史签名：给「签名 URL 自授权」的读接口用。现在恒有身份，等价于 get_current_context。"""
     try:
-        return await get_current_context(request, ga_session, authorization)
-    except HTTPException:
+        return await get_current_context(request)
+    except Exception:  # noqa: BLE001 - 拿不到身份也不该让静态读取 500
         return None
 
 
 def _u(v):  # type: ignore[no-untyped-def]
+    """宽松 UUID 转换：字符串能转就转，转不了原样返回（路由层大量使用）。"""
     import uuid
     if isinstance(v, str):
         try:

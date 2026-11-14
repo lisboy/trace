@@ -24,6 +24,29 @@ _EXEC_VERB_RE = re.compile(
     r"\b(pythonw?(?:\d+(?:\.\d+)*)?|pypy(?:3)?|node|deno|bun|powershell|pwsh)\b", re.I)
 
 
+# 语音服务历史默认端口（8860=IndexTTS2 曾用、7860=IndexTTS2 原始默认）。现在端口可 >10000
+# 并会动态改绑，守卫不能只认死一个端口：这里动态并入「当前配置/实际端口」，同时保留这两个
+# 历史默认，保证 .env 换端口后既拦得住新端口、也拦得住模型照旧 curl 老默认端口。
+_LEGACY_TTS_PORTS = {8860, 7860}
+
+
+def _tts_ports() -> set[int]:
+    """当前需要拦的语音服务端口：配置端口 + 已改绑的实际端口 + 历史默认。"""
+    ports = set(_LEGACY_TTS_PORTS)
+    try:
+        from game_agent.assets import tts as _tts
+        for raw in (_tts.TTS_BASE_URL, _tts.actual_base()):
+            try:
+                p = _tts.urlparse((raw or "").strip()).port
+            except Exception:  # noqa: BLE001
+                p = None
+            if p:
+                ports.add(int(p))
+    except Exception:  # noqa: BLE001 - 模块导入失败也不影响守卫
+        pass
+    return ports
+
+
 def audio_python_allowed(text: str) -> bool:
     """用户是否明确要求走 python 脚本/直接调接口的老路（或明确要求运维语音服务）。"""
     t = (text or "").lower()
@@ -35,7 +58,8 @@ def audio_python_allowed(text: str) -> bool:
     if "python" in t and any(x in t for x in ("生成", "跑", "脚本", "方式", "直接", "执行")):
         return True
     # 3) 明确是在运维/排查语音服务本身（重启/启动/停止/排查 语音服务）
-    svc_words = ("语音服务", "tts", "8860", "indextts", "index-tts")
+    svc_words = ("语音服务", "tts", "indextts", "index-tts") + tuple(
+        str(p) for p in _tts_ports())
     if any(x in t for x in ("重启", "启动", "关闭", "停掉", "停止", "排查", "调试")) and any(
             x in t for x in svc_words):
         return True
@@ -67,7 +91,7 @@ def is_audio_server_command(cmd: str, port: int = 0) -> bool:
     看看有哪些音色预设名好传给 generate_audio，不是起服务——只有命令里带
     「启动/执行」信号（start、python、.py、uvicorn、conda activate…）才算。
     """
-    if int(port or 0) == 8860:
+    if int(port or 0) in _tts_ports():
         return True
     c = _norm(cmd)
     if not any(k in c for k in ("indextts2", "index-tts", "index_tts", "index tts",
@@ -82,7 +106,7 @@ def is_audio_script_command(cmd: str) -> bool:
     if any(k in c for k in ("gen-cv-indextts", "cv-presets.py", "cv_presets.py",
                             "cv_gen.py", "cv-gen.py")):
         return True
-    if "8860" in c:
+    if any(re.search(rf":{p}(?:\D|$)", c) for p in _tts_ports()):
         return True
     if any(k in c for k in ("/api/v1/voice-design", "/api/v1/synthesize",
                             "/api/v1/tts", "voice-design/presets")):
@@ -93,8 +117,8 @@ def is_audio_script_command(cmd: str) -> bool:
 AUDIO_ROUTE_DENIED = (
     "这条命令被拦：配音生成一律直接调用 **generate_audio** 工具，"
     "语音服务由它内部自动拉起/管理。不要自己 start_service 起 IndexTTS2、"
-    "不要 curl 127.0.0.1:8860、不要跑 cv_gen.py / gen-cv-indextts.py / cv-presets.py，"
-    "也不要写自定义脚本去调语音接口。\n"
+    "不要 curl 语音服务端口（如 127.0.0.1:8860）、不要跑 cv_gen.py / gen-cv-indextts.py / "
+    "cv-presets.py，也不要写自定义脚本去调语音接口。\n"
     "正确做法：generate_audio(text=台词, voice=音色预设名, kind=\"voice\", slug=...)。\n"
     "需要新音色（用户说「不要之前的预设」）时，generate_audio 传 "
     "design_desc=音色文字描述、preset_name=预设名，它会先造音色再合成，不用你起服务。\n"
@@ -146,7 +170,8 @@ def script_calls_audio(cmd: str, workspace) -> bool:
     except OSError:
         return False
     low_body = body.lower()
-    return ("8860" in low_body or "voice-design" in low_body or "/api/v1/tts" in low_body
+    port_hit = any(re.search(rf":{p}(?:\D|$)", low_body) for p in _tts_ports())
+    return (port_hit or "voice-design" in low_body or "/api/v1/tts" in low_body
             or "indextts" in low_body or "gen-cv-indextts" in low_body)
 
 

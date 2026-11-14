@@ -114,7 +114,12 @@ def status() -> dict[str, Any]:
 
 def _url(kind: str) -> str:
     if kind == "image":
-        return (COMFYUI_BASE_URL or "").strip().rstrip("/")
+        # ComfyUI 配置端口被保留/占用时会自动改绑，走实际端口（见 assets/comfyui.py）
+        try:
+            from game_agent.assets import comfyui as _comfyui
+            return _comfyui.actual_base()
+        except Exception:  # noqa: BLE001
+            return (COMFYUI_BASE_URL or "").strip().rstrip("/")
     # voice 走 tts 的实际端口（配置端口被系统保留时会自动改绑，见 assets/tts.py）
     try:
         from game_agent.assets import tts as _tts
@@ -126,9 +131,9 @@ def _url(kind: str) -> str:
 def _port_of(kind: str) -> int:
     url = _url(kind)
     try:
-        return urlparse(url).port or (8188 if kind == "image" else 7860)
+        return urlparse(url).port or (10188 if kind == "image" else 10189)
     except Exception:  # noqa: BLE001
-        return 8188 if kind == "image" else 7860
+        return 10188 if kind == "image" else 10189
 
 
 def _is_local(kind: str) -> bool:
@@ -169,16 +174,16 @@ async def _wait_closed(kind: str, timeout_s: float) -> bool:
 
 async def _stop(kind: str) -> dict[str, Any]:
     if kind == "image":
-        from game_agent.assets.comfyui import stop_comfyui_service
-        return await stop_comfyui_service(COMFYUI_BASE_URL)
+        from game_agent.assets.comfyui import actual_base, stop_comfyui_service
+        return await stop_comfyui_service(actual_base())
     from game_agent.assets.tts import stop_tts_service
     return await stop_tts_service(TTS_BASE_URL)
 
 
 async def _start(kind: str) -> dict[str, Any]:
     if kind == "image":
-        from game_agent.assets.comfyui import ensure_comfyui_running
-        return await ensure_comfyui_running(COMFYUI_BASE_URL)
+        from game_agent.assets.comfyui import actual_base, ensure_comfyui_running
+        return await ensure_comfyui_running(actual_base())
     from game_agent.assets.tts import ensure_tts_running
     return await ensure_tts_running(TTS_BASE_URL)
 

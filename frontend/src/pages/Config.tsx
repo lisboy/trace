@@ -8,10 +8,17 @@ import SkillsTab from "../components/SkillsTab";
 import SystemLogs from "../components/SystemLogs";
 import ProfileTab from "../components/ProfileTab";
 import AssistantTab from "../components/AssistantTab";
+import StorageTab from "../components/StorageTab";
+import ChannelsTab from "../components/ChannelsTab";
 import SearchSelect from "../components/SearchSelect";
 
 const ROLE_NAMES: Record<string, string> = {
   main: "助手",
+};
+
+/** 推理强度档位的显示名（与后端 REASONING_EFFORTS 对齐；空=端点默认） */
+const EFFORT_LABELS: Record<string, string> = {
+  none: "None", minimal: "Minimal", low: "Low", medium: "Medium", high: "High",
 };
 
 /** 后端时间是 UTC 裸串（`2026-10-30 06:06:12+00:00`）。直接 slice 会既带 +00:00 又差 8 小时，
@@ -35,7 +42,7 @@ type Agent = {
 };
 type Profile = ModelProfileRow;
 type Provider = { id: string; driver_key: string; label: string; kind: string; enabled: boolean };
-export type ConfigTab = "profile" | "assistant" | "appearance" | "skills" | "agents" | "profiles" | "providers" | "memory" | "mcp" | "logs";
+export type ConfigTab = "profile" | "assistant" | "appearance" | "skills" | "agents" | "profiles" | "providers" | "memory" | "mcp" | "channels" | "storage" | "logs";
 
 /** 设置弹窗：盖在当前页上，左侧分类 + 右侧内容（对齐 Qoder 的设置对话框）。 */
 export default function Config({ onClose, initialTab }: { onClose?: () => void; initialTab?: ConfigTab }) {
@@ -113,6 +120,13 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
     refresh();
   }
 
+  /** 默认推理强度（params_json.reasoning_effort）：输入框右下角切换「推理等级」时也写这里。
+   *  只传 params_json，避免顺手覆盖 system_prompt / 打上「自定义提示词」标记。 */
+  async function bindEffort(a: Agent, key: string) {
+    await api.updateAgent(a.key, { params_json: { reasoning_effort: key } });
+    refresh();
+  }
+
   const ico = (d: ReactNode) => (
     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
       strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="shrink-0">
@@ -128,7 +142,9 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
     { v: "profiles", label: "模型配置", icon: ico(<><path d="M4 8h9M19 8h1M4 16h3M13 16h7" /><circle cx="16" cy="8" r="2.2" /><circle cx="10" cy="16" r="2.2" /></>) },
     { v: "providers", label: "素材供应商", icon: ico(<><path d="M21 8 12 3 3 8v8l9 5 9-5z" /><path d="M3 8l9 5 9-5M12 13v8" /></>) },
     { v: "mcp", label: "MCP 服务器", icon: ico(<><rect x="3" y="4" width="18" height="7" rx="2" /><rect x="3" y="13" width="18" height="7" rx="2" /><path d="M7 7.5h.01M7 16.5h.01" /></>) },
+    { v: "channels", label: "消息通道", icon: ico(<><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-3.9-.9L3 21l1.9-4.9A8.4 8.4 0 0 1 12 3a8.4 8.4 0 0 1 9 8.5z" /><path d="M8.5 11h.01M12 11h.01M15.5 11h.01" /></>) },
     { v: "memory", label: "项目记忆", icon: ico(<><path d="M4 5a2 2 0 0 1 2-2h12v18H6a2 2 0 0 1-2-2z" /><path d="M8 3v18M12 8h4M12 12h4" /></>) },
+    { v: "storage", label: "存储空间", icon: ico(<><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5" /><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" /></>) },
     { v: "logs", label: "系统日志", icon: ico(<><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M7 8h10M7 12h10M7 16h6" /></>) },
   ];
 
@@ -187,7 +203,11 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
 
       {tab === "memory" && <MemoryTab />}
 
+      {tab === "storage" && <StorageTab />}
+
       {tab === "mcp" && <McpTab />}
+
+      {tab === "channels" && <ChannelsTab />}
 
       {tab === "logs" && <SystemLogs open onClose={() => {}} embedded />}
 
@@ -265,6 +285,25 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
                       }}
                     />
                   </label>
+                  <label className="text-xs text-slate-500 flex items-center gap-1"
+                    title="默认推理强度：输入框右下角切换「推理等级」会写回这里；不指定=走模型端点默认">
+                    推理等级
+                    <SearchSelect
+                      className="border rounded px-2 py-1 text-xs w-[112px]"
+                      value={a.params_json?.reasoning_effort ?? ""}
+                      title="默认推理强度。输入框右下角切换「推理等级」时也写这里；不指定=走端点默认"
+                      searchPlaceholder="搜索…"
+                      options={[
+                        { value: "", label: "Default" },
+                        { value: "none", label: "None" },
+                        { value: "minimal", label: "Minimal" },
+                        { value: "low", label: "Low" },
+                        { value: "medium", label: "Medium" },
+                        { value: "high", label: "High" },
+                      ]}
+                      onChange={(v) => bindEffort(a, v)}
+                    />
+                  </label>
                   <label className="text-xs text-slate-500 flex items-center gap-1">美术模型
                     <SearchSelect
                       className="border rounded px-2 py-1 text-xs w-[130px]"
@@ -337,6 +376,12 @@ export default function Config({ onClose, initialTab }: { onClose?: () => void; 
                   ) : (
                     <span className="text-slate-400">全局默认（环境变量）</span>
                   )}
+                  <span className="text-slate-400"> · </span>
+                  <span title="默认推理强度（输入框右下角切换会写回这里）">
+                    推理：{a.params_json?.reasoning_effort
+                      ? <span className="mono text-slate-700">{EFFORT_LABELS[a.params_json.reasoning_effort] || a.params_json.reasoning_effort}</span>
+                      : <span className="text-slate-400">端点默认</span>}
+                  </span>
                 </span>
                 <span>
                   美术：{boundImage ? (
@@ -537,7 +582,7 @@ function McpTab() {
             options={[{ value: "", label: "选择项目" }, ...projects.map((p) => ({ value: p.id, label: p.name, keywords: p.name }))]}
             onChange={(v) => { setProjectId(v); resetForm(); }} />
           <span className="text-[11px] text-slate-400">
-            项目级 MCP 服务器：工具以 mcp_名称_工具名 注入各角色（仅分析模式除外）。改配置下次 run 生效。
+            项目级 MCP 服务器：工具以 mcp_名称_工具名 注入各角色。改配置下次 run 生效。
           </span>
         </div>
         {projectId && (
@@ -771,16 +816,31 @@ function MemoryTab() {
       {projectId && notes.length > 0 && (
         <div className="mb-4">
           <div className="text-xs text-slate-500 mb-1.5">
-            改动经验（run 收尾判断「值得记」才写，落在工作区 .agent/notes/ 的分类 md；后续 run 注入的是条目标题索引，智能体按标题自己去读正文）
+            改动经验（run 收尾判断「值得记」才写，落在工作区 .trace/notes/ 的分类 md；后续 run 注入的是条目标题索引，智能体按标题自己去读正文）。
+            每类满 40 条后按「已失效最先淘汰 → 其余丢最旧 → 钉住的永不淘汰」处理；「标失效」是留痕，不是删除。
           </div>
           <div className="space-y-1.5">
             {notes.map((n) => (
-              <div key={`${n.category}:${n.key}`} className="bg-white rounded border border-emerald-100 p-3 flex items-start gap-2 text-sm">
+              <div key={`${n.category}:${n.key}`}
+                   className={`bg-white rounded border p-3 flex items-start gap-2 text-sm ${
+                     n.stale ? "border-slate-200 opacity-60" : "border-emerald-100"}`}>
                 <span className="text-[10px] px-1.5 py-0.5 rounded shrink-0 mt-0.5 bg-emerald-50 text-emerald-700">
                   {n.category_cn}
                 </span>
                 <div className="flex-1 min-w-0">
-                  <div className="font-medium text-slate-700">{n.title}</div>
+                  <div className="font-medium text-slate-700 break-words">
+                    {n.title}
+                    {n.keep && (
+                      <span className="ml-1.5 text-[10px] px-1 py-0.5 rounded bg-amber-50 text-amber-700 align-middle">
+                        钉住
+                      </span>
+                    )}
+                    {n.stale && (
+                      <span className="ml-1.5 text-[10px] px-1 py-0.5 rounded bg-slate-100 text-slate-500 align-middle">
+                        已失效
+                      </span>
+                    )}
+                  </div>
                   <div className="whitespace-pre-wrap break-words text-[12.5px] text-slate-600 mt-0.5">{n.detail}</div>
                   {n.files.length > 0 && (
                     <div className="text-[11px] text-slate-400 mt-1 break-words">涉及：{n.files.join("、")}</div>
@@ -789,16 +849,42 @@ function MemoryTab() {
                     {n.when}{n.run_id && ` · run ${n.run_id.slice(0, 8)}`}
                   </div>
                 </div>
-                <button
-                  className="text-xs text-red-600 shrink-0"
-                  onClick={async () => {
-                    if (!confirm("删除这条改动经验？")) return;
-                    await api.deleteProjectNote(projectId, n.category, n.key);
-                    refresh();
-                  }}
-                >
-                  删除
-                </button>
+                <div className="flex flex-col items-end gap-1 shrink-0">
+                  <button
+                    className="text-xs text-amber-700"
+                    title={n.keep
+                      ? "取消钉住：不再豁免淘汰"
+                      : "钉住：每类满了 40 条时优先淘汰最旧的，钉住的永不淘汰"}
+                    onClick={async () => {
+                      await api.setProjectNoteFlag(projectId, n.category, n.key, { keep: !n.keep });
+                      refresh();
+                    }}
+                  >
+                    {n.keep ? "取消钉住" : "钉住"}
+                  </button>
+                  <button
+                    className="text-xs text-slate-500"
+                    title={n.stale
+                      ? "恢复：重新参与注入与正常淘汰"
+                      : "标失效：不再注入上下文、优先淘汰（留痕，不删除）"}
+                    onClick={async () => {
+                      await api.setProjectNoteFlag(projectId, n.category, n.key, { stale: !n.stale });
+                      refresh();
+                    }}
+                  >
+                    {n.stale ? "恢复" : "标失效"}
+                  </button>
+                  <button
+                    className="text-xs text-red-600"
+                    onClick={async () => {
+                      if (!confirm("删除这条改动经验？")) return;
+                      await api.deleteProjectNote(projectId, n.category, n.key);
+                      refresh();
+                    }}
+                  >
+                    删除
+                  </button>
+                </div>
               </div>
             ))}
           </div>

@@ -110,6 +110,22 @@ async def delete_note(project_id: str, category: str, key: str,
     return {"ok": True}
 
 
+class NoteFlagIn(BaseModel):
+    keep: bool | None = None
+    stale: bool | None = None
+
+
+@router.post("/projects/{project_id}/notes/{category}/{key}/flag")
+async def flag_note(project_id: str, category: str, key: str, body: NoteFlagIn,
+                    ctx: RequestContext = Depends(require(PERM_RUN_CREATE))):
+    """钉住（永不淘汰）/ 标失效（不再注入、优先淘汰）。失效是留痕，不是删除。"""
+    p = await _check_project(project_id, ctx)
+    if not project_notes.set_flag(PROJECTS_ROOT / p.repo_path, category, key,
+                                  keep=body.keep, stale=body.stale):
+        raise HTTPException(status_code=404, detail="经验条目不存在（或已被删除）")
+    return {"ok": True}
+
+
 def _u(v):  # type: ignore[no-untyped-def]
     import uuid
     if isinstance(v, str):

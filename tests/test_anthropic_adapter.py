@@ -124,3 +124,66 @@ def test_stream_translation():
         assert any(t == "你好" for _, t in deltas)
     finally:
         srv.should_exit = True
+
+
+def _body_has_image_block(body: dict) -> bool:
+    for m in body.get("messages", []):
+        c = m.get("content")
+        if isinstance(c, list) and any(
+                isinstance(p, dict) and p.get("type") == "image" for p in c):
+            return True
+    return False
+
+
+def _start_reject_image_server():
+    """模拟「anthropic 协议」中转站背后是 OpenAI/SGLang 内核：图片块会被内核以
+    「content 必须是字符串」400 拒绝（即线上真实故障）。纯文本则正常。"""
+    import uvicorn
+    from fastapi.responses import JSONResponse
+    captured: dict = {"reqs": []}
+    app = FastAPI()
+
+    @app.post("/v1/messages")
+    async def messages(req: Request):
+        body = await req.json()
+        captured["reqs"].append(body)
+        if _body_has_image_block(body):
+            msg = ("23 validation errors: {'type':'string_type','loc':('body','messages',1,"
+                   "'function-after[validate_thinking_parts_role(), ChatCompletionMessageGenericParam]',"
+                   "'content','str'),'msg':'Input should be a valid string','input':[{'type':")
+            return JSONResponse({"error": {"type": "bad_response_status_code",
+                                           "message": msg}}, status_code=400)
+        return {"id": "m", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": "好的"}],
+                "usage": {"input_tokens": 5, "output_tokens": 2}}
+
+    cfg = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
+    srv = uvicorn.Server(cfg)
+    threading.Thread(target=srv.run, daemon=True).start()
+    for _ in range(200):
+        if srv.started:
+            break
+        time.sleep(0.05)
+    port = srv.servers[0].sockets[0].getsockname()[1]
+    return srv, f"http://127.0.0.1:{port}", captured
+
+
+def test_image_block_reject_degrades_to_text():
+    """带图被 400 时不应把 run 打崩：自动把图片降成文字说明后重发成功。"""
+    srv, base, captured = _start_reject_image_server()
+    try:
+        llm = AnthropicMessagesLLM("main", model="claude-x", api_key="sk-test",
+                                   base_url=base, vision=True)
+        img = {"type": "image_url",
+               "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQSkZJRg=="}}
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": [{"type": "text", "text": "看图"}, img]},
+        ]
+        resp = asyncio.run(llm.chat(messages, [], Ctx(role="main")))
+        assert resp.text == "好的"
+        assert len(captured["reqs"]) == 2
+        assert _body_has_image_block(captured["reqs"][0])       # 第一次带图块 → 400
+        assert not _body_has_image_block(captured["reqs"][1])    # 降级后不再有图块
+    finally:
+        srv.should_exit = True

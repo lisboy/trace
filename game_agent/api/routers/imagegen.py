@@ -27,8 +27,8 @@ from game_agent.api.deps import require
 from game_agent.api.routers import progress
 from game_agent.assets import gpu_arbiter, media_queue, presets as img_presets, views as img_views
 from game_agent.assets.comfyui import (
-    ComfyUIError, comfyui_queue_state, ensure_comfyui_running, fetch_model_options,
-    generate_images_bytes, loras_dir, stop_comfyui_service)
+    ComfyUIError, actual_base, comfyui_queue_state, ensure_comfyui_running,
+    fetch_model_options, generate_images_bytes, loras_dir, stop_comfyui_service)
 from game_agent.assets.placeholder import _parse_size
 from game_agent.assets.presets import BUILTIN_PRESETS
 from game_agent.auth.rbac import PERM_AGENT_CONFIG, PERM_DOWNLOAD, PERM_VIEW
@@ -65,8 +65,9 @@ JSON 格式：
 - 【全部用中文】撰写：positive 和 negative 都必须是中文，不要英文标签、不要英文单词堆砌。
 - positive：用中文逗号分隔的短语，按「主体 → 数量/动作姿态 → 构图/镜头 → 风格 → 配色 →
   光影 → 材质 → 背景 → 画质」的顺序组织；主体在前，画质词在后（如：高清、杰作、极致细节）。
-  例：「一位黑发冷艳女子，正面半身像，三分之四视角，国风厚涂，黑白配色，柔和侧光，
-  丝绸质感，城市夜景虚化，高清，杰作」
+  「风格」一律取自用户需求本身（用户说写实就写实、说动漫就动漫、说厚涂就厚涂），
+  用户没提风格时**不要擅自加任何具体画风**。例：「一位黑发冷艳女子，正面半身像，三分之四视角，
+  柔和侧光，丝绸质感，城市夜景虚化，高清，杰作」
 - negative：用中文写出要排除的问题（中文逗号分隔），针对本次内容补充
   （例：人物→多余手指、畸形手、五官不对称；机械/硬表面→锈迹、噪点；Q版/卡通→写实照片、三维渲染；文字类→文字、水印）。
 - 不要输出换行以外的东西；字符串内不要出现未转义的双引号。
@@ -343,7 +344,7 @@ def _new_name(name: str) -> str:
 
 @router.get("/options")
 async def options(ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
-    data = await fetch_model_options(COMFYUI_BASE_URL)
+    data = await fetch_model_options(actual_base())
     # 附带多视角目录与默认负面词，前端渲染视角选择器/负面框直接取用
     data["views"] = img_views.view_catalog()
     data["default_negative_prompt"] = COMFYUI_NEGATIVE_PROMPT
@@ -421,7 +422,7 @@ async def comfyui_stop(ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))
     """手动停止 ComfyUI 服务：杀掉监听 API 端口的进程及其子进程。"""
     if not COMFYUI_BASE_URL:
         raise HTTPException(status_code=400, detail="未配置 ComfyUI 地址（.env COMFYUI_BASE_URL）")
-    res = await stop_comfyui_service(COMFYUI_BASE_URL)
+    res = await stop_comfyui_service(actual_base())
     if not res.get("stopped"):
         return {"stopped": False, "detail": "ComfyUI 未在运行"}
     return {"stopped": True, "killed": res.get("killed") or []}
@@ -682,7 +683,7 @@ async def get_job(job_id: str, ctx: RequestContext = Depends(require(PERM_AGENT_
     job = progress.get(job_id)
     # 采样阶段实时查 ComfyUI 队列，把「正在跑 / 排队第几位」透出来
     if job is not None and job.get("stage") == "sampling" and job.get("prompt_id"):
-        st = await comfyui_queue_state(job["prompt_id"], COMFYUI_BASE_URL)
+        st = await comfyui_queue_state(job["prompt_id"], actual_base())
         qs = st.get("state") or ""
         progress.set_queue(job_id, qs,
                            st.get("position") if qs == "queued" else None)
@@ -750,7 +751,7 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
 
     # 3) 确保 ComfyUI 在运行（未启动则自动拉起并等待就绪）
     progress.set_stage(job_id, "starting", "正在准备 ComfyUI 服务…")
-    boot = await ensure_comfyui_running(COMFYUI_BASE_URL)
+    boot = await ensure_comfyui_running(actual_base())
     if boot["error"]:
         raise HTTPException(status_code=502, detail=f"ComfyUI 不可用：{boot['error']}")
     boot_note = (f"ComfyUI 已自动启动（{boot['waited_ms'] / 1000:.1f}s）" if boot["started"] else "")

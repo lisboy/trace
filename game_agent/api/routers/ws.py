@@ -1,4 +1,8 @@
-"""WebSocket 实时事件扇出（设计 §8.1）。DB 是权威源；此处为加速通道。"""
+"""WebSocket 实时事件扇出（设计 §8.1）。DB 是权威源；此处为加速通道。
+
+这个版本没有登录，所以也不再校验 token——本机就是本人。
+唯一保留的检查是「这个项目存在且属于本机工作区」，避免拿别的 project_id 乱订阅。
+"""
 from __future__ import annotations
 
 import json
@@ -6,7 +10,8 @@ import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from game_agent.api.state import state
-from game_agent.db.models import Project, User
+from game_agent.auth.local import ensure_local_identity
+from game_agent.db.models import Project
 from game_agent.db.session import SessionLocal
 
 router = APIRouter()
@@ -15,19 +20,11 @@ router = APIRouter()
 @router.websocket("/ws/projects/{project_id}")
 async def project_events(websocket: WebSocket, project_id: str):
     await websocket.accept()
-    token = websocket.query_params.get("token")
-    team_id = websocket.query_params.get("team_id")
-    if not token:
-        await websocket.close(code=4401)
-        return
-    user = await state.auth.get_user_by_pat(token)
-    if user is None:
-        await websocket.close(code=4401)
-        return
     async with SessionLocal() as s:
+        _user, team = await ensure_local_identity(s)
         project = await s.get(Project, _u(project_id))
-        if project is None or str(project.team_id) != team_id:
-            await websocket.close(code=4403)
+        if project is None or str(project.team_id) != str(team.id):
+            await websocket.close(code=4404)
             return
     await websocket.send_json({"type": "connected", "project_id": project_id})
     try:

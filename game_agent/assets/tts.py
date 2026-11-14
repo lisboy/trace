@@ -77,11 +77,14 @@ def parse_emo_vector(value: Any) -> list[float] | None:
 
 
 async def health(base_url: str = "", timeout_s: float = 3.0) -> dict[str, Any]:
-    """探测语音服务。返回 {enabled, reachable, model_loaded, design_ready, error}。
+    """探测语音服务。返回 {enabled, reachable, model_loaded, design_ready, error, base_url}。
 
     永不抛异常：状态栏/下拉框要能一直渲染，服务挂了只是显示"未连接"。
+    传了显式 base_url（如档位里那个旧端口）时走 _base()：一旦系统把配置端口改绑，
+    这里要跟着映射到实际端口，否则状态栏永远显示「未连接」。
     """
-    eff = (base_url or actual_base() or "").strip().rstrip("/")
+    eff = (_base(base_url or actual_base() or "") if (base_url or actual_base())
+           else "").strip().rstrip("/")
     info: dict[str, Any] = {
         "enabled": bool(eff),
         "reachable": False, "model_loaded": False, "design_ready": False,
@@ -125,10 +128,14 @@ _ENSURE_FAIL_TTL_S = 60.0
 # 2026-11-05 实测：Hyper-V/WinNAT 动态保留把 8851-8950 整段排除，原设的 8860 正好落在里面，
 # 语音服务连续 5 次起不来。这里记住「实际可用端口」，让之后连它的地方（合成/健康/列表）
 # 都改走它，不必改库里的档位配置。_ACTUAL_BASE 非空时覆盖 TTS_BASE_URL。
+# 2026-11-10 用户要求：端口统一用 10000 以上（避开 Windows 保留段，也避开低位常用端口），
+# 被占用/被系统保留时自动改绑到 10000 以上的空闲端口（与 ComfyUI 同一套规则）。
 _ACTUAL_BASE: str | None = None
-# 端口被系统保留时的自动改绑候选：先从配置端口往后跳几个，再试本机高位空闲区。
-# 7860 是 Windows 保留段 7781-7880 的常客（.env 里早有注释），所以 7860 也排除。
-_PORT_BLOCKED_SKIP = {7860, 8860}
+# 端口下限：改绑候选一律 >10000（用户要求）。
+_PORT_FLOOR = 10000
+# 端口被系统保留时的自动改绑候选：先从配置端口往上跳几个，再试本机高位空闲区。
+# 7860 是 Windows 保留段 7781-7880 的常客；18888 是 game_agent 后端自身端口——都排除。
+_PORT_BLOCKED_SKIP = {7860, 8860, 18888}
 
 
 def actual_base() -> str:
@@ -136,15 +143,117 @@ def actual_base() -> str:
     return (_ACTUAL_BASE or TTS_BASE_URL or "").strip().rstrip("/")
 
 
+def _cfg_base() -> str:
+    return (TTS_BASE_URL or "").strip().rstrip("/")
+
+
+def _cfg_port() -> int:
+    try:
+        return urlparse(_cfg_base()).port or 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _candidate_ports() -> list[int]:
+    """配置端口 + 已改绑端口（去重、保序）——停止/改绑/发现外部实例时用。"""
+    ports: list[int] = []
+    for raw in (TTS_BASE_URL, _ACTUAL_BASE):
+        try:
+            p = urlparse((raw or "").strip()).port
+        except Exception:  # noqa: BLE001
+            p = None
+        if p and p not in ports:
+            ports.append(p)
+    return ports
+
+
+def _all_bases() -> list[str]:
+    """配置地址 + 已改绑地址（去重、保序；空忽略）。停止服务时两处都要看一眼。"""
+    out: list[str] = []
+    for raw in (TTS_BASE_URL, _ACTUAL_BASE):
+        b = (raw or "").strip().rstrip("/")
+        if b and b not in out:
+            out.append(b)
+    return out
+
+
+def discover_external(probe: bool = True) -> str | None:
+    """同步找一个「外部已拉起」的语音服务实际地址（端口可能 ≠ 配置端口）。
+
+    背景：用户手动起服务 / 旧实例还在跑时，实际端口可能与配置不同。配置端口探不通时，
+    API 层（/status、/start）调它把 _ACTUAL_BASE 记下来，让后续探活/合成/状态栏跟随。
+    probe=True 时逐个候选做真实 HTTP 探活（同步 httpx，供在线程里跑）。
+    """
+    global _ACTUAL_BASE
+    ext = _find_starting_tts()
+    cands: list[int] = []
+    if ext and ext.get("port"):
+        cands.append(int(ext["port"]))
+    for p in _candidate_ports():
+        if p not in cands:
+            cands.append(p)
+    _u = urlparse((TTS_BASE_URL or "").strip())
+    host = _u.hostname or "127.0.0.1"
+    scheme = _u.scheme or "http"
+    for p in cands:
+        if not p or p < 1024:
+            continue
+        base = f"{scheme}://{host}:{p}"
+        if probe:
+            try:
+                with httpx.Client(timeout=1.5, trust_env=False) as c:
+                    if c.get(f"{base}/api/v1/model").status_code != 200:
+                        continue
+            except Exception:  # noqa: BLE001
+                continue
+        _ACTUAL_BASE = base
+        log.info("检测到外部语音服务实际端口 %s（配置 %s），探活跟随", base, TTS_BASE_URL)
+        return base
+    return None
+
+
+async def _discover_external(probe: bool = True) -> str | None:
+    return await asyncio.to_thread(discover_external, probe)
+
+
+def _maybe_rebind(base: str) -> str:
+    """配置端口 bind 不了（系统保留 WinError 10013 / 被占用 10048）→ 改绑到 >10000 的可用
+    端口并记下 _ACTUAL_BASE。只在「本机 + 尚未改绑 + 该端口确实 bind 不了」时动；远端地址
+    / 本来就能用的端口原样返回。改绑只动 base，库里的档位配置不用改。
+
+    关键排除：端口若正被「外部 IndexTTS 实例」占用（它还在加载、暂时探不通但进程在），
+    那是同一台服务的启动中，不是「系统保留」——不能改绑，否则会另起一个实例（双开抢卡）。
+    """
+    global _ACTUAL_BASE
+    if _ACTUAL_BASE is not None:
+        return base
+    u = urlparse(base)
+    if u.hostname not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+        return base
+    if not u.port or _port_bindable(u.port):
+        return base
+    ext = _find_starting_tts()
+    if ext is not None and (not ext.get("port") or ext.get("port") == u.port):
+        # 外部实例正占用该端口（加载中 / 探测暂不可达）→ 视为「在启动」，不改绑
+        return base
+    alt = _pick_alt_base(base)
+    if alt:
+        log.warning("语音服务端口 %s 被系统保留/占用（WinError 10013/10048 一类），"
+                    "自动改绑到 %s", base, alt)
+        _ACTUAL_BASE = alt
+        return alt
+    return base
+
+
 def _base(base_url: str = "") -> str:
     req = (base_url or "").strip().rstrip("/")
     # 显式传入的地址若正是「配置里那个被系统拒绝、已自动改绑」的端口 → 用改绑后的，
-    # 否则 specialized._indextts_generate 一路把档位里的 8860 传下来，HTTP 层照样打死。
-    if req and _ACTUAL_BASE and req == (TTS_BASE_URL or "").strip().rstrip("/"):
+    # 否则 specialized._indextts_generate 一路把档位里的旧端口传下来，HTTP 层照样打死。
+    if req and _ACTUAL_BASE and req == _cfg_base():
         return _ACTUAL_BASE
     base = (req or actual_base() or "").strip().rstrip("/")
     if not base:
-        raise TTSError("未配置语音服务地址（.env TTS_BASE_URL，例：http://127.0.0.1:7860）")
+        raise TTSError("未配置语音服务地址（.env TTS_BASE_URL，例：http://127.0.0.1:10189）")
     return base
 
 
@@ -164,7 +273,8 @@ def _port_bindable(port: int) -> bool:
 
 def _pick_alt_base(base: str) -> str | None:
     """配置端口 bind 不了时挑一个可用端口，返回改绑后的 base URL（保持 host/协议）。
-    只在「本机且配置端口确实被系统拒绝」时用；远端地址一律不动。"""
+    只在「本机且配置端口确实被系统拒绝/占用」时用；远端地址一律不动。
+    候选全部 >10000（用户要求）：先从配置端口往上 +100 步进探测，再试几个高位空闲区。"""
     u = urlparse(base)
     host = (u.hostname or "")
     if host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
@@ -174,11 +284,12 @@ def _pick_alt_base(base: str) -> str | None:
         return None
     if _port_bindable(cur):
         return None  # 配置端口本来就能用，不改
-    candidates: list[int] = []
-    candidates += [cur + d for d in (100, 200, 300, 400)]          # 近邻跳
-    candidates += [18960, 18961, 18962, 7861, 7862, 18760, 7160, 7000]  # 高位空闲区
+    # 近邻上跳：从 max(配置端口+100, 10000+100) 起步，确保候选全部 >10000
+    start = max(cur + 100, _PORT_FLOOR + 100)
+    candidates: list[int] = [start + 100 * i for i in range(0, 6)]
+    candidates += [10188, 10189, 10288, 10888, 11088, 12088, 13088, 15088, 18088, 21088]
     for p in candidates:
-        if p in _PORT_BLOCKED_SKIP or p < 1024 or p > 65535:
+        if p in _PORT_BLOCKED_SKIP or p <= _PORT_FLOOR or p > 65535:
             continue
         if _port_bindable(p):
             return f"{u.scheme or 'http'}://{host}:{p}"
@@ -208,13 +319,19 @@ def _read_boot_log_tail(n: int = 25) -> str:
 
 
 def _find_starting_tts() -> dict | None:
-    """找「外部已拉起、正在启动中」的 IndexTTS2 进程（cmdline 带 TTS_HOME / indextts / server.py）。"""
+    """找「外部已拉起、正在启动中」的 IndexTTS2 进程（cmdline 带 TTS_HOME / indextts / server.py）。
+
+    返回里带 port：优先从 cmdline 解析 --port；解析不到就从该进程（含子进程）的监听端口
+    反查——覆盖「用户手动起、端口 ≠ 配置端口」与「shell 秒退、真身是子进程」的场景，
+    让状态栏/探活跟随实际端口，避免永远显示「未连接」。
+    """
     try:
         import psutil
     except ImportError:
         return None
     home = str(TTS_HOME or "").lower().replace("\\", "/").rstrip("/")
     me = psutil.Process().pid
+    cfg_port = _cfg_port()
     for p in psutil.process_iter(["pid", "cmdline"]):
         if p.info["pid"] == me:
             continue
@@ -225,9 +342,33 @@ def _find_starting_tts() -> dict | None:
         if "game_agent" in low or "pytest" in low:
             continue
         hit = (home and home in low) or "indextts" in low or (
-            "server.py" in low and str(urlparse(actual_base()).port or 7860) in low)
+            "server.py" in low and str(cfg_port or 10189) in low)
         if hit and "python" in low:
-            return {"pid": p.info["pid"], "cmdline": cl[:200]}
+            info = {"pid": p.info["pid"], "cmdline": cl[:200]}
+            m = re.search(r"--port\s+(\d+)", cl)
+            if m:
+                try:
+                    info["port"] = int(m.group(1))
+                except ValueError:
+                    pass
+            if "port" not in info:
+                # 命令行没有 --port → 从进程树监听端口反查（取最小的高位端口，通常只有一个 API 端口）
+                try:
+                    proc = psutil.Process(p.info["pid"])
+                    procs = [proc] + proc.children(recursive=True)
+                except psutil.NoSuchProcess:
+                    procs = []
+                ports: set[int] = set()
+                for q in procs:
+                    try:
+                        for c in q.net_connections(kind="inet"):
+                            if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port >= 1024:
+                                ports.add(c.laddr.port)
+                    except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        continue
+                if ports:
+                    info["port"] = min(ports)
+            return info
     return None
 
 
@@ -249,7 +390,7 @@ def _launch_cmd(base: str) -> tuple[str, str | None]:
     py = home / "runtime" / "python.exe"
     srv = home / "server.py"
     if py.is_file() and srv.is_file():
-        port = urlparse(base).port or 7860
+        port = urlparse(base).port or 10189
         return f'"{py}" -u "{srv}" --port {port}', str(home)
     return "", None
 
@@ -284,7 +425,7 @@ async def ensure_tts_running(base_url: str = "", timeout_s: int = 240) -> dict[s
         return {"started": False, "waited_ms": 0, "error": None}
     # 调用方（如 gpu_arbiter._start）常把配置里的地址原样传进来：一旦已自动改绑，
     # 这个旧地址要映射到改绑后的端口，否则每次都会去 bind 那个被系统拒绝的端口。
-    config_base = (TTS_BASE_URL or "").strip().rstrip("/")
+    config_base = _cfg_base()
     if _ACTUAL_BASE and base == config_base:
         base = _ACTUAL_BASE
     if (await health(base))["reachable"]:
@@ -293,16 +434,18 @@ async def ensure_tts_running(base_url: str = "", timeout_s: int = 240) -> dict[s
             _LAUNCH_RECORD = None
         _ENSURE_FAIL_CACHE.pop(base, None)
         return {"started": False, "waited_ms": 0, "error": None}
-    # 配置端口被系统保留（WinError 10013 一类）→ 服务端永远无法 bind，这里趁早改绑到一个
-    # 可用端口，而不是傻等 240s 再报「未就绪」。改绑只动 base，_ACTUAL_BASE 让后续合成/健康
-    # 都走新端口；库里的档位配置不用改。
-    if base == config_base and _ACTUAL_BASE is None and not _port_bindable(urlparse(base).port or 0):
-        alt = _pick_alt_base(base)
-        if alt:
-            log.warning("语音服务端口 %s 被系统保留（WinError 10013 一类），自动改绑到 %s",
-                        base, alt)
-            _ACTUAL_BASE = alt
-            base = alt
+    # 配置端口探不通：先看是不是「外部已拉起、端口 ≠ 配置」的实例（用户手动起 / 旧实例），
+    # 找到就跟随它的实际端口并直接返回就绪，别对着配置端口空等、也别再拉一个（双实例抢同一块卡）。
+    ext_base = await _discover_external(probe=True)
+    if ext_base:
+        log.info("语音服务已在外部就绪（%s），无需启动", ext_base)
+        _LAUNCH_RECORD = None
+        _ENSURE_FAIL_CACHE.pop(ext_base, None)
+        return {"started": False, "waited_ms": 0, "error": None}
+    # 配置端口被系统保留（WinError 10013）/ 被占用（10048）→ 服务端永远无法 bind，
+    # 趁早改绑到 >10000 的可用端口，而不是傻等 240s 再报「未就绪」。改绑只动 base，
+    # _ACTUAL_BASE 让后续合成/健康都走新端口；库里的档位配置不用改。
+    base = _maybe_rebind(base)
     cached = _ENSURE_FAIL_CACHE.get(base)
     if cached and time.monotonic() - cached[0] < _ENSURE_FAIL_TTL_S:
         log.warning("语音服务 %s 刚启动失败过，熔断快速失败：%s", base, cached[1][:120])
@@ -327,8 +470,15 @@ async def ensure_tts_running(base_url: str = "", timeout_s: int = 240) -> dict[s
         else:
             ext = await asyncio.to_thread(_find_starting_tts)
             if ext is not None:
-                log.info("检测到外部语音服务正在启动（pid=%s：%s），等待就绪不重复拉起",
-                         ext["pid"], ext["cmdline"])
+                # 外部实例绑的端口可能 ≠ 配置端口（用户手动起 / 旧实例）：跟随它的实际端口
+                # 探活，否则会对着配置端口空等 240s，表现为「我都启动完了，它还显示未连接」。
+                if ext.get("port") and ext["port"] != (urlparse(base).port or 0):
+                    _gu = urlparse(base)
+                    base = (f"{_gu.scheme or 'http'}://"
+                            f"{_gu.hostname or '127.0.0.1'}:{ext['port']}")
+                    _ACTUAL_BASE = base
+                log.info("检测到外部语音服务正在启动（pid=%s，端口=%s：%s），等待就绪不重复拉起",
+                         ext["pid"], ext.get("port"), ext["cmdline"])
             else:
                 if ours is not None:
                     log.info("上次启动的语音服务进程（pid=%s）已退出且未就绪，重新拉起", ours.get("pid"))
@@ -387,19 +537,31 @@ async def stop_tts_service(base_url: str = "") -> dict[str, Any]:
     """停掉监听该端口的语音服务进程（含子进程）。
 
     只杀「监听 TTS 端口」的那个进程树，不按进程名模糊匹配，
-    避免误杀别的 python。
+    避免误杀别的 python。端口可能已自动改绑（_ACTUAL_BASE）或用户手动起在别的端口：
+    这里把配置端口 + 实际端口都纳入（去重），谁在监听就停谁。
     """
     import psutil
 
     base = _base(base_url)
     if not base:
         raise TTSError("未配置语音服务地址（.env TTS_BASE_URL）")
-    port = urlparse(base).port or 7860
+    ports: list[int] = []
+    for b in [base, *_all_bases()]:
+        try:
+            p = urlparse(b).port
+        except Exception:  # noqa: BLE001
+            p = None
+        if p and p not in ports:
+            ports.append(p)
+    if not ports:
+        raise TTSError("语音服务地址缺少端口")
 
-    def _kill() -> list[str]:
+    def _kill() -> tuple[list[str], list[int]]:
         killed: list[str] = []
+        hit_ports: list[int] = []
         for c in psutil.net_connections(kind="inet"):
-            if c.laddr and c.laddr.port == port and c.status == psutil.CONN_LISTEN and c.pid:
+            if (c.laddr and c.laddr.port in ports and c.status == psutil.CONN_LISTEN
+                    and c.pid):
                 try:
                     proc = psutil.Process(c.pid)
                     children = proc.children(recursive=True)
@@ -409,12 +571,15 @@ async def stop_tts_service(base_url: str = "") -> dict[str, Any]:
                         except psutil.NoSuchProcess:
                             pass
                     killed.append(f"{c.pid}({proc.name()})")
+                    if c.laddr.port not in hit_ports:
+                        hit_ports.append(c.laddr.port)
                 except psutil.NoSuchProcess:
                     pass
-        return killed
+        return killed, hit_ports
 
-    killed = await asyncio.to_thread(_kill)
-    return {"stopped": bool(killed), "killed": killed, "port": port}
+    killed, hit_ports = await asyncio.to_thread(_kill)
+    return {"stopped": bool(killed), "killed": killed,
+            "port": hit_ports[0] if hit_ports else ports[0], "ports": ports}
 
 
 async def list_presets(base_url: str = "") -> list[str]:
@@ -528,6 +693,8 @@ async def synthesize(
     emo_vector: Any = None,
     emo_audio: bytes | None = None,
     emo_auto: bool = False,
+    speed: float | None = None,          # 语速 0.5~2.0（>1 慢 <1 快；IndexTTS-2.5 生效）
+    lang: str | None = None,             # 语言 auto/zh/en/ja/es/ar（2.5 生效；auto 由服务端判定）
     timeout_s: int | None = None,
     on_done: "Callable[[dict[str, Any]], None] | None" = None,
 ) -> tuple[bytes, dict[str, Any]]:
@@ -600,6 +767,16 @@ async def synthesize(
         "emo_weight": str(emo_weight if emo_weight is not None else TTS_EMO_WEIGHT),
         "file_naming": "title_time",
     }
+    # 语速 / 语言：只给 2.5 服务透传（2.0 会忽略未知表单字段，不必担心兼容）。
+    if speed is not None:
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            speed = None
+    if speed is not None:
+        payload["duration_factor"] = str(max(0.5, min(2.0, speed)))
+    if lang and str(lang).strip():
+        payload["lang"] = str(lang).strip()
     if vec is not None and mode == "2":
         # 服务端按 vec1..vec8 逐个接（顺序：高兴/愤怒/悲伤/害怕/厌恶/忧郁/惊讶/平静）
         for i, v in enumerate(vec, 1):

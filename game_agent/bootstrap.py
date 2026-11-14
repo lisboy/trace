@@ -1,50 +1,32 @@
-"""首启引导与示例播种（设计 §3.4 首启 / §16 示例项目）。
+"""首启：保证本机身份与（可选的）示例项目存在。
 
-两种首启行为，二选一（以 GA_SEED_DEMO 区分）：
-- GA_SEED_DEMO=1（Windows 单机打包版默认）：自动建示例 owner 账号 demo@local / demo1234，
-  可选地把 examples/cardgame 拷贝为可运行的团队项目，开箱即可登录体验。
-  这是打包版避免「预填一个根本不存在的账号 → 邮箱或密码错误」的正解。
-- GA_SEED_DEMO 未设（源码/git/团队部署）：不做任何账号播种，打印一次性引导 token，
-  由用户访问 /setup 创建第一个 owner。
+这个版本没有注册/登录，所以「首启」不再是「建第一个账号 + 打印引导 token」，
+而是「把这台机器的默认身份和工作区准备好」：
+
+  · 身份：``auth.local.ensure_local_identity`` 幂等保证 users/teams/team_members
+    各有恰好一行（老库复用最早那个用户，不丢原有项目与会话）；
+  · 示例：``GA_SEED_DEMO=1``（Windows 单机打包版默认）时把 ``examples/cardgame``
+    拷成可直接运行的示例工作区，开箱就能点开一个项目试。
+
+个人版：一个人 = 一个工作区，没有团队/成员/邀请概念。
 """
 from __future__ import annotations
 
-import secrets
 import shutil
 from pathlib import Path
 
 from sqlalchemy import select
 
-from game_agent.config import BOOTSTRAP_TOKEN, PROJECTS_ROOT, SEED_DEMO, default_python_bin
+from game_agent.auth.local import ensure_local_identity
+from game_agent.config import PROJECTS_ROOT, SEED_DEMO, default_python_bin
 from game_agent.core.registry import seed_default_agents
-from game_agent.db.models import Project, Team, TeamMember
+from game_agent.db.models import Project
 from game_agent.db.session import SessionLocal
 from game_agent.logging_setup import get_logger
 
 log = get_logger("bootstrap")
 
-DEMO_EMAIL = "demo@local"
-DEMO_PASSWORD = "demo1234"
-DEMO_TEAM = "demo-team"
-
-
-async def bootstrap(auth) -> None:  # type: ignore[no-untyped-def]
-    count = await auth.count_users()
-    if count != 0:
-        return
-    if SEED_DEMO:
-        # 打包版开箱即用：建示例 owner + 示例项目，控制台打印可登录的账号
-        await seed_demo(auth)
-        _print_demo_banner()
-        return
-    token = BOOTSTRAP_TOKEN or secrets.token_hex(8)
-    from game_agent.api.state import state
-    state.bootstrap_token = token
-    print("\n" + "=" * 60)
-    print(" 循迹（Trace） 首次启动：创建第一个 owner")
-    print(f"  访问 /setup 并使用引导 token：{token}")
-    print("  或在 .env 设置 GA_BOOTSTRAP_TOKEN 后重启")
-    print("=" * 60 + "\n")
+DEMO_PROJECT_SLUG = "cardgame"
 
 
 def _safe_print(text: str) -> None:
@@ -60,20 +42,22 @@ def _safe_print(text: str) -> None:
             pass
 
 
-def _print_demo_banner() -> None:
+async def bootstrap(auth=None) -> None:  # type: ignore[no-untyped-def]
+    """准备本机身份（+ 示例项目）。``auth`` 参数只为兼容旧调用方，已不再使用。"""
+    async with SessionLocal() as s:
+        user, team = await ensure_local_identity(s)
+    log.info("local identity ready", extra={"user": str(user.id), "team": str(team.id)})
+    if SEED_DEMO:
+        await seed_demo()
     _safe_print("\n" + "=" * 60)
-    _safe_print(" 循迹（Trace） 首次启动：已创建示例账号，可直接登录")
-    _safe_print(f"   邮箱：{DEMO_EMAIL}")
-    _safe_print(f"   密码：{DEMO_PASSWORD}")
-    _safe_print("   注意：这是打包版默认账号，请登录后在「设置 / 团队」里修改密码或新建正式成员")
+    _safe_print(" 循迹（Trace）已就绪 —— 无需登录，直接在浏览器里使用")
     _safe_print("=" * 60 + "\n")
 
 
-async def seed_demo(auth) -> None:  # type: ignore[no-untyped-def]
-    log.info("seeding demo team + project")
-    # 可选：拷贝示例项目到 PROJECTS_ROOT/cardgame（源码与打包版都随包提供 examples/）
+async def seed_demo() -> None:
+    """拷贝示例项目并登记到本机工作区（幂等：已存在就跳过）。"""
     src = Path(__file__).resolve().parent.parent / "examples" / "cardgame"
-    dst = PROJECTS_ROOT / "cardgame"
+    dst = PROJECTS_ROOT / DEMO_PROJECT_SLUG
     if src.exists() and not dst.exists():
         try:
             shutil.copytree(src, dst)
@@ -81,31 +65,18 @@ async def seed_demo(auth) -> None:  # type: ignore[no-untyped-def]
             log.exception("示例项目拷贝失败（忽略）")
 
     async with SessionLocal() as s:
-        # owner 已由 bootstrap 创建；复用其所在的首个工作区团队，避免重复建团队
-        user = await auth.get_user_by_email(DEMO_EMAIL)
-        if user is None:
-            user = await auth.bootstrap_owner(DEMO_EMAIL, "Demo Owner", DEMO_PASSWORD)
-        tm = (await s.execute(
-            select(TeamMember).where(TeamMember.user_id == user.id)
-        )).scalars().first()
-        team = await s.get(Team, tm.team_id) if tm else None
-        if team is None:
-            team = Team(name="Demo 工作区", slug=DEMO_TEAM)
-            s.add(team)
-            await s.flush()
-            s.add(TeamMember(team_id=team.id, user_id=user.id, role="owner"))
-
+        user, team = await ensure_local_identity(s)
         if dst.exists():
-            existing_proj = await s.scalar(
-                select(Project).where(Project.team_id == team.id, Project.slug == "cardgame"))
-            if existing_proj is None:
-                proj = Project(team_id=team.id, name="CardGame 示例",
-                              slug="cardgame", repo_path="cardgame",
+            existing = await s.scalar(select(Project).where(
+                Project.team_id == team.id, Project.slug == DEMO_PROJECT_SLUG))
+            if existing is None:
+                s.add(Project(team_id=team.id, name="CardGame 示例",
+                              slug=DEMO_PROJECT_SLUG, repo_path=DEMO_PROJECT_SLUG,
                               project_type="python",
                               python_bin=default_python_bin() or None,
                               commands_json={"build": "python -m compileall -q .",
-                                             "test": "python -m pytest -q"})
-                s.add(proj)
+                                             "test": "python -m pytest -q"}))
                 await s.commit()
+                log.info("示例项目已登记")
         await seed_default_agents(s, team.id)
-        log.info("demo ready", extra={"email": DEMO_EMAIL})
+        log.info("demo ready")

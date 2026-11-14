@@ -92,23 +92,39 @@ class _ScriptedBrain(LLM):
                            usage={"prompt_tokens": 100, "completion_tokens": 50})
 
 
-def _execute(session_factory, requirement: str, script: list[list[ToolCall]]):
+def _execute(session_factory, requirement: str, script: list[list[ToolCall]],
+             intent: str | None = None):
     from unittest.mock import patch
     import game_agent.agents.runtime as rt_mod
     import game_agent.orchestration.orchestrator as orch_mod
+    from game_agent.orchestration.intent import IntentResult
 
     brain = _ScriptedBrain(script)
 
     def _factory(role, ctx=None):  # noqa: ANN001, ANN202
         return brain
 
+    patches = [patch.object(rt_mod, "build_llm", _factory),
+               patch.object(orch_mod, "build_llm", _factory)]
+    if intent is not None:
+        # 意图判别也走同一套桩：模型推理结果由测试显式指定（不再依赖关键词）。
+        result = IntentResult(intent=intent, mode="build", reason="test")
+
+        async def _classify(req, profile=None, **k):  # noqa: ANN001, ANN202
+            return result
+        patches.append(patch.object(orch_mod, "classify_intent", _classify))
+
     async def _flow():
         ids = await _seed(session_factory, requirement)
         svcs = await build_lite_services(session_factory, "fr-worker")
         orch = Orchestrator(svcs, "fr-worker", session_factory)
-        with patch.object(rt_mod, "build_llm", _factory), \
-                patch.object(orch_mod, "build_llm", _factory):
+        for p in patches:
+            p.start()
+        try:
             await orch.execute_run(ids["run_id"])
+        finally:
+            for p in patches:
+                p.stop()
         run = await svcs.repo.get_run(ids["run_id"])
         messages = await svcs.repo.list_messages(ids["session_id"])
         return run, messages, brain
@@ -118,10 +134,10 @@ def _execute(session_factory, requirement: str, script: list[list[ToolCall]]):
 
 @pytest.mark.slow
 def test_pure_question_does_not_force_a_rerun(session_factory) -> None:
-    """名词「处理」出现在问句里 → 纯问答，不触发「只勘察不动手」纠正。"""
+    """纯问答（模型判 survey）→ 不触发「只勘察不动手」纠正，答复只落一条。"""
     q = "这一块，一次接口请求，能完成查重处理和编制完成吗？为什么有时候请求一次没用？"
     script = [[_tc("report_to_user", report="## 结论\n\n一次请求做不到：查重是异步任务。")]]
-    run, messages, brain = _execute(session_factory, q, script)
+    run, messages, brain = _execute(session_factory, q, script, intent="survey")
 
     assert brain.agent_rounds == 1, f"纯问答被强制重跑了，共 {brain.agent_rounds} 轮"
     assert run.status == "succeeded", f"{run.status} {run.error}"
@@ -132,8 +148,13 @@ def test_pure_question_does_not_force_a_rerun(session_factory) -> None:
 
 @pytest.mark.slow
 def test_first_report_survives_correction_rerun(session_factory) -> None:
-    """真要动手时，第一轮的汇报不能被纠正重跑顶掉：两条答复都在、顺序正确。"""
-    first = "## 初步诊断\n\n问题在异步回调，我准备改 compileComplete。"
+    """真要动手时，第一轮的汇报不能被纠正重跑顶掉：两条答复都在、顺序正确。
+
+    触发纠正用的是「模型自相矛盾」：汇报里自称已改（命中 _CLAIM_WORDS，如「已修复」），
+    但本轮零落地 —— 这时才会被要求补落地。纯结论/「我准备改」不触发（见
+    test_pure_question_does_not_force_a_rerun 与 orchestrator.py:502 的 will_correct）。
+    """
+    first = "## 初步诊断\n\n问题在异步回调，已修复 compileComplete 的排序逻辑，改动如下。"
     second = "## 已修复\n\ncompileComplete 已重写，测试通过。"
     script = [
         [_tc("report_to_user", report=first)],  # 第 1 轮：先汇报（本轮零落地 → 触发纠正）

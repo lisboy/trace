@@ -262,8 +262,8 @@ export default function ContextStatsView({
           </span>
         </div>
         <TrendChart
-          windowSize={latest?.context_window || 32768}
-          budget={latest?.budget_tokens || 24576}
+          windowSize={latest?.context_window || 256000}
+          budget={latest?.budget_tokens || 192000}
           points={data.trend.map((t) => ({
             y: t.prompt_tokens || t.est_tokens,
             compressed: t.compressed,

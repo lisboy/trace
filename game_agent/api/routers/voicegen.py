@@ -32,8 +32,8 @@ from game_agent.assets.tts import TTSError, ensure_tts_running
 from game_agent.auth.rbac import PERM_DOWNLOAD, PERM_RUN_CREATE, PERM_VIEW
 from game_agent.config import (
     DATA_DIR, TTS_AUTOSTART, TTS_BASE_URL, TTS_EMO_AUDIO, TTS_EMO_MODE, TTS_EMO_TEXT,
-    TTS_EMO_VECTOR, TTS_EMO_WEIGHT, TTS_PRESET, TTS_REF_AUDIO, TTS_TIMEOUT_S,
-    TTS_VOICE_DESIGN)
+    TTS_EMO_VECTOR, TTS_EMO_WEIGHT, TTS_LANG, TTS_PRESET, TTS_REF_AUDIO, TTS_SPEED,
+    TTS_TIMEOUT_S, TTS_VOICE_DESIGN)
 from game_agent.core.context import RequestContext
 from game_agent.llm.base import Ctx
 from game_agent.llm.factory import build_llm
@@ -122,6 +122,12 @@ _ENHANCE_PROMPT = """你是游戏配音的口播稿编辑。把下面这段文�
 @router.get("/status")
 async def status(ctx: RequestContext = Depends(require(PERM_VIEW))):
     info = await tts_client.health()
+    # 自愈：配置端口探不通时，找一下「外部已拉起、端口可能不同」的实例（用户手动起 / 旧实例），
+    # 找到就把实际端口记下来再探一次——否则工作台永远显示「未连接」（对齐 ComfyUI 工作台）。
+    if not info["reachable"]:
+        ext = await tts_client._discover_external(probe=True)
+        if ext:
+            info = await tts_client.health()
     presets, perr = ([], None)
     if info["reachable"]:
         presets, perr = await _presets_safe()
@@ -138,6 +144,8 @@ async def status(ctx: RequestContext = Depends(require(PERM_VIEW))):
         "emo_weight": TTS_EMO_WEIGHT,
         "emo_vector": TTS_EMO_VECTOR,
         "has_emo_audio": bool(TTS_EMO_AUDIO),
+        "default_speed": TTS_SPEED,
+        "default_lang": TTS_LANG,
         "timeout_s": TTS_TIMEOUT_S,
         "autostart": TTS_AUTOSTART,
     }
@@ -211,6 +219,8 @@ class GenIn(BaseModel):
     emo_vector: list[float] | None = None   # 8 维：高兴/愤怒/悲伤/害怕/厌恶/忧郁/惊讶/平静
     emo_audio: str = ""       # /upload 返回的情感参考音频文件名（emo_mode=1 时用）
     emo_auto: bool = False    # 未给任何情绪素材时，用台词本身做情感文本（Qwen 自动判情绪）
+    speed: float | None = None  # 语速 0.5~2.0（>1 慢 <1 快；IndexTTS-2.5 生效）
+    lang: str = "auto"        # 语言 auto/zh/en/ja/es/ar（2.5 生效）
     label: str = ""           # 文件名标签（例如角色名）
     enhance: bool = False     # 走 LLM 把文本润色成更适合朗读的口播稿
     job_id: str = ""          # 前端生成的进度任务号，供 GET /jobs/{id} 轮询处理过程
@@ -316,7 +326,8 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
             emo_mode=(body.emo_mode or None), emo_text=(body.emo_text or None),
             emo_weight=body.emo_weight,
             emo_vector=body.emo_vector, emo_audio=emo_bytes,
-            emo_auto=body.emo_auto)
+            emo_auto=body.emo_auto,
+            speed=body.speed, lang=(body.lang or "auto"))
     except TTSError as e:
         raise HTTPException(status_code=502, detail=str(e))
 

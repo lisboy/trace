@@ -1,13 +1,11 @@
 import { useState } from "react";
 import { useAuth } from "../store";
 import { navigateKeep } from "../router";
-import { ROLE_LABEL } from "../types";
 import { notifyEnabled, setNotifyEnabled, notifyPermission } from "../notify";
 import Avatar from "./Avatar";
 
 export default function Topbar() {
-  const { teams, currentTeamId, setTeam, user } = useAuth();
-  const role = teams.find((t) => t.id === currentTeamId)?.role;
+  const { user } = useAuth();
   const [notifyOn, setNotifyOn] = useState(notifyEnabled());
   const [notifyPerm, setNotifyPerm] = useState(notifyPermission());
 
@@ -49,19 +47,7 @@ export default function Topbar() {
         <div className="ga-brand font-bold">循迹 Trace</div>
       </div>
 
-      <select
-        className="text-sm border border-slate-200 rounded px-2 py-1"
-        value={currentTeamId ?? ""}
-        onChange={(e) => setTeam(e.target.value)}
-      >
-        {teams.map((t) => (
-          <option key={t.id} value={t.id}>
-            {t.name}（{ROLE_LABEL[t.role] || t.role}）
-          </option>
-        ))}
-      </select>
-
-      {/* 项目管理已全部收进左侧会话面板（新建/删除/归档/恢复），这里不再留「项目」页入口。 */}
+      {/* 个人版没有「团队」概念：工作区就是当前账号自己的，不做切换。 */}
       <nav className="flex items-center gap-1 text-sm">
         <button
           className="px-2 py-1 rounded hover:bg-slate-100"
@@ -77,9 +63,9 @@ export default function Topbar() {
         </button>
         <button
           className="px-2 py-1 rounded hover:bg-slate-100"
-          onClick={() => navigateKeep("team")}
+          onClick={() => navigateKeep("usage")}
         >
-          团队
+          用量
         </button>
       </nav>
 
@@ -93,13 +79,15 @@ export default function Topbar() {
               ? `提示已开启：任务完成/需要回答时响铃并弹系统通知（桌面通知：${
                   notifyPerm === "granted" ? "已授权" : notifyPerm === "denied" ? "被浏览器拒绝，仅提示音" : "未授权，开启时已申请"
                 }）。点击关闭`
-              : "提示已关闭：任务完成/需要回答时不会有提醒。点击开启"
+              : "提示已关闭：任务完成/需要回答时不会有提醒。点击开启（会立刻试响一声 + 弹一条测试通知）"
           }
           onClick={() => {
             const v = !notifyOn;
             setNotifyEnabled(v);
             setNotifyOn(v);
             setNotifyPerm(notifyPermission());
+            // 权限申请是异步的：稍后再读一次，让提示里的「已授权/被拒绝」尽快变成真状态
+            if (v) window.setTimeout(() => setNotifyPerm(notifyPermission()), 800);
           }}
         >
           {notifyOn ? (
@@ -128,7 +116,7 @@ export default function Topbar() {
             <span className="block text-xs font-medium max-w-[140px] truncate">
               {user?.display_name || "未命名"}
             </span>
-            <span className="block text-[10px] text-slate-400">{role || "成员"}</span>
+            <span className="block text-[10px] text-slate-400">{user?.email || "未登录"}</span>
           </span>
           <Avatar src={user?.avatar} name={user?.display_name} size={28} className="ring-1 ring-slate-200" />
         </button>

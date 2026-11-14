@@ -2,10 +2,6 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { useAuth } from "../store";
 
-type Member = {
-  user_id: string; email: string; display_name: string; role: string; joined_at: string;
-  is_self?: boolean; runs_30d?: number; last_run_at?: string | null;
-};
 type Usage = {
   days: number;
   tokens: {
@@ -44,15 +40,8 @@ const ROLE_NAMES: Record<string, string> = {
   planner: "助手", artist: "助手", voice: "助手",
 };
 const RETIRED_ROLES = ["developer", "tester", "tester_qa"];
-const MEMBER_ROLES = [
-  { v: "owner", t: "owner（创建者，不可改）" },
-  { v: "admin", t: "admin（可改配置）" },
-  { v: "developer", t: "developer（可跑任务）" },
-  { v: "viewer", t: "viewer（只读）" },
-];
 const AUDIT_CN: Record<string, string> = {
   "auth.login": "登录", "auth.login_failed": "登录失败",
-  "member.add": "添加成员", "member.remove": "移除成员", "member.role": "改成员角色",
   "provider.add": "新增供应商", "provider.update": "修改供应商", "provider.delete": "删除供应商",
   "profile.add": "新增模型档位", "profile.update": "修改模型档位", "profile.delete": "删除模型档位",
   "agent.update": "修改智能体", "merge": "合并改动到主分支",
@@ -75,10 +64,8 @@ function localTime(iso: string | null | undefined): string {
   return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-export default function Team() {
+export default function Usage() {
   const currentTeamId = useAuth((s) => s.currentTeamId);
-  const myRole = useAuth((s) => s.teams.find((t) => t.id === s.currentTeamId)?.role);
-  const [members, setMembers] = useState<Member[]>([]);
   const [usage, setUsage] = useState<Usage | null>(null);
   const [audit, setAudit] = useState<AuditRow[]>([]);
   const [days, setDays] = useState(30);
@@ -86,55 +73,13 @@ export default function Team() {
   const [modelF, setModelF] = useState("");
   const [auditQ, setAuditQ] = useState("");
   const [auditOpen, setAuditOpen] = useState<string | null>(null);
-  const [email, setEmail] = useState("");
-  const [addRole, setAddRole] = useState("developer");
-  const [err, setErr] = useState("");
-  const canManage = myRole === "owner" || myRole === "admin";
-  const canSeeUsage = canManage;
 
   function refresh() {
     if (!currentTeamId) return;
-    api.members(currentTeamId).then((r) => setMembers(r.members)).catch(() => {});
-    if (canSeeUsage) {
-      api.usage(days, agentF || undefined, modelF || undefined).then(setUsage).catch(() => {});
-      api.audit(100, auditQ.trim() || undefined).then((r) => setAudit(r.logs)).catch(() => {});
-    }
+    api.usage(days, agentF || undefined, modelF || undefined).then(setUsage).catch(() => {});
+    api.audit(100, auditQ.trim() || undefined).then((r) => setAudit(r.logs)).catch(() => {});
   }
   useEffect(refresh, [currentTeamId, days, agentF, modelF]);
-
-  async function add() {
-    if (!currentTeamId) return;
-    setErr("");
-    try {
-      await api.addMember(currentTeamId, { email: email.trim(), role: addRole });
-      setEmail("");
-      refresh();
-    } catch (e: any) {
-      setErr(e?.message || "添加失败");
-    }
-  }
-
-  async function remove(m: Member) {
-    if (!currentTeamId) return;
-    if (!confirm(`把 ${m.display_name}（${m.email}）移出团队？`)) return;
-    try {
-      await api.removeMember(currentTeamId, m.user_id);
-      refresh();
-    } catch (e: any) {
-      setErr(e?.message || "移除失败");
-    }
-  }
-
-  async function setRole(m: Member, v: string) {
-    if (!currentTeamId) return;
-    setErr("");
-    try {
-      await api.setMemberRole(currentTeamId, m.user_id, v);
-      refresh();
-    } catch (e: any) {
-      setErr(e?.message || "改角色失败");
-    }
-  }
 
   const totalTokens = usage ? usage.tokens.prompt + usage.tokens.completion : 0;
   const agentRows = Object.entries(usage?.by_agent || {}).sort((a, b) => b[1].tokens - a[1].tokens);
@@ -146,8 +91,8 @@ export default function Team() {
   return (
     <div className="h-full overflow-auto p-5">
       <div className="flex items-center gap-2 mb-4">
-        <h2 className="text-lg font-semibold">团队</h2>
-        {canSeeUsage && usage && (
+        <h2 className="text-lg font-semibold">用量</h2>
+        {usage && (
           <div className="ml-auto flex items-center gap-1 text-xs">
             <span className="text-slate-400 mr-1">统计窗口</span>
             {DAY_OPTS.map((d) => (
@@ -184,66 +129,8 @@ export default function Team() {
         )}
       </div>
 
-      {/* 成员 */}
-      <div className="bg-white rounded border border-slate-200 p-4 mb-4">
-        <div className="font-medium mb-3 text-sm">成员（{members.length}）</div>
-        {canManage && (
-          <div className="flex gap-2 mb-3 text-sm">
-            <input className="border rounded px-2 py-1 flex-1" placeholder="成员邮箱（需对方先注册过）"
-              value={email} onChange={(e) => setEmail(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && email.trim() && add()} />
-            <select className="border rounded px-2 py-1" value={addRole} onChange={(e) => setAddRole(e.target.value)}>
-              {MEMBER_ROLES.filter((r) => r.v !== "owner").map((r) => (
-                <option key={r.v} value={r.v}>{r.t}</option>
-              ))}
-            </select>
-            <button className="ga-btn ga-btn-primary"
-              disabled={!email.trim()} onClick={add}>添加</button>
-          </div>
-        )}
-        {err && <div className="text-xs text-red-600 mb-2">{err}</div>}
-        <div className="space-y-1">
-          {members.map((m) => (
-            <div key={m.user_id} className="flex items-center gap-3 text-sm py-1.5 border-t border-slate-50">
-              <span className="w-8 h-8 rounded-full bg-brand-100 text-brand-700 flex items-center justify-center text-xs font-bold">
-                {m.display_name.slice(0, 1)}
-              </span>
-              <div className="min-w-0">
-                <div className="truncate">
-                  {m.display_name}
-                  {m.is_self && <span className="text-[10px] text-slate-400 ml-1">（我）</span>}
-                </div>
-                <div className="text-[11px] text-slate-400 truncate">{m.email}</div>
-              </div>
-              <span className={`text-[10px] px-1.5 py-0.5 rounded ${
-                m.role === "owner" ? "bg-amber-100 text-amber-700"
-                : m.role === "admin" ? "bg-brand-100 text-brand-700"
-                : "bg-slate-100 text-slate-500"}`}>
-                {m.role}
-              </span>
-              <span className="text-[11px] text-slate-400" title={m.last_run_at ? `最近发起 ${localTime(m.last_run_at)}` : "近 30 天没发起过任务"}>
-                近 30 天 {(m.runs_30d ?? 0)} 次任务
-              </span>
-              {canManage && m.role !== "owner" && !m.is_self && (
-                <>
-                  <select className="ml-auto text-xs border rounded px-1.5 py-1"
-                    value={m.role} onChange={(e) => setRole(m, e.target.value)}
-                    title="改成员权限">
-                    {MEMBER_ROLES.filter((r) => r.v !== "owner").map((r) => (
-                      <option key={r.v} value={r.v}>{r.v}</option>
-                    ))}
-                  </select>
-                  <button className="ga-btn ga-btn-danger ga-btn-sm" onClick={() => remove(m)}>移除</button>
-                </>
-              )}
-            </div>
-          ))}
-          {members.length === 0 && <div className="text-xs text-slate-400">没有成员数据</div>}
-        </div>
-      </div>
-
       {/* 用量 + 审计 */}
-      {canSeeUsage && usage && (
+      {usage && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
           <div className="bg-white rounded border border-slate-200 p-4">
             <div className="font-medium mb-3 text-sm">近 {usage.days} 天用量</div>
@@ -470,14 +357,14 @@ export default function Team() {
               ))}
               {audit.length === 0 && (
                 <div className="text-xs text-slate-400">
-                  暂无记录。登录、改模型配置、加删成员、合并改动都会记在这里。
+                  暂无记录。登录、改模型配置、合并改动都会记在这里。
                 </div>
               )}
             </div>
           </div>
         </div>
       )}
-      {canSeeUsage && !usage && <div className="text-xs text-slate-400">用量数据加载中…</div>}
+      {!usage && <div className="text-xs text-slate-400">用量数据加载中…</div>}
     </div>
   );
 }

@@ -88,7 +88,7 @@ async def _gpus() -> list[dict]:
             "--format=csv,noheader,nounits")
     exe = _nvidia_smi()
     def run() -> bytes:
-        # 必须走线程：main.py 为 aiomysql 强制了 WindowsSelectorEventLoopPolicy，
+        # 必须走线程：main.py 在 Windows 上强制了 WindowsSelectorEventLoopPolicy，
         # 而 Selector 循环在 Windows 上不支持 asyncio.create_subprocess_exec
         # （直接 NotImplementedError，GPU 读数永远是空）。
         return subprocess.run(

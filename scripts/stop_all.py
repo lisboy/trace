@@ -146,8 +146,37 @@ def stop_by_port(url: str, label: str, quiet: bool) -> bool:
 
 
 def stop_comfy_children(quiet: bool) -> bool:
-    """ComfyUI 若由本服务的常驻拉起，端口可能已随父进程退出而消失；这里再按端口兜一层。"""
-    return stop_by_port(COMFYUI_BASE_URL, "ComfyUI", quiet)
+    """ComfyUI 若由本服务的常驻拉起，端口可能已随父进程退出而消失；这里再按端口兜一层。
+    配置端口被保留/占用自动改绑后走实际端口（见 assets/comfyui.py actual_base）。"""
+    try:
+        from game_agent.assets.comfyui import actual_base
+        comfy_url = actual_base()
+    except Exception:  # noqa: BLE001 - 模块可能因环境问题导入失败，退回配置值
+        comfy_url = COMFYUI_BASE_URL
+    return stop_by_port(comfy_url, "ComfyUI", quiet)
+
+
+def stop_tts(quiet: bool) -> bool:
+    """语音 IndexTTS2：把配置端口 + 自动改绑后的实际端口都停一遍（去重）。
+    只按配置端口停会漏掉「系统把端口改绑后实际起在别的端口」的实例。"""
+    urls: list[str] = []
+    for raw in (TTS_BASE_URL,):
+        b = (raw or "").strip().rstrip("/")
+        if b and b not in urls:
+            urls.append(b)
+    try:
+        from game_agent.assets.tts import actual_base, _all_bases
+        for b in _all_bases():
+            if b and b not in urls:
+                urls.append(b)
+        if actual_base() and actual_base() not in urls:
+            urls.append(actual_base())
+    except Exception:  # noqa: BLE001
+        pass
+    ok = False
+    for u in urls:
+        ok = stop_by_port(u, "语音 IndexTTS2", quiet) or ok
+    return ok
 
 
 def main() -> None:
@@ -165,7 +194,7 @@ def main() -> None:
     results.append(("服务(后端)", stop_app(quiet)))
     if not args.app_only:
         results.append(("ComfyUI", stop_comfy_children(quiet)))
-        results.append(("语音 IndexTTS2", stop_by_port(TTS_BASE_URL, "语音 IndexTTS2", quiet)))
+        results.append(("语音 IndexTTS2", stop_tts(quiet)))
 
     # 给进程一点时间真正退出（端口释放），再复查
     time.sleep(1.5)

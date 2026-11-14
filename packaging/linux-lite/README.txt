@@ -104,9 +104,7 @@ Alpine:
 五、.env 关键项说明
 --------------------------------------------------------
 - GA_MODE=lite                     运行模式（不要改）
-- DATABASE_URL=                    留空 = 自动用 SQLite（推荐单机）
-                                   要 MySQL 才填 mysql+aiomysql://user:pass@host:3306/game_agent?charset=utf8mb4
-                                   （用 MySQL 还需 .venv/bin/pip install aiomysql，并先建库 utf8mb4）
+- DATABASE_URL=                    留空 = 用内置 SQLite（本版本只支持 SQLite）
 - GA_HOST=127.0.0.1                只监听本机
 - GA_PORT=18888                     端口
    给同网段访问：GA_HOST=0.0.0.0，并放行防火墙 18888
@@ -159,7 +157,7 @@ WantedBy=multi-user.target
 --------------------------------------------------------
 八、可选增强（不装也能用，只是对应功能降级）
 --------------------------------------------------------
-- 本地生图 ComfyUI：.env 里 COMFYUI_BASE_URL=http://127.0.0.1:8588（否则出占位图）
+- 本地生图 ComfyUI：.env 里 COMFYUI_BASE_URL=http://127.0.0.1:10188（否则出占位图）
 - 本地语音 IndexTTS2：.env 里 TTS_BASE_URL=... 与 TTS_HOME=<安装目录>（否则占位静音）
 - 网页截图 screenshot_page：需系统有 Chrome/Chromium/Edge，或设 GA_BROWSER_PATH
 - 音视频转换：需 ffmpeg/ffprobe 在 PATH

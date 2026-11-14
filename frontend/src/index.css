@@ -26,6 +26,13 @@ body {
   border-radius: 4px;
 }
 
+/* 常驻滚动条槽位：内容从「不满一屏」到「溢出」时，滚动条的出现/消失会把这 8px
+   宽度还给内容，长文本重新折行、整块高度跟着跳一下（流式输出时最明显，
+   看着就是「后面的内容在抖」）。挂上这个类，槽位一直在，宽度不再变。 */
+.ga-scroll-stable {
+  scrollbar-gutter: stable;
+}
+
 .mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
@@ -34,6 +41,7 @@ body {
 .md-body {
   line-height: 1.65;
   word-break: break-word;
+  overflow-wrap: anywhere;
 }
 .md-body > :first-child { margin-top: 0; }
 .md-body > :last-child { margin-bottom: 0; }
@@ -241,6 +249,25 @@ html.dark .ga-bg-on .bg-white,
 html.dark.ga-bg-on .bg-white { background-color: rgb(var(--ga-panel-rgb) / var(--ga-panel-alpha)); }
 html.dark.ga-bg-on .bg-slate-50 { background-color: rgb(var(--ga-panel-rgb) / calc(var(--ga-panel-alpha) * 0.72)); }
 
+/* ---------- 系统自动续跑「续跑说明」面板 ----------
+   正文是几百上千字的金色小字，压在自定义壁纸上完全读不清（2026-11-14 用户反馈
+   「续跑不要透明背景，看不清字」）。它不属于可调透明度的内容面板，所以不吃
+   --ga-panel-alpha：浅色给实白、深色给实深底，展开正文再垫一层更实的底。 */
+.ga-auto-continue { background-color: #fffdf7; }
+html.dark .ga-auto-continue { background-color: #1a2338; }
+html.ga-bg-on .ga-auto-continue,
+html.dark.ga-bg-on .ga-auto-continue {
+  background-color: #fffdf7;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+html.dark.ga-bg-on .ga-auto-continue {
+  background-color: #1a2338;
+}
+/* 展开正文用的是 text-amber-900，深色模式没有对应覆写：实深底上会变成深棕压深蓝。
+   标题行的 amber-800/700 已由深色规则提亮，这里只补正文这一档。 */
+html.dark .ga-auto-continue .text-amber-900 { color: #fcd34d; }
+
 /* ---------- 壁纸下的「一点点底色」----------
    用户反馈：侧栏空白区和运行轨迹直接压在壁纸上，边界和文字都看不清；
    但又不想糊成一块实心面板（「要透明一点」）。所以只在开壁纸时补一层很轻的
@@ -281,6 +308,15 @@ html.ga-text-on body,
 html.ga-text-on :is(.text-slate-900, .text-slate-800, .text-slate-700, .text-slate-600,
   .text-slate-500, .text-slate-400, .text-gray-600):not(.ga-log, .ga-log *) {
   color: var(--ga-text);
+}
+
+/* ---------- 迁移进度条：总量还没统计完时给「不确定」滚动条，别让用户盯着 0% ---------- */
+@keyframes ga-progress-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(300%); }
+}
+.ga-progress-indeterminate {
+  animation: ga-progress-slide 1.2s ease-in-out infinite;
 }
 
 /* ---------- 统一按钮体系：primary 主操作 / secondary 常规 / ghost 轻量 / danger 危险 ---------- */

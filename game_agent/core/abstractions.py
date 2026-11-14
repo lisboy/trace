@@ -1,7 +1,7 @@
 """5 个跨模式抽象接口（设计 §2.1）。
 
 业务代码（agent / tool / orchestration）只依赖这些接口，不出现 ``if mode == "lite"``。
-lite 用进程内实现；server 换成 Redis/MySQL/S3 实现即可，业务零改动。
+个人版只跑 lite（进程内实现）；接口保留是为了将来换远端实现时业务零改动。
 """
 from __future__ import annotations
 

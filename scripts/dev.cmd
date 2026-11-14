@@ -1,10 +1,13 @@
 @echo off
-REM æœ¬åœ°å¼€å‘ï¼šåç«¯ï¼ˆ8765ï¼‰+ å‰ç«¯ dev serverï¼ˆ5173ï¼Œä»£ç† /api /wsï¼‰ã€‚
+REM ±¾µØ¿ª·¢£ººó¶Ë£¨8765£©+ Ç°¶Ë dev server£¨5173£¬´úÀí /api /ws£©¡£
 cd /d "%~dp0.."
+
 if not exist .venv ( python -m venv .venv )
 call .venv\Scripts\activate.bat
 pip install -q -r requirements.txt
+
 start "trace-backend" python -m game_agent.main
+
 cd frontend
 call npm install
 call npm run dev

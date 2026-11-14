@@ -16,10 +16,11 @@ log = logging.getLogger("llm.context_window")
 
 # 单张图片按 OpenAI low detail 估 ~900 token（不解析 base64 长度）
 IMAGE_TOKENS = 900
-# 未配置窗口时的默认假设：当前主流模型基本都在 128k 起，按 32k 猜会让长 run 白白
+# 未配置窗口时的默认假设：当前主流模型基本都在 256k 起，按更小的值猜会让长 run 白白
 # 丢掉几十轮历史（实测：策划角色每轮都被顶到窗口外，压缩一直在做无用功）。
+# 2026-11-14：默认值由 128k 提到 256k（用户要求所有模型默认 256k）。
 # 真实窗口更小怎么办？超限时端点回 400，适配层会按半预算重压一次再发（openai_compat）。
-DEFAULT_CONTEXT_WINDOW = 128_000
+DEFAULT_CONTEXT_WINDOW = 256_000
 # 发送预算 = 窗口 × 该比例（给回复留空间）
 BUDGET_RATIO = 0.75
 # 压缩的「装回目标」= 预算 × 该比例（滞回）。触发在预算线、压到预算的 8 成：
@@ -200,7 +201,7 @@ def apply_media_budget(messages: list[dict]) -> tuple[list[dict], dict]:
 def resolve_window(params: dict | None) -> tuple[int, bool]:
     """档位 params_json.context_window → (窗口 tokens, 是否显式配置)。
 
-    没配时回退 DEFAULT_CONTEXT_WINDOW（128k）：这是猜的，所以调用方需要知道这个
+    没配时回退 DEFAULT_CONTEXT_WINDOW（256k）：这是猜的，所以调用方需要知道这个
     值是不是配置里的——猜大了端点会 400（适配层会重压重试），猜小了白丢历史。
     """
     raw = (params or {}).get("context_window")
@@ -209,6 +210,34 @@ def resolve_window(params: dict | None) -> tuple[int, bool]:
     except (TypeError, ValueError):
         window = 0
     return (window, True) if window > 0 else (DEFAULT_CONTEXT_WINDOW, False)
+
+
+def merge_model_catalog_params(params: dict, models_json: list | None,
+                               model: str) -> dict:
+    """用供应商模型目录里的 context_window / vision 校正档位 params（按模型名匹配）。
+
+    目录值**优先**于档位 params（2026-11-12 实测修正）：窗口是「按模型」的属性，
+    用户把目录里某模型的窗口改成 128k 后，档位 params 里残留的旧值 256k 若仍优先，
+    顶栏/压缩会继续按 256k 算——用户看到「目录明明是 128k 还按 256k」。
+    档位 params 只在目录没有该模型（或没填窗口）时兜底。
+    返回补好后的 params（可能是新 dict，调用方无需关心）。
+    """
+    merged = dict(params or {})
+    if not model or not isinstance(models_json, list):
+        return merged
+    entry = next((m for m in models_json
+                  if isinstance(m, dict) and str(m.get("name") or "").strip() == model), None)
+    if not entry:
+        return merged
+    try:
+        win = int(entry.get("context_window") or 0)
+    except (TypeError, ValueError):
+        win = 0
+    if win > 0:
+        merged["context_window"] = win
+    if entry.get("vision"):
+        merged["vision"] = True
+    return merged
 
 
 def budget_for(window: int, ratio: float = BUDGET_RATIO) -> int:

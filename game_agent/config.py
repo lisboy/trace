@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -60,7 +61,66 @@ MODE: str = _str("GA_MODE", "lite").lower()
 assert MODE in ("lite", "server"), f"GA_MODE 非法: {MODE}"
 
 # ---------- 数据目录 / 路径 ----------
-_DATA_DIR_RAW = _str("GA_DATA_DIR", str(Path.home() / ".trace"))
+# 数据根目录（DB / 日志 / 上传 / 项目工作区都在它下面）。默认在用户主目录的 .trace 下，
+# 但允许用户在「设置 / 存储空间」里改到别的盘（老盘时间久了会占满 C 盘）。
+#
+# 记忆方式用「指针文件」——因为用户选的目录本身不能用来记住自己（搬走/删掉就丢了），
+# 所以需要一个固定位置的小文件存「当前数据目录在哪」，进程启动时先读它：
+#   ① 用户主目录的 ~/.trace_location（默认/最早的位置，永远可写）；
+#   ② 打包版另外再看 exe 同目录的 .trace_location（便携盘换机也能跟着走）。
+# 环境变量 GA_DATA_DIR 优先级最高（调试/测试用），显式给了就不再读指针文件。
+_POINTER_FILENAME = ".trace_location"
+
+
+def _pointer_files() -> list[Path]:
+    """指针文件的候选位置（按优先级）。第一个是主位置，写指针时也写它。"""
+    out: list[Path] = [Path.home() / _POINTER_FILENAME]
+    if getattr(sys, "frozen", False):
+        out.append(Path(sys.executable).parent / _POINTER_FILENAME)
+    return out
+
+
+def _read_pointer() -> str:
+    """读指针文件里记的数据目录（空串=没有配置，走默认）。"""
+    for pf in _pointer_files():
+        try:
+            if pf.is_file():
+                raw = pf.read_text(encoding="utf-8").strip()
+                if not raw:
+                    continue
+                # 新格式是 JSON {"data_dir": "..."}；兼容历史上的纯文本路径
+                if raw.startswith("{"):
+                    try:
+                        return str(json.loads(raw).get("data_dir") or "")
+                    except Exception:  # noqa: BLE001
+                        continue
+                return raw
+        except Exception:  # noqa: BLE001 - 读不到就继续看下一个
+            pass
+    return ""
+
+
+def read_data_dir_pointer() -> str:
+    """对外暴露：当前指针文件里记的数据目录（没有则空串）。设置页用来判断是否被改过。"""
+    return _read_pointer()
+
+
+def write_data_dir_pointer(new_dir: str) -> None:
+    """把「数据目录改到 new_dir」记进指针文件。new_dir 为空 = 恢复默认（删掉指针）。"""
+    for pf in _pointer_files():
+        try:
+            pf.parent.mkdir(parents=True, exist_ok=True)
+            if new_dir:
+                pf.write_text(json.dumps({"data_dir": new_dir}, ensure_ascii=False), encoding="utf-8")
+            else:
+                pf.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 - 写第二个（exe 目录）失败不影响主位置
+            pass
+
+
+_DEFAULT_DATA_DIR = str(Path.home() / ".trace")
+# 优先级：环境变量 > 指针文件 > 默认 ~/.trace
+_DATA_DIR_RAW = _str("GA_DATA_DIR", "") or _read_pointer() or _DEFAULT_DATA_DIR
 DATA_DIR = Path(_DATA_DIR_RAW).expanduser().resolve()
 PROJECTS_ROOT = Path(
     _str("PROJECTS_ROOT", str(DATA_DIR / "projects"))
@@ -76,25 +136,43 @@ CHAT_UPLOADS_ROOT = Path(
 LOG_DIR = DATA_DIR / "logs"
 TMP_DIR = DATA_DIR / "tmp"
 
+# 迁移后的「旧目录待清理」标记（写在**新**目录里，内容是旧目录绝对路径）。
+# 只有启动时 DB 打开成功后才按它删旧目录——所以迁移本身绝不删数据。
+# 名字单点定义在这里：迁移接口（api/routers/storage.py）写它、启动逻辑（main.py）读它，
+# 两边各写一份字面量，改一处就静默失效（旧目录永远删不掉）。
+PENDING_CLEANUP_FILENAME = ".trace_pending_cleanup"
+
+
+def data_dir_env_override() -> str:
+    """显式钉死数据目录的环境变量值（空串=没指定）。
+
+    非空时 ``GA_DATA_DIR`` 优先级高于指针文件：设置页「迁移到别处」写的是指针，
+    这种情况下迁移不会生效（重启后还读老目录）。设置页拿它给用户一句实话，
+    迁移接口拿它直接拒绝——否则用户会得到「迁移成功」却什么都没变。
+    """
+    return _str("GA_DATA_DIR", "")
+
 # ---------- 密钥 ----------
 SECRET_KEY = _str("GA_SECRET_KEY", "")
 if not SECRET_KEY and MODE == "lite":
     # lite 离线可接受一个确定性开发密钥；server 模式必须由用户设置
     SECRET_KEY = "dev-insecure-secret-change-me-in-server"
 
-# ---------- 数据库 / Redis ----------
+# ---------- 数据库 ----------
+# 个人版只支持 SQLite（单文件、零运维、随包即用）。
+# 留空 → 用 DATA_DIR 下的 game_agent.db；若 .env 里仍写着 MySQL 等非 SQLite 连接串，
+# 直接报错说清楚，而不是启动到一半才在 SQL 方言上炸。
 DATABASE_URL = _str("DATABASE_URL", "")
 REDIS_URL = _str("REDIS_URL", "")
 
 if not DATABASE_URL:
-    if MODE == "lite":
-        DB_PATH = DATA_DIR / "game_agent.db"
-        DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
-    else:
-        raise RuntimeError(
-            "server 模式必须设置 DATABASE_URL，"
-            "公用部署推荐 MySQL：mysql+aiomysql://user:pass@host:3306/game_agent?charset=utf8mb4"
-        )
+    DB_PATH = DATA_DIR / "game_agent.db"
+    DATABASE_URL = f"sqlite+aiosqlite:///{DB_PATH}"
+elif not DATABASE_URL.startswith("sqlite"):
+    raise RuntimeError(
+        "本版本只支持 SQLite。请把 .env 里的 DATABASE_URL 删除或改为 sqlite+aiosqlite:///<数据库文件路径>；"
+        f"当前值：{DATABASE_URL}"
+    )
 
 # ---------- LLM ----------
 # 只有「真实大模型」一种运行方式：有配置好的供应商档位就走档位，没有就走下面的
@@ -108,6 +186,43 @@ LLM_MAX_ATTEMPTS = 5                             # 单次对话请求的最大�
 LLM_RETRIES = max(0, min(_int("GA_LLM_RETRIES", LLM_MAX_ATTEMPTS - 1), LLM_MAX_ATTEMPTS - 1))
 LLM_CALL_TIMEOUT_S = _int("GA_LLM_CALL_TIMEOUT_S", 360)  # 单次 LLM 调用硬上限（防网关挂起卡死 run）
 LLM_RETRY_BASE_S = float(_str("GA_LLM_RETRY_BASE_S", "1.5") or 1.5)
+# 建连超时（只等 TCP+TLS 握手，不覆盖模型出字时间）：默认 8s。
+# 以前跟着 timeout=300 一起用 300s，是个大坑：中转站挂在 Cloudflare 后面、有两个 A 记录，
+# 其中一个时不时黑洞（实测 3 次里 1 次 SYN 无响应），300s 就直接白等满五分钟
+# （2026-11-13 那次 309.7s 的调用 = 300s 建连超时 + 正常耗时）。跨洋握手 0.6~0.9s 就够，
+# 8s 给足余量，失败立刻退避重试（下一轮 DNS/选路多半换了健康的那台）。
+LLM_CONNECT_TIMEOUT_S = float(_str("GA_LLM_CONNECT_TIMEOUT_S", "8") or 8)
+# 进程级 LLM 出站并发上限：主agent + 子agent 共用同一把 key，一起打满中转配额只会换来
+# 429 + 指数退避（实测 412 次 429 全发生在长 run 里，并把 4.7% 的调用拖成 >30s）。
+# 闸门是自适应的：收到 429 立刻腰斩并发，连续成功后再慢慢加回来。0 = 不限（仅排查用）。
+LLM_MAX_CONCURRENCY = _int("GA_LLM_MAX_CONCURRENCY", 12)
+# 是否显式声明「允许一次返回多个工具调用」（OpenAI 兼容协议里的 parallel_tool_calls）。
+# 有些中转/推理后端默认关闭，模型明明能一次发 3 个 grep 也硬拆成 3 轮，每轮都要付一次
+# 完整往返（实测历史平均只有 1.5 个工具/轮）。端点不认这个字段时适配层会自动去掉重发。
+LLM_PARALLEL_TOOL_CALLS = _bool("GA_LLM_PARALLEL_TOOL_CALLS", True)
+# 出站并发的实测依据（2026-11-14，gonode.si / deepseek-v4.1-flash，41k prompt 固定，重复请求
+# 吃满前缀缓存）：1 路 3.5~4.2s，2 路 3.4~4.2s，4 路 4.9s，8 路 4.5~5.0s，12 路 4.7~5.3s，
+# 16 路 4.2~4.4s —— 单请求延迟几乎不随并发上升（因为 95% 的 prompt 命中缓存、瓶颈在等首 token），
+# 而聚合吞吐 18→122→157→296→320→514 tok/s。所以上限调高到 12：多开就是纯赚，
+# 429 时由自适应闸门腰斩收回。
+# 子agent 的单次回复上限：**默认 0 = 不设**（重要）。实测近 7 天 384 次 sub 调用里，
+# completion >4096 的那 18.2% 占掉 33% 的 sub 时间，但它们 text 中位 0 字符、只有 2 个
+# 工具调用（arguments 中位 147 字符）——也就是说这些 token 全是**隐藏思考**，不是长报告。
+# 硬截断会把这些工具调用的 JSON 切碎（参数解析失败 → 整轮白扔），所以这里保持不设，
+# 从源头治：sub 角色的推理强度默认关掉（见 LLM_SUB_REASONING_EFFORT）。
+LLM_SUB_MAX_OUTPUT_TOKENS = _int("GA_SUB_MAX_TOKENS", 0)
+# 子agent 的推理强度默认值（档位没显式配 reasoning_effort 时生效）：none。
+# 依据：sub 只做只读检索与核对（read_file/grep/glob），结论由主agent 复核；同一条
+# sub 风格的请求实测——不传该字段（走端点默认）5.35s / 537 completion tokens，
+# 显式 none 3.62s / 209 tokens（-32% 延迟、-61% 输出 token），且思考 token 归零。
+# 想要更保守可设 low；设成空串 = 不干预（走端点默认）。主agent 不受此影响。
+LLM_SUB_REASONING_EFFORT = _str("GA_SUB_REASONING_EFFORT", "none")
+# 同 run 内「同工具 + 同参数」重复调用直接复用上次结果（只读类工具）。
+# 实测近 40 个 run 的 2093 轮里有 311 轮含完全重复的调用（15%），重复 grep/read 大仓库
+# 一次就是几百毫秒到几秒；更麻烦的是重复结果会再塞一遍上下文，把后续每轮都撑大。
+# 任何写/执行类工具跑过之后立即清空记忆，避免「改完还读旧内容」。
+TOOL_MEMO_ENABLED = _bool("GA_TOOL_MEMO", True)
+TOOL_MEMO_MAX_ENTRIES = _int("GA_TOOL_MEMO_MAX", 200)
 # 历史压缩用的「摘要调用」单独给一套更短的上限：它不是正文产出，卡住时用户看到的是
 # 「压缩/汇报时一直不动」。默认 120s / 2 次（最坏 ~2×120s + 退避），失败就退化为要点节选，
 # 绝不让摘要器按正文的 5×360s 预算把整个 run 拖死。
@@ -124,8 +239,34 @@ LLM_USER_AGENT = _str("GA_LLM_USER_AGENT",
                       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 # 上下文现场（llm_transcripts）保留天数：每轮存一份完整请求，长 run 一轮就上百 KB，
-# 不清库迟早把 MySQL 撑爆。0 = 不保留（等于关掉现场记录，只剩计数统计）。
+# 不清库迟早把库里堆满。0 = 不保留（等于关掉现场记录，只剩计数统计）。
 LLM_TRANSCRIPT_KEEP_DAYS = _int("GA_LLM_TRANSCRIPT_KEEP_DAYS", 14)
+# 旧工具结果降级（节省上下文，不影响「可再生信息」的可用性）：
+# 文件内容/命令输出这类**可由路径或命令再生**的 tool 结果，模型看过一轮之后就从历史里
+# 降级成「前 N 字符 + 省略提示」的存根——需要细节时它会自己再 read_file/run_command，
+# 但不必让一份 8k 的旧文件内容在后几十轮里每轮重发。置 0 = 关闭该降级。
+# SHRINK_CHARS = 触发降级的最小结果长度；SHRINK_KEEP = 降级后保留的前缀字符数。
+TOOL_RESULT_SHRINK_CHARS = _int("GA_TOOL_RESULT_SHRINK_CHARS", 1500)
+TOOL_RESULT_SHRINK_KEEP = _int("GA_TOOL_RESULT_SHRINK_KEEP", 1000)
+# 降级的**压力门槛**（占上下文预算的比例）：估算用量低于这个比例时一律不动历史。
+# 以前是无条件降级——只要工具结果超过 1500 字符、又不在最近一轮，下一轮就被削成 400 字符存根。
+# 代价在真实会话里立刻显现（2026-11-14 02:06 那次「看看这个项目」）：
+#   · README.md（255 行）被 read_file 读了 4 次不同区间（1-150 / 150-254 / 18-147 / 205-254），
+#     因为上一轮读到的内容下一轮就被削没了 → 模型「不记得」，只能再读一遍（8 轮才干完一件事）；
+#   · 每次削都是在**历史中段**改写消息，从改写点之后的前缀缓存全部作废，
+#     逐轮少命中 1~3k tokens（那次 run 命中率 79.9%，而长 run 是 95%）。
+# 上下文还很宽松（那次只用了 16k / 192k 预算，8%）时做这种删除是纯亏，所以加压力门控。
+TOOL_RESULT_SHRINK_PRESSURE = float(_str("GA_TOOL_RESULT_SHRINK_PRESSURE", "0.6") or 0.6)
+
+# 单次回复输出上限（OpenAI 兼容端点的 max_tokens）：0 = 不传（走端点默认）。
+# 个别模型在收尾/思考时会无限生成，把单轮拖到几十秒——给个上限可兜住。
+# 注意：推理模型的思考 token 也计入该上限，设太小会截断思考/工具调用，默认不设。
+LLM_MAX_OUTPUT_TOKENS = _int("GA_LLM_MAX_TOKENS", 0)
+# 长 run 后段自动降一档推理强度（用更少思考换每步生成时间）：
+# 0 = 关闭（默认）。N>0 时第 N 轮起把档位里的 reasoning_effort 逐级下调
+# （high→medium→low→minimal），每再满 N 轮再降一档，不低于最低档。
+# 仅在档位显式配了 reasoning_effort 时生效；不配（走端点默认）时不动。
+LLM_REASONING_STEP_DOWN_AFTER = _int("GA_REASONING_STEP_DOWN_AFTER", 0)
 
 # ---------- 联网搜索（web_search / web_fetch 工具） ----------
 # bing = 无 key 抓结果页（国内可达，默认）；ddg = DuckDuckGo HTML 版（部分网络不可达）；
@@ -146,8 +287,8 @@ for pair in _ROLE_MODELS_RAW.split(","):
         ROLE_MODELS[k] = v.strip()
 
 # ---------- 认证 ----------
-AUTH_MODE = _str("GA_AUTH_MODE", "both").lower()
-assert AUTH_MODE in ("password", "oidc", "both")
+# 这个版本没有登录：身份是本机默认用户（见 game_agent/auth/local.py）。
+# 保留占位是为了「不要因为 .env 里还留着旧键就报错」——旧的 GA_AUTH_MODE 一律忽略。
 PLACEHOLDER_ENABLED = _bool("PLACEHOLDER_ENABLED", True)
 
 # ---------- 图像生成（ComfyUI 本地） ----------
@@ -258,10 +399,8 @@ COMFYUI_VIDEO_TEMPORAL_DENOISE = _bool("COMFYUI_VIDEO_TEMPORAL_DENOISE", True)
 # 单条视频等待上限（含排队/冷启动加载模型）。5B 在 3060Ti 上一条约 2–5 分钟，留足余量。
 COMFYUI_VIDEO_TIMEOUT_S = _int("COMFYUI_VIDEO_TIMEOUT_S", 1800)
 
-BOOTSTRAP_TOKEN = _str("GA_BOOTSTRAP_TOKEN", "")
-# 首启后是否自动造示例 owner（demo@local / demo1234）与示例团队/项目。
-# 源码与团队部署默认关闭（走 /setup 引导 token）；Windows 单机打包版在 env.template 里
-# 显式设 GA_SEED_DEMO=1，开箱即可登录，避免预填一个不存在的账号导致「邮箱或密码错误」。
+# 首启后是否把 examples/cardgame 拷成示例工作区（并登记为项目）。
+# 这个版本没有账号概念：「播种」只播示例项目，不再造 demo 账号/密码。
 SEED_DEMO = _bool("GA_SEED_DEMO", False)
 
 # ---------- 语音合成（IndexTTS2 本地服务，配音 / 语音工作台 / 对话朗读） ----------
@@ -279,14 +418,17 @@ TTS_EMO_WEIGHT = float(_str("TTS_EMO_WEIGHT", "0.65") or 0.65)
 TTS_EMO_VECTOR = _str("TTS_EMO_VECTOR")
 # 情感参考音频文件路径（一段带目标情绪的干声；配置即用 mode=1）
 TTS_EMO_AUDIO = _str("TTS_EMO_AUDIO")
+# 语速 0.5~2.0（>1 慢 <1 快；IndexTTS-2.5 的 duration_factor，2.0 服务自动忽略）
+TTS_SPEED = float(_str("TTS_SPEED", "1.0") or 1.0)
+# 语言 auto/zh/en/ja/es/ar（auto=服务端按台词判定；IndexTTS-2.5 才生效）
+TTS_LANG = _str("TTS_LANG", "auto")
 # 单次合成等待上限：8G 单卡串行，首次含 30~60 秒模型加载，别设太小
-TTS_TIMEOUT_S = _int("TTS_TIMEOUT_S", 600)
-# 是否在界面暴露「音色设计」（文字描述造音色，需 IndexTTS2 侧装好 VoxCPM2）
+TTS_TIMEOUT_S = _int("TTS_TIMEOUT_S", 600)# 是否在界面暴露「音色设计」（文字描述造音色，需 IndexTTS2 侧装好 VoxCPM2）
 TTS_VOICE_DESIGN = _str("GA_TTS_VOICE_DESIGN", "true").lower() not in ("false", "0", "no")
 # 语音服务未运行时自动拉起（合成/音色设计前检查，未就绪则等待）
 TTS_AUTOSTART = _str("GA_TTS_AUTOSTART", "true").lower() not in ("false", "0", "no")
-# IndexTTS2 分发目录：含 runtime\python.exe 与 server.py
-TTS_HOME = _str("TTS_HOME", r"D:\AI\IndexTTS2.0_v3")
+# IndexTTS2 分发目录：含 runtime\python.exe 与 server.py（2.5 平滑升级版）
+TTS_HOME = _str("TTS_HOME", r"D:\AI\IndexTTS-2.5-v3")
 # 自定义启动命令（留空自动用 TTS_HOME\runtime\python.exe -u server.py --port <端口>）
 TTS_LAUNCH_CMD = _str("TTS_LAUNCH_CMD")
 

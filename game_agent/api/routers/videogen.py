@@ -23,8 +23,9 @@ from game_agent.api.deps import require
 from game_agent.api.routers import progress
 from game_agent.assets import gpu_arbiter, media_queue
 from game_agent.assets.comfyui import (
-    ComfyUIError, comfyui_queue_state, ensure_comfyui_running, generate_video_bytes,
-    generate_video_chain_bytes, smooth_video_bytes, fit_video_size, _comfyui_alive)
+    ComfyUIError, actual_base, comfyui_queue_state, ensure_comfyui_running,
+    generate_video_bytes, generate_video_chain_bytes, smooth_video_bytes,
+    fit_video_size, _comfyui_alive)
 from game_agent.assets.placeholder import _parse_size
 from game_agent.auth.rbac import PERM_AGENT_CONFIG, PERM_DOWNLOAD
 from game_agent.config import (
@@ -67,10 +68,10 @@ def _new_name(name: str) -> str:
 @router.get("/options")
 async def options(ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
     """出片工作台可选参数 + ComfyUI 是否可用（Wan2.2 TI2V 5B，原生 24fps）。"""
-    alive = await _comfyui_alive(COMFYUI_BASE_URL) if COMFYUI_BASE_URL else False
+    alive = await _comfyui_alive(actual_base()) if COMFYUI_BASE_URL else False
     return {
         "available": alive,
-        "base_url": COMFYUI_BASE_URL,
+        "base_url": actual_base(),
         "model": "wan",
         "model_label": "Wan2.2 TI2V 5B",
         "default_size": f"{COMFYUI_VIDEO_WIDTH}x{COMFYUI_VIDEO_HEIGHT}",
@@ -133,7 +134,7 @@ async def get_job(job_id: str, ctx: RequestContext = Depends(require(PERM_AGENT_
     """前端轮询出片进度。任务已被回收/未知时返回 stage='unknown'。"""
     job = progress.get(job_id)
     if job is not None and job.get("stage") == "sampling" and job.get("prompt_id"):
-        st = await comfyui_queue_state(job["prompt_id"], COMFYUI_BASE_URL)
+        st = await comfyui_queue_state(job["prompt_id"], actual_base())
         qs = st.get("state") or ""
         progress.set_queue(job_id, qs, st.get("position") if qs == "queued" else None)
     return progress.snapshot(job_id)
@@ -211,7 +212,7 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
 
     # 3) 确保 ComfyUI 在运行（未启动则自动拉起并等待就绪）
     progress.set_stage(job_id, "starting", "正在准备 ComfyUI 服务…")
-    boot = await ensure_comfyui_running(COMFYUI_BASE_URL)
+    boot = await ensure_comfyui_running(actual_base())
     if boot["error"]:
         raise HTTPException(status_code=502, detail=f"ComfyUI 不可用：{boot['error']}")
     boot_note = (f"ComfyUI 已自动启动（{boot['waited_ms'] / 1000:.1f}s）" if boot["started"] else "")

@@ -46,23 +46,29 @@ def test_configured_port_bindable_means_no_change(clean):
 
 
 def test_reserved_port_rebinds_to_a_bindable_candidate(clean):
-    # 8860 被系统拒绝；让 18960 可用 → 应改绑到 18960
-    _bindable_set(clean, ports={18960})
+    # 8860 被系统拒绝；让 10188 可用 → 应改绑到 10188（候选均 >10000）
+    _bindable_set(clean, ports={10188})
     out = tts._pick_alt_base("http://127.0.0.1:8860")
-    assert out == "http://127.0.0.1:18960"
+    assert out == "http://127.0.0.1:10188"
 
 
 def test_rebind_preserves_scheme_and_host(clean):
-    _bindable_set(clean, ports={7160})
+    _bindable_set(clean, ports={11088})
     out = tts._pick_alt_base("https://localhost:8860")
-    assert out == "https://localhost:7160"
+    assert out == "https://localhost:11088"
 
 
-def test_skip_port_blocked_list(clean):
-    # 近邻候选即使可 bind，只要在 _PORT_BLOCKED_SKIP 里（如 7860）也要跳过
-    _bindable_set(clean, ports={7860, 18961})
-    out = tts._pick_alt_base("http://127.0.0.1:7760")
-    assert out == "http://127.0.0.1:18961"
+def test_candidates_are_above_10000(clean):
+    # 用户要求端口一律 >10000：即使低位端口（如 7860/7000）可 bind 也不能选
+    _bindable_set(clean, ports={7860, 7160, 7000, 10288})
+    out = tts._pick_alt_base("http://127.0.0.1:8860")
+    assert out == "http://127.0.0.1:10288"
+
+
+def test_no_candidate_above_floor_returns_none(clean):
+    # 只有低位端口可用（全 <=10000）→ 拒绝改绑，返回 None（宁可报错也不降到低位）
+    _bindable_set(clean, ports={7860, 7160, 7000})
+    assert tts._pick_alt_base("http://127.0.0.1:8860") is None
 
 
 def test_missing_port_returns_none(clean):
@@ -71,16 +77,64 @@ def test_missing_port_returns_none(clean):
 
 def test_base_remaps_stale_config_port_to_actual(clean, monkeypatch):
     """改绑后，caller 仍把旧配置端口（8860）传下来时，_base 要映射到新端口。"""
-    monkeypatch.setattr(tts, "_ACTUAL_BASE", "http://127.0.0.1:18960", raising=False)
+    monkeypatch.setattr(tts, "_ACTUAL_BASE", "http://127.0.0.1:10188", raising=False)
     monkeypatch.setattr(tts, "TTS_BASE_URL", "http://127.0.0.1:8860", raising=False)
-    assert tts._base("http://127.0.0.1:8860") == "http://127.0.0.1:18960"
+    assert tts._base("http://127.0.0.1:8860") == "http://127.0.0.1:10188"
     # 不传或传新地址都走新端口
-    assert tts._base("") == "http://127.0.0.1:18960"
-    assert tts._base("http://127.0.0.1:18960") == "http://127.0.0.1:18960"
+    assert tts._base("") == "http://127.0.0.1:10188"
+    assert tts._base("http://127.0.0.1:10188") == "http://127.0.0.1:10188"
 
 
 def test_actual_base_prefers_rebound(clean, monkeypatch):
     monkeypatch.setattr(tts, "TTS_BASE_URL", "http://127.0.0.1:8860", raising=False)
     assert tts.actual_base() == "http://127.0.0.1:8860"
-    tts._ACTUAL_BASE = "http://127.0.0.1:18960"
-    assert tts.actual_base() == "http://127.0.0.1:18960"
+    tts._ACTUAL_BASE = "http://127.0.0.1:10188"
+    assert tts.actual_base() == "http://127.0.0.1:10188"
+
+
+# ------------------------------------------------ 改绑/跟随（_maybe_rebind / discover）
+def test_maybe_rebind_skips_when_external_tts_holds_the_port(clean, monkeypatch):
+    """配置端口 bind 不了，但正被「外部 IndexTTS 实例」占用（它在加载、暂探不通）→
+    不能改绑，否则会另起一个实例双开抢卡。"""
+    monkeypatch.setattr(tts, "_port_bindable", lambda p: False)
+    monkeypatch.setattr(tts, "_find_starting_tts",
+                        lambda: {"pid": 1234, "cmdline": "python server.py --port 8860", "port": 8860})
+    assert tts._maybe_rebind("http://127.0.0.1:8860") == "http://127.0.0.1:8860"
+    assert tts._ACTUAL_BASE is None
+
+
+def test_maybe_rebind_rebinds_when_reserved_and_no_external(clean, monkeypatch):
+    """端口被系统保留、且没有外部实例占用 → 改绑到 >10000 的可用端口并记住。"""
+    monkeypatch.setattr(tts, "_port_bindable", lambda p: p == 10188)
+    monkeypatch.setattr(tts, "_find_starting_tts", lambda: None)
+    out = tts._maybe_rebind("http://127.0.0.1:8860")
+    assert out == "http://127.0.0.1:10188"
+    assert tts._ACTUAL_BASE == "http://127.0.0.1:10188"
+
+
+def test_maybe_rebind_remote_untouched(clean, monkeypatch):
+    monkeypatch.setattr(tts, "_port_bindable", lambda p: False)
+    assert tts._maybe_rebind("http://10.0.0.5:8860") == "http://10.0.0.5:8860"
+    assert tts._ACTUAL_BASE is None
+
+
+def test_discover_external_follows_started_port(clean, monkeypatch):
+    """配置端口探不通，但外部实例已绑在别的端口并能回话 → 跟随该端口。"""
+    monkeypatch.setattr(tts, "TTS_BASE_URL", "http://127.0.0.1:10189", raising=False)
+    monkeypatch.setattr(tts, "_find_starting_tts",
+                        lambda: {"pid": 9, "cmdline": "python server.py --port 10289", "port": 10289})
+
+    class _Resp:
+        status_code = 200
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, *a, **k):
+            return _Resp() if url.startswith("http://127.0.0.1:10289") else None
+
+    monkeypatch.setattr(tts.httpx, "Client", _Client)
+    out = tts.discover_external(probe=True)
+    assert out == "http://127.0.0.1:10289"
+    assert tts._ACTUAL_BASE == "http://127.0.0.1:10289"

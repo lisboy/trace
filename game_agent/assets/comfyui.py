@@ -18,11 +18,13 @@ import asyncio
 import json
 import random
 import re
+import socket
 import subprocess
 import time
 import uuid
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -53,6 +55,75 @@ BOOT_LOG_PATH = LOG_DIR / "comfyui_boot.log"
 # 只有控制台。启动时补上 `--verbose INFO <此路径>`，进程输出才真正可回溯，
 # 也用来判断「还在加载」还是「卡死」。
 COMFY_LOG_PATH = LOG_DIR / "comfyui.log"
+
+# 实际在用的 ComfyUI 地址覆盖：配置端口落在 Windows「保留/排除端口段」（WinError 10013，
+# 一个包都不发）或被别的进程占用（WinError 10048）时，服务端 bind 会立刻失败，探活永远
+# 「未就绪」。这里记住「实际可用端口」，让之后连它的地方（合成/健康/停止/列表）都改走它，
+# 不必改库里的档位配置。_ACTUAL_BASE 非空时覆盖 COMFYUI_BASE_URL。
+# 与 tts.actual_base() 同一套思路（语音服务 2026-11-05 就踩过 8851-8950 被 Hyper-V 保留的坑）。
+_ACTUAL_BASE: str | None = None
+# 端口被系统保留时的自动改绑候选：先从配置端口往上跳（>10000 才符合“避开保留段”的需求），
+# 再补几个本机高位空闲区。10188 实测可 bind；18888 曾被 game_agent 后端自身占用，跳过。
+_PORT_BLOCKED_SKIP = {8188, 8588, 18888}
+
+
+def actual_base() -> str:
+    """实际应连接的 ComfyUI 地址（优先用自动改绑后的端口，否则用配置值）。"""
+    return (_ACTUAL_BASE or COMFYUI_BASE_URL or "").strip().rstrip("/")
+
+
+def _comfy_base(base_url: str = "") -> str:
+    """把调用方传入的地址归一到「实际在用的地址」。
+
+    - 显式传入的地址若正是「配置里那个被拒绝、已自动改绑」的端口 → 用改绑后的；
+    - 否则用传入值 / 改绑值 / 配置值兜底。
+    """
+    req = (base_url or "").strip().rstrip("/")
+    config_base = (COMFYUI_BASE_URL or "").strip().rstrip("/")
+    if req and _ACTUAL_BASE and req == config_base:
+        return _ACTUAL_BASE
+    return (req or actual_base() or "").rstrip("/")
+
+
+def _port_bindable(port: int) -> bool:
+    """本机 127.0.0.1:port 能否 bind。WinError 10013（系统保留段）/10048（被占用）判为不可用。"""
+    if not port:
+        return False
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _pick_alt_base(base: str) -> str | None:
+    """配置端口 bind 不了时挑一个可用端口，返回改绑后的 base URL（保持 host/协议）。
+    只在「本机且配置端口确实被系统拒绝/占用」时用；远端地址一律不动。
+    候选全部 >10000（用户要求避开 10000 以下）；优先从配置端口往上 +100 步进探测，
+    再试几个高位空闲区。"""
+    u = urlparse(base)
+    host = u.hostname or ""
+    if host not in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
+        return None
+    cur = u.port
+    if not cur:
+        return None
+    if _port_bindable(cur):
+        return None  # 配置端口本来就能用，不改
+    # 近邻上跳：从 max(配置端口+100, 10100) 起步，确保候选全部 >10000
+    start = max(cur + 100, 10100)
+    candidates: list[int] = [start + 100 * i for i in range(0, 6)]
+    candidates += [10188, 10189, 10288, 10888, 11088, 12088, 13088, 15088, 18088, 21088]
+    for p in candidates:
+        if p in _PORT_BLOCKED_SKIP or p < 10000 or p > 65535:
+            continue
+        if _port_bindable(p):
+            return f"{u.scheme or 'http'}://{host}:{p}"
+    return None
+
 
 # 自动启动：优先直接启动实例服务（绕过桌面壳的实例选择器），找不到再退桌面 exe
 # （Comfy Desktop.exe 只开选择器窗口，需手动点实例卡片才真正起服务——不适合无人值守）
@@ -103,9 +174,12 @@ async def _comfyui_alive(base_url: str) -> bool:
     实例去抢同一张卡（00:06:55 那次重复拉起就是这么来的），正在跑的那张图反而被拖死。
     /queue 不碰 GPU，空闲时 ~50ms；只要 HTTP 层能答（哪怕 4xx）就算活着。
     """
+    base = _comfy_base(base_url)
+    if not base:
+        return False
     try:
         async with httpx.AsyncClient(timeout=8, trust_env=False) as client:
-            r = await client.get(f"{base_url.rstrip('/')}/queue")
+            r = await client.get(f"{base.rstrip('/')}/queue")
             return r.status_code < 500
     except Exception:  # noqa: BLE001
         return False
@@ -115,7 +189,7 @@ async def comfyui_queue_state(prompt_id: str, base_url: str = "") -> dict:
     """只读查 ComfyUI /queue：本 prompt_id 是「正在跑 / 排队中 / 已不在队列」。
     给工作台的「处理过程可视化」用——出图请求本身是阻塞的，另起一个查询线程靠它报进度阶段。
     /queue 不碰 GPU，正在出图时也能很快返回。任何异常一律返回 unknown（前端按未知处理）。"""
-    base = (base_url or COMFYUI_BASE_URL or "").rstrip("/")
+    base = _comfy_base(base_url)
     if not base or not prompt_id:
         return {"state": "unknown"}
     try:
@@ -143,11 +217,10 @@ async def stop_comfyui_service(base_url: str = "") -> dict:
     """
     import psutil
 
-    base = (base_url or COMFYUI_BASE_URL or "").strip().rstrip("/")
+    base = _comfy_base(base_url)
     if not base:
         return {"stopped": False, "killed": [], "port": 0}
-    from urllib.parse import urlparse as _urlparse
-    u = _urlparse(base)
+    u = urlparse(base)
     port = u.port or 8188
     if (u.hostname or "127.0.0.1") not in ("127.0.0.1", "localhost", "::1"):
         # 远端 ComfyUI：不在本机，停不了也不该停
@@ -227,6 +300,9 @@ def _find_starting_comfyui() -> dict | None:
     """找「外部已拉起、正在启动中」的 ComfyUI 进程（cmdline 带 comfyui 且是 main.py / 桌面壳）。
 
     只用于识别启动状态，不做任何杀进程动作（杀进程在 stop_comfyui_service 里按端口精确匹配）。
+    返回里带 port：优先从 cmdline 解析 --port；解析不到就从该进程（含子进程）的监听端口
+    反查——覆盖桌面壳 exe（不带 --port）与「shell 秒退、真身是子进程」的场景，
+    让「外部实例绑的端口 ≠ 配置端口」时探活跟随，避免空等整轮超时。
     """
     try:
         import psutil
@@ -246,7 +322,32 @@ def _find_starting_comfyui() -> dict | None:
         if "game_agent" in low or "cargame" in low or "pytest" in low:
             continue
         if "main.py" in low or "comfy desktop" in low:
-            return {"pid": p.info["pid"], "cmdline": cl[:200]}
+            info = {"pid": p.info["pid"], "cmdline": cl[:200]}
+            m = re.search(r"--port\s+(\d+)", cl)
+            if m:
+                try:
+                    info["port"] = int(m.group(1))
+                    return info
+                except ValueError:
+                    pass
+            # 命令行没有 --port（桌面壳/包装进程）→ 从进程树监听端口反查
+            try:
+                proc = psutil.Process(p.info["pid"])
+                procs = [proc] + proc.children(recursive=True)
+            except psutil.NoSuchProcess:
+                continue
+            ports: set[int] = set()
+            for q in procs:
+                try:
+                    for c in q.net_connections(kind="inet"):
+                        if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port >= 1000:
+                            ports.add(c.laddr.port)
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    continue
+            if ports:
+                # 多个监听端口（如 8188 代理）就取最小的高位端口；通常只有一个 API 端口
+                info["port"] = min(ports)
+            return info
     return None
 
 
@@ -281,6 +382,13 @@ async def _wait_alive(base: str, deadline: float, record: dict | None = None) ->
       只要没到硬上限（COMFYUI_BOOT_HARD_CAP_S）就继续等；
     - 无进展超过 COMFYUI_BOOT_STALL_S 时在日志里记一条（便于事后复盘），但不打断等待；
     - 超时/失败时把**新增日志**尾部带回，能直接看出是卡在哪个 import/哪步。
+
+    关键修正（2026-11-10 实测）：Popen(shell=True, DETACHED_PROCESS) 记下的是 **shell 的 pid**
+    （cmd.exe），命令派发后 shell 秒退、真正的 python 进程成了孤儿子进程——旧逻辑看到
+    pid 已死就立刻报「启动进程已退出」，而 ComfyUI 其实正好好地在起来。所以：
+    - 判死前先探一次活；
+    - 若端口已经有人监听，说明服务在，绝不算退出；
+    - 最后再用「端口是否被占用」作为进程真实存活的兜底（bind 不上的进程才可能已死）。
     """
     import psutil  # 局部导入，避免无 psutil 环境下模块导入失败
 
@@ -292,22 +400,31 @@ async def _wait_alive(base: str, deadline: float, record: dict | None = None) ->
     last_progress_at = started_at
     last_size = -1
     stall_warned = False
+    target_port = urlparse(base).port
 
     while True:
         now = time.monotonic()
         if await _comfyui_alive(base):
             return {"ok": True, "reason": "", "tail": ""}
 
-        # 进程已经退出（或崩了）→ 立即失败，不空等
+        # 进程已经退出（或崩了）→ 立即失败，不空等。
+        # 但 shell 包装进程秒退是正常现象：真正的服务进程是它的子进程，且端口监听者
+        # 才代表「服务还在」。端口有人监听 = 服务在起/在跑，绝不判死。
         if has_own_pid:
             try:
                 alive = psutil.pid_exists(pid) and psutil.Process(pid).is_running()
             except Exception:  # noqa: BLE001
                 alive = True  # 探测不了按活着处理
             if not alive:
-                _, tail = _log_progress_since(log_offset)
-                return {"ok": False, "reason": "启动进程已退出（多半是依赖/端口/显存错误，见日志）",
-                        "tail": tail}
+                port_busy = (target_port and not _port_bindable(target_port))
+                if port_busy:
+                    # shell 已退但端口被监听 → 服务进程仍在，继续等就绪（可能还在加载）
+                    alive = True
+                else:
+                    _, tail = _log_progress_since(log_offset)
+                    return {"ok": False,
+                            "reason": "启动进程已退出（多半是依赖/端口/显存错误，见日志）",
+                            "tail": tail}
 
         # 进度：日志有没有新增长。一直没有任何日志增长，说明可能根本没在往日志写
         # （桌面壳/外部实例），此时进度只看日志会误判——用「已耗时」兜底，不打断。
@@ -340,8 +457,7 @@ def _align_launch_cmd(cmd: str, base: str) -> str:
     """
     if "main.py" not in cmd:
         return cmd
-    from urllib.parse import urlparse as _up
-    u = _up(base)
+    u = urlparse(base)
     port = u.port or 8188
     host = u.hostname or "127.0.0.1"
     out = cmd
@@ -423,8 +539,8 @@ async def ensure_comfyui_running(base_url: str = "", timeout_s: int = 0) -> dict
 
     返回 {started: bool, waited_ms: int, error: str|None}；error 非空表示无法拉起。
     """
-    global _LAUNCH_RECORD
-    base = (base_url or COMFYUI_BASE_URL).rstrip("/")
+    global _LAUNCH_RECORD, _ACTUAL_BASE
+    base = _comfy_base(base_url)
     if not base or not COMFYUI_AUTOSTART:
         return {"started": False, "waited_ms": 0, "error": None}
     if await _comfyui_alive(base):
@@ -433,14 +549,34 @@ async def ensure_comfyui_running(base_url: str = "", timeout_s: int = 0) -> dict
             _LAUNCH_RECORD = None
         _ENSURE_FAIL_CACHE.pop(base, None)
         return {"started": False, "waited_ms": 0, "error": None}
+    # 配置/档位端口被系统保留（WinError 10013）/被占用（WinError 10048）→ 服务端 bind 永远失败，
+    # 趁早改绑到 >10000 的可用端口，而不是傻等 600s 再报「进程已退出」。改绑只动 base，
+    # _ACTUAL_BASE 让后续探活/合成/停止都走新端口；库里的档位配置不用改。
+    # 注意：档位 base_url 可能是旧端口（如 8588），同样要能改绑，不能只认 config_base。
+    _u = urlparse(base)
+    if (_ACTUAL_BASE is None and _u.hostname in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+            and _u.port and not _port_bindable(_u.port)):
+        alt = _pick_alt_base(base)
+        if alt:
+            log.warning("ComfyUI 端口 %s 被系统保留/占用，自动改绑到 %s", base, alt)
+            _ACTUAL_BASE = alt
+            base = alt
     cached = _ENSURE_FAIL_CACHE.get(base)
     if cached and time.monotonic() - cached[0] < _ENSURE_FAIL_TTL_S:
         # 上次失败时拉起的进程还活着 → 不是真失败（多半是加载慢），不熔断，继续等
         if not _pid_alive(cached[2]):
-            log.warning("ComfyUI %s 刚启动失败过（%.0fs 前），熔断快速失败：%s",
-                        base, time.monotonic() - cached[0], cached[1][:120])
-            return {"started": False, "waited_ms": 0, "error": cached[1]}
-        log.info("ComfyUI %s 上次判失败但进程 pid=%s 仍存活，继续等待不熔断", base, cached[2])
+            # 进程已死：但要先看用户是不是已经手动把 ComfyUI 拉起来了（可能绑在别的端口），
+            # 有的话不能拿旧错误熔断，交给下面的流程跟随它探活。
+            ext_now = await asyncio.to_thread(_find_starting_comfyui)
+            if ext_now is not None:
+                log.info("ComfyUI %s 有熔断缓存，但检测到外部实例（pid=%s），不熔断继续跟随",
+                         base, ext_now["pid"])
+            else:
+                log.warning("ComfyUI %s 刚启动失败过（%.0fs 前），熔断快速失败：%s",
+                            base, time.monotonic() - cached[0], cached[1][:120])
+                return {"started": False, "waited_ms": 0, "error": cached[1]}
+        else:
+            log.info("ComfyUI %s 上次判失败但进程 pid=%s 仍存活，继续等待不熔断", base, cached[2])
         _ENSURE_FAIL_CACHE.pop(base, None)
 
     # 起 ComfyUI 前先停语音服务并等显存释放（与 tts.ensure_tts_running 对称）。
@@ -466,6 +602,19 @@ async def ensure_comfyui_running(base_url: str = "", timeout_s: int = 0) -> dict
         else:
             ext = await asyncio.to_thread(_find_starting_comfyui)
             if ext is not None:
+                # 外部实例绑的端口可能 ≠ 配置端口（用户手动起、桌面壳选卡等）：
+                # 有 --port 就跟过去探活，没有就仍探配置端口。否则对着配置端口空等整轮超时，
+                # 表现为「我都启动完了，它还显示启动中」。
+                if ext.get("port") and ext["port"] != (urlparse(base).port or 0):
+                    _u = urlparse(base)
+                    ext_base = (f"{_u.scheme or 'http'}://"
+                                f"{_u.hostname or '127.0.0.1'}:{ext['port']}")
+                    base = ext_base
+                    # 记下实际端口，让之后的探活/合成/停止/工作台列表都跟着走，
+                    # 否则面板会一直显示「启动中」（对着配置端口探活）。
+                    _ACTUAL_BASE = ext_base
+                    log.info("检测到外部 ComfyUI 实例（pid=%s，端口=%s ≠ 配置 %s），探活地址跟随",
+                             ext["pid"], ext["port"], _u.port)
                 log.info("检测到外部 ComfyUI 实例正在启动（pid=%s：%s），等待就绪不重复拉起",
                          ext["pid"], ext["cmdline"])
                 # 外部实例的 pid 不在我们手上，清掉可能残留的旧记录，避免 _wait_alive
@@ -481,8 +630,7 @@ async def ensure_comfyui_running(base_url: str = "", timeout_s: int = 0) -> dict
                     # 优先：实例 python + main.py 直启服务（无人值守可用）。
                     # 端口跟随 COMFYUI_BASE_URL，避免硬编码端口落在 Windows 保留端口段
                     # （如 8188 属于 8155-8254）导致 WinError 10013 绑定失败。
-                    from urllib.parse import urlparse as _urlparse
-                    _u = _urlparse(base)
+                    _u = urlparse(base)
                     _host = _u.hostname or "127.0.0.1"
                     _port = _u.port or 8188
                     for py, main in _LAUNCH_PY_MAIN:
@@ -543,6 +691,16 @@ async def ensure_comfyui_running(base_url: str = "", timeout_s: int = 0) -> dict
             log.info("ComfyUI 就绪（%s，等待 %dms，本次%s发起）",
                      base, waited, "由本进程" if started_here else "外部/早前")
             _LAUNCH_RECORD = None
+            return {"started": started_here, "waited_ms": waited, "error": None}
+        # 判失败前最后再探一次活：外部/手动拉起的实例可能刚好在 wait 超时瞬间起来，
+        # 或者之前「进程退出」是误判（pid 是 shell 包装进程，真正服务进程是它的子进程，
+        # DETACHED_PROCESS 下 shell 秒退，服务其实活着）——一次 /queue 探活最便宜也最真。
+        if await _comfyui_alive(base):
+            waited = int((time.monotonic() - t0) * 1000)
+            log.info("ComfyUI 最终复核已就绪（%s，等待 %dms，此前被误判为 %s）",
+                     base, waited, wait["reason"])
+            _LAUNCH_RECORD = None
+            _ENSURE_FAIL_CACHE.pop(base, None)
             return {"started": started_here, "waited_ms": waited, "error": None}
         tail = (wait.get("tail") or "").strip() or _read_boot_log_tail()
         err = (f"ComfyUI（{base}）未就绪：{wait['reason']}（已等 {budget}s）"
@@ -670,7 +828,11 @@ def _style_ref_workflow() -> dict:
     }
 
 
-STYLE_PROMPT_PREFIX = "沿用参考图的画风、厚涂质感、光影处理与配色氛围，按以下描述生成全新内容："
+# 风格参考模式：参考图只用来「借鉴」画风/质感/配色，人物与构图按用户描述全新生成。
+# 注意：这里**绝不能**写死某个具体风格（如以前写死的「厚涂质感」）——那会把照片参考也
+# 强行拉成油画/厚涂（2026-11-10 用户反馈：选了写实参考图、不挂 LoRA，出来的却是油画风格）。
+# 具体画风由「用户提示词 + 预设 + 参考图本身」共同决定，这条前缀只说明参考图的作用，不指定风格。
+STYLE_PROMPT_PREFIX = "以下为画面描述；参考图仅作画风、质感与配色的参考，人物与构图按描述全新生成，不照搬参考图内容："
 
 
 def _dit_workflow() -> dict:
@@ -1157,8 +1319,12 @@ def flatten_reference_bg(ref_bytes: bytes) -> bytes:
 async def fetch_model_options(base_url: str) -> dict:
     """从 ComfyUI /object_info 拉可选手动模型列表。
     返回 {available, checkpoints, diffusion, loras, default_lora, default_lora_strength,
-    loras_dir, error}；ComfyUI 不可达时 available=False，但默认值与 LoRA 安装目录照常返回。"""
-    base = (base_url or "").rstrip("/")
+    loras_dir, error}；ComfyUI 不可达时 available=False，但默认值与 LoRA 安装目录照常返回。
+
+    配置端口探不通时，会顺手找一下外部手动拉起、但绑了别的端口的实例（桌面壳/手动改端口），
+    找到就把 _ACTUAL_BASE 记下来——工作台刷新列表即自愈，不必重启后端。"""
+    global _ACTUAL_BASE
+    base = _comfy_base(base_url)
     ld = loras_dir()
     defaults = {
         "default_lora": COMFYUI_LORA,
@@ -1168,6 +1334,21 @@ async def fetch_model_options(base_url: str) -> dict:
     if not base:
         return {"available": False, "checkpoints": [], "diffusion": [], "loras": [],
                 "error": "未配置 ComfyUI 地址", **defaults}
+    # 配置端口探不通时自愈：找外部实例绑的实际端口（用户手动起/桌面壳）
+    try:
+        async with httpx.AsyncClient(timeout=5, trust_env=False) as probe:
+            r = await probe.get(f"{base}/queue")
+            reachable = r.status_code < 500
+    except Exception:  # noqa: BLE001
+        reachable = False
+    if not reachable and _ACTUAL_BASE is None:
+        ext = await asyncio.to_thread(_find_starting_comfyui)
+        if ext and ext.get("port"):
+            _u = urlparse(base)
+            ext_base = (f"{_u.scheme or 'http'}://{_u.hostname or '127.0.0.1'}:{ext['port']}")
+            if ext_base != base:
+                _ACTUAL_BASE = ext_base
+                base = ext_base
     def _opts(spec) -> list[str]:
         try:
             first = spec[0]  # ComfyUI 格式：[["a.safetensors", "b.safetensors"], {...}]
@@ -1250,7 +1431,7 @@ async def _generate_images_bytes_once(prompt: str, *, negative_prompt: str = "",
     - diffusion：强制 DiT 三件套工作流。
     model 非空时手动指定模型文件名（覆盖探测结果）。
     batch > 1 时通过 latent 的 batch_size 一次生成多张，按 ComfyUI 输出顺序返回全部图片。"""
-    base = base_url.rstrip("/")
+    base = _comfy_base(base_url)
     workflow_mode = (workflow_mode or "auto").lower()
     if workflow_mode not in ("auto", "checkpoint", "diffusion"):
         workflow_mode = "auto"
@@ -1407,7 +1588,7 @@ async def generate_images_bytes(prompt: str, **kwargs) -> list[bytes]:
     进程内先过 media_queue（图片/语音/视频共用一条队列，别的会话在生成语音时这里要等），
     再过 _GEN_LOCK（同类型内再兜一层）；服务本身由 ensure_comfyui_running 只拉起一次。
     """
-    base = (kwargs.get("base_url") or COMFYUI_BASE_URL or "").rstrip("/")
+    base = _comfy_base(kwargs.get("base_url"))
     ref = "参考图" if kwargs.get("reference") else "文生图"
     t0 = time.monotonic()
     log.info("出图开始：%s %sx%s %s prompt=%r",
@@ -1637,7 +1818,7 @@ async def _generate_video_bytes_once(prompt: str, *, negative_prompt: str = "",
 
     reference 提供时走 i2v（参考图作首帧，并按目标宽高**等比缩放、不裁脸**）；否则 t2v。
     帧数按 Wan 的 4n+1 约束收敛；尺寸取 32 的整数倍。"""
-    base = (base_url or COMFYUI_BASE_URL).rstrip("/")
+    base = _comfy_base(base_url)
     width = width or COMFYUI_VIDEO_WIDTH
     height = height or COMFYUI_VIDEO_HEIGHT
     length = length or COMFYUI_VIDEO_LENGTH
@@ -1744,7 +1925,7 @@ async def _generate_video_bytes_once(prompt: str, *, negative_prompt: str = "",
 async def generate_video_bytes(prompt: str, **kwargs) -> bytes:
     """出片总入口：**全局串行**（与出图/配音共用 media_queue 的 video 通道），
     独占 GPU（gpu_image：视频同样吃 ComfyUI，和出图互斥，与语音互斥）。"""
-    base = (kwargs.get("base_url") or COMFYUI_BASE_URL or "").rstrip("/")
+    base = _comfy_base(kwargs.get("base_url"))
     t0 = time.monotonic()
     log.info("出片开始：%s %sx%s prompt=%r",
              base, kwargs.get("width") or COMFYUI_VIDEO_WIDTH,
@@ -1832,7 +2013,7 @@ async def generate_video_chain_bytes(prompt: str, *, segments: int = 4,
     seg_len = _normalize_seg_len(segment_seconds, fps)
     target_fps = int(target_fps or 0)
 
-    base = (kwargs.get("base_url") or COMFYUI_BASE_URL or "").rstrip("/")
+    base = _comfy_base(kwargs.get("base_url"))
     t0 = time.monotonic()
     log.info("接龙出片：%d 段 × %d 帧(@%dfps) 首帧参考=%s prompt=%r",
              segments, seg_len, fps, bool(reference), (prompt or "")[:60])

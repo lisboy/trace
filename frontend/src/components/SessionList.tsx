@@ -42,7 +42,7 @@ function Chevron({ open }: { open: boolean }) {
 /** 工作区（项目）里可折叠的一组会话。点击整行切换收起/展开；悬停显示「进入 / 删除」。 */
 function ProjectGroup({
   p, sessions, current, archivedMode, collapsed, showAll, query, activeId,
-  onToggle, onPick, onPickProject, onDeleteProject, onShowAll, onArchiveToggle, onRemove,
+  onToggle, onPick, onPickProject, onDeleteProject, onShowAll, onArchiveToggle, onRemove, onReveal,
 }: {
   p: ProjectSummary;
   sessions: Session[];
@@ -59,6 +59,7 @@ function ProjectGroup({
   onShowAll: () => void;
   onArchiveToggle: (s: Session, status: "active" | "archived") => void;
   onRemove: (s: Session) => void;
+  onReveal: (p: ProjectSummary) => void;
 }) {
   const q = query.trim().toLowerCase();
   const list = sessions.filter((s) => !q || (s.title || "（无标题）").toLowerCase().includes(q));
@@ -74,7 +75,15 @@ function ProjectGroup({
         onClick={onToggle}
         title={`${p.name}（点击${open ? "收起" : "展开"}会话）`}
       >
-        <FolderIcon />
+        <button
+          type="button"
+          className="shrink-0 flex items-center justify-center rounded p-0.5 -m-0.5 text-slate-500 hover:text-brand-600 hover:bg-slate-100"
+          title="在文件管理器中打开项目文件夹"
+          aria-label="打开项目文件夹"
+          onClick={(e) => { e.stopPropagation(); onReveal(p); }}
+        >
+          <FolderIcon />
+        </button>
         <span className="truncate flex-1 text-[12.5px] font-medium">{p.name}</span>
         {!current && (
           <button
@@ -313,8 +322,16 @@ export default function SessionList({
     }
   }
 
-  async function restoreProject(p: ProjectSummary) {
+  async function revealProject(p: ProjectSummary) {
     setMsg("");
+    try {
+      await api.revealProject(p.id);
+    } catch (e: any) {
+      setMsg(e?.message || "打开文件夹失败");
+    }
+  }
+
+  async function restoreProject(p: ProjectSummary) {    setMsg("");
     try {
       await api.restoreProject(p.id);
       window.dispatchEvent(new Event("ga-sessions-changed"));
@@ -475,6 +492,7 @@ export default function SessionList({
             onShowAll={() => setShowAll((v) => ({ ...v, [p.id]: true }))}
             onArchiveToggle={setStatus}
             onRemove={remove}
+            onReveal={revealProject}
           />
         ))}
 

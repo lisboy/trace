@@ -15,11 +15,16 @@ def _ensure_std_streams() -> None:
     """windowed 模式下 sys.stdout/stderr 可能是 None，写日志会崩；兜底到 DATA_DIR 下的日志文件。"""
     if sys.stdout is not None and sys.stderr is not None:
         return
+    # 数据目录以 config 为准（它认得设置页写下的指针文件）：这里要是只认「默认 ~/.trace」，
+    # 用户把数据迁到 D 盘后，每次启动都会在 C 盘重新长出 ~/.trace/logs/exe.out，
+    # 看起来就像「迁移根本没生效」。
     try:
-        data_dir = Path(os.environ.get("GA_DATA_DIR", str(Path.home() / ".trace")))
+        from game_agent.config import DATA_DIR
+
+        data_dir = Path(DATA_DIR)
         data_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:  # noqa: BLE001
-        data_dir = Path(".")
+    except Exception:  # noqa: BLE001 - config 都导不进来时回到默认位置，别在这里崩
+        data_dir = Path(os.environ.get("GA_DATA_DIR") or (Path.home() / ".trace"))
     log_path = data_dir / "logs" / "exe.out"
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -39,10 +44,11 @@ def main() -> None:
     if str(exe_dir) not in sys.path:
         sys.path.insert(0, str(exe_dir))
     _ensure_std_streams()
-    # 子命令入口：`Trace.exe --reset-password` 走 CLI，不启动服务。
-    # 放在最前面，这样即使后端配置有问题也仍能重置密码。
+    # 子命令入口：`Trace.exe --reset-password` 仍走 CLI，但这个版本没有账号密码，
+    # 它只会打印一句「本版本不需要账号密码」。留着是为了老用户/老快捷方式不至于撞上
+    # argparse 报错；`Trace.exe --info` 则能不开服务就查到数据目录/端口。
     argv = sys.argv[1:]
-    if argv and argv[0] in ("--reset-password", "reset-password", "-rp"):
+    if argv and argv[0] in ("--reset-password", "reset-password", "-rp", "--info", "info"):
         from game_agent.cli import main as cli_main
         raise SystemExit(cli_main(argv))
     from game_agent.main import main as app_main

@@ -95,7 +95,10 @@ def append(workspace: Path | str, entries: list[dict], run_id: str = "",
                 old = p.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 old = ""
-        existing = set(re.findall(r"<!--k:([0-9a-f]{12})-->", old))
+        # 用解析后的 key 判重（含「缺 key / key 写坏」的旧条目走标题哈希回退），
+        # 否则手改过 md、key 格式不规范的条目判重会漏，同一件事被反复沉淀。
+        existing = ({_parse_entry(c)["key"] for c in _chunks(old)[1]}
+                    if old.strip() else set())
         blocks = []
         for e in items:
             key = _title_key(str(e["title"]))
@@ -118,20 +121,93 @@ def append(workspace: Path | str, entries: list[dict], run_id: str = "",
             log.warning("经验写入失败 %s：%s", fname, e)
             continue
         touched.append(f"{NOTES_DIR}/{fname}")
+        # judge_prompt 让模型在 detail 里写「取代：<旧条标题>」，这里兑现它：
+        # 把被取代的旧条标为失效（不删、留痕），否则旧口径会一直注入误导后续 run。
+        for e in items:
+            for target in _supersede_targets(str(e.get("detail") or "")):
+                _mark_superseded(ws, cat, target)
     return touched
 
 
+def _supersede_targets(detail: str) -> list[str]:
+    """从 detail 里抠出「取代：xxx」的旧条标题（支持全角/半角冒号）。"""
+    out: list[str] = []
+    for m in re.finditer(r"取代[:：]\s*([^\n；;]+)", detail or ""):
+        t = m.group(1).strip().strip("「」『』\"'《》〈〉").strip()
+        if t:
+            out.append(t)
+    return out
+
+
+def _norm_title(t: str) -> str:
+    return re.sub(r"[\s\u3000]+", "", t or "").lower()
+
+
+def _mark_superseded(workspace: Path | str, category: str, target_title: str) -> bool:
+    """把同类别里标题匹配「被取代」的旧条标为失效。匹配用互相包含，容忍措辞微调。"""
+    if category not in CATEGORIES:
+        return False
+    p = notes_root(Path(workspace)) / CATEGORIES[category][0]
+    if not p.is_file():
+        return False
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    _, chunks = _chunks(text)
+    want = _norm_title(target_title)
+    if not want:
+        return False
+    # 跳过最后一条（刚写入的新条目本身），避免自我标记
+    for c in chunks[:-1]:
+        parsed = _parse_entry(c)
+        have = _norm_title(parsed["title"])
+        if not have or parsed["stale"] or parsed["keep"]:
+            continue
+        if want == have or want in have or have in want:
+            return set_flag(workspace, category, parsed["key"], stale=True)
+    return False
+
+
 def _trim(text: str) -> str:
-    """只保留最近 _MAX_ENTRIES_PER_FILE 条（文件头说明之后）。"""
+    """保留最近 _MAX_ENTRIES_PER_FILE 条，按价值分三级淘汰。
+
+    为什么不再「纯丢最旧」：旧条不一定没用（「迁移先复制再删旧」这种铁律写一次就管很久），
+    而新条也不一定有用（早期的过程性流水账）。只按位置淘汰等于把最该留的和最该丢的一起丢。
+
+    三级：
+    - 标 `<!--stale-->` 的（已失效）：**最先丢**，腾坑优先于一切；
+    - 标 `<!--keep-->` 的（钉住）：**永不淘汰**，除非钉住数本身就超过上限；
+    - 其余：维持原行为，满了丢最旧。
+    """
     parts = re.split(r"(?=^### )", text, flags=re.M)
-    head = [x for x in parts if not x.startswith("### ")]
+    head = "".join(x for x in parts if not x.startswith("### "))
     entries = [x for x in parts if x.startswith("### ")]
     if len(entries) <= _MAX_ENTRIES_PER_FILE:
         return text
-    keep = entries[-_MAX_ENTRIES_PER_FILE:]
-    dropped = len(entries) - len(keep)
-    return "".join(head).rstrip("\n") + "\n\n" + f"<!-- 更早 {dropped} 条已归档删除 -->\n\n" \
-        + "\n".join(keep)
+    parsed = [_parse_entry(c) for c in entries]
+    pinned = [i for i, e in enumerate(parsed) if e["keep"] and not e["stale"]]
+    stale = [i for i, e in enumerate(parsed) if e["stale"]]
+    normal = [i for i, e in enumerate(parsed) if not e["keep"] and not e["stale"]]
+    # 钉住的优先占坑（极端情况钉了超过上限，只留最早的 _MAX 条，避免文件无限增长）
+    chosen = set(pinned[:_MAX_ENTRIES_PER_FILE])
+    room = _MAX_ENTRIES_PER_FILE - len(chosen)
+    if room > 0 and normal:
+        take = min(room, len(normal))
+        chosen |= set(normal[len(normal) - take:])      # 正常条目丢最旧、留最新
+        room -= take
+    if room > 0 and stale:
+        take = min(room, len(stale))                    # 还有空位才轮到失效条目（排最后）
+        chosen |= set(stale[len(stale) - take:])
+    dropped = len(entries) - len(chosen)
+    kept = "\n".join(c for i, c in enumerate(entries) if i in chosen)
+
+    # 归档标记累计次数，别每次 trim 都往上叠一行
+    prev = sum(int(x) for x in re.findall(r"<!-- 更早 (\d+) 条已归档删除 -->", head))
+    head = re.sub(r"\n*<!-- 更早 \d+ 条已归档删除 -->\s*", "\n", head)
+    total = dropped + prev
+    note = f"<!-- 更早 {total} 条已归档删除 -->\n\n" if total else ""
+    return head.rstrip("\n") + "\n\n" + note + kept
 
 
 def _chunks(text: str) -> tuple[str, list[str]]:
@@ -159,7 +235,9 @@ def _parse_entry(chunk: str) -> dict[str, Any]:
         elif t:
             detail.append(t)
     return {"when": when, "title": title, "detail": "\n".join(detail),
-            "files": files, "run_id": run_id, "key": km.group(1) if km else _title_key(title)}
+            "files": files, "run_id": run_id, "key": km.group(1) if km else _title_key(title),
+            # 生命周期标记：keep=钉住不淘汰，stale=已失效（不注入、优先淘汰）
+            "keep": "<!--keep-->" in chunk, "stale": "<!--stale-->" in chunk}
 
 
 def list_entries(workspace: Path | str) -> list[dict[str, Any]]:
@@ -211,8 +289,54 @@ def delete_entry(workspace: Path | str, category: str, key: str) -> bool:
     return True
 
 
-def index_titles(workspace: Path | str) -> list[str]:
-    """已有条目的「类别 · 标题」清单，喂给判断模型防止重复沉淀。"""
+def set_flag(workspace: Path | str, category: str, key: str,
+             *, keep: bool | None = None, stale: bool | None = None) -> bool:
+    """给条目打/去标记：keep=钉住（永不淘汰），stale=已失效（不注入、优先淘汰）。
+
+    None 表示不动这个标记（只想改一个就不传另一个）。为什么用标记而不是直接删：
+    失效要留痕——用户看得见「这条作废了」，智能体不再被它误导，历史也还在文件里。
+    """
+    if category not in CATEGORIES:
+        return False
+    p = notes_root(Path(workspace)) / CATEGORIES[category][0]
+    if not p.is_file():
+        return False
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    head, chunks = _chunks(text)
+    hit = False
+    out: list[str] = []
+    for c in chunks:
+        parsed = _parse_entry(c)
+        if not hit and (parsed["key"] == key or _title_key(parsed["title"]) == key):
+            hit = True
+            body = re.sub(r"\n*<!--(?:keep|stale)-->\s*", "\n", c).rstrip()
+            new_keep = parsed["keep"] if keep is None else keep
+            new_stale = parsed["stale"] if stale is None else stale
+            if new_keep:
+                body += "\n<!--keep-->"
+            if new_stale:
+                body += "\n<!--stale-->"
+            c = body + "\n"
+        out.append(c)
+    if not hit:
+        return False
+    try:
+        p.write_text(head.rstrip("\n") + "\n\n" + "\n".join(out), encoding="utf-8")
+    except OSError as e:
+        log.warning("经验标记失败 %s：%s", CATEGORIES[category][0], e)
+        return False
+    return True
+
+
+def index_titles(workspace: Path | str, limit: int = 400) -> list[str]:
+    """已有条目的「类别 · 标题」清单，喂给判断模型防止重复沉淀。
+
+    为什么不再截 120 条：判重靠的是「模型看得见已有条目」，截断等于让后半部分文件隐形。
+    本机 130 条约 1.7k token，判断模型吃得下；limit 只是防文件失控增长的保险丝。
+    """
     out: list[str] = []
     root = notes_root(Path(workspace))
     for cat, (fname, cn, _) in CATEGORIES.items():
@@ -225,7 +349,7 @@ def index_titles(workspace: Path | str) -> list[str]:
                 out.append(f"{cn} · {m.group(1).split(' · ', 1)[-1]}")
         except OSError:
             continue
-    return out[:120]
+    return out[:limit]
 
 
 def index_block(workspace: Path | str, budget_tokens: int = INJECT_BUDGET_TOKENS) -> str:
@@ -233,43 +357,83 @@ def index_block(workspace: Path | str, budget_tokens: int = INJECT_BUDGET_TOKENS
 
     为什么不inject正文：五类文件的正文全给要上千 token，而多数 run 只用得上其中一两类；
     给索引让 agent 自己按标题 read_file，需要哪类读哪类（.trace/notes 不在保护路径里，读得动）。
+
+    为什么按「轮转」分配预算而不是一类吃完再下一类：CATEGORIES 里排最后的 playbook/codemap
+    曾被前三类把 1500 token 预算吃光后整类饿死，一条标题都进不了上下文——智能体看不到，
+    就会重新全库 grep，正好废掉 codemap 的意义。现在每类轮流拿一条，五类都有份。
+    已失效（stale）的条目不注入，钉住（keep）的排该类最前面。
     """
     from game_agent.llm.context_window import estimate_tokens
 
     root = notes_root(Path(workspace))
     if not root.is_dir():
         return ""
-    used = 0
-    blocks: list[str] = []
+    buckets: list[dict[str, Any]] = []
     for cat, (fname, cn, desc) in CATEGORIES.items():
         p = root / fname
         if not p.is_file():
             continue
         try:
-            text = p.read_text(encoding="utf-8", errors="replace")
+            _, chunks = _chunks(p.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        titles = [m.group(1).strip() for m in
-                  re.finditer(r"^### (.+)$", text, flags=re.M)]
-        if not titles:
+        items = [_parse_entry(c) for c in chunks]
+        alive = [e for e in items if not e["stale"]]
+        if not alive:
             continue
-        rows: list[str] = []
-        for t in reversed(titles):          # 文件里最靠后的最新，索引里也新的在前
-            cost = estimate_tokens(t) + 4
+        newest = list(reversed(alive))                  # 文件里最靠后的最新，索引里也新的在前
+        ordered = [e for e in newest if e["keep"]] + [e for e in newest if not e["keep"]]
+        buckets.append({"cn": cn, "fname": fname, "desc": desc, "all": len(items),
+                        "hidden": len(items) - len(alive), "ordered": ordered, "rows": []})
+    if not buckets:
+        return ""
+
+    # 固定开销先扣掉：外层说明 + 每个类别头（含 desc 与「共 N 条」），否则五类各塞到
+    # 「刚好不超」时会一起把总量顶出预算（实测曾超 18%）。
+    preamble = ("## 项目改动经验索引（只有标题，正文没注入）\n")
+    fixed = estimate_tokens(preamble) + 60
+    for b in buckets:
+        fixed += estimate_tokens(f"**{b['cn']}** · {NOTES_DIR}/{b['fname']}"
+                                 f"（共 {b['all']} 条；另有 N 条未列出，可 read_file；{b['desc']}）") + 2
+    used = fixed
+    ptr = [0] * len(buckets)
+    moved = True
+    while moved:                                        # 轮转：每类轮流拿一条
+        moved = False
+        for i, b in enumerate(buckets):
+            if ptr[i] >= len(b["ordered"]):
+                continue
+            t = b["ordered"][ptr[i]]
+            stamp = f'{t["when"]} · ' if t["when"] else ""
+            line = f'- {stamp}{t["title"]}' + ("（钉住）" if t["keep"] else "")
+            cost = estimate_tokens(line) + 2
             if used + cost > budget_tokens:
-                break
-            rows.append(f"- {t}")
+                continue
+            b["rows"].append(line)
+            ptr[i] += 1
             used += cost
-        if not rows:
+            moved = True
+
+    blocks: list[str] = []
+    for b in buckets:
+        if not b["rows"]:
             continue
-        blocks.append(f"**{cn}** · {NOTES_DIR}/{fname}（{len(titles)} 条，{desc}）\n"
-                      + "\n".join(rows))
+        extra: list[str] = []
+        if b["hidden"]:
+            extra.append(f"另有 {b['hidden']} 条已失效")
+        rest = len(b["ordered"]) - len(b["rows"])
+        if rest > 0:
+            extra.append(f"另有 {rest} 条未列出，可 read_file")
+        tail = f"（共 {b['all']} 条" + ("；" + "；".join(extra) if extra else "") + f"；{b['desc']}）"
+        blocks.append(f"**{b['cn']}** · {NOTES_DIR}/{b['fname']}{tail}\n"
+                      + "\n".join(str(r) for r in b["rows"]))
     if not blocks:
         return ""
-    return ("## 项目改动经验索引（只有标题，正文没注入）\n"
-            "下面是历次 run 沉淀下来的条目标题。动手前先扫一眼：命中当前任务的，"
+    return (preamble
+            + "下面是历次 run 沉淀下来的条目标题。动手前先扫一眼：命中当前任务的，"
             "用 read_file 读那个文件（文件里最靠后的条目最新），照着已经定好的口径做，"
-            "别把同一条坑再踩一遍、也别重新摸索已经记过的做法。\n\n"
+            "别把同一条坑再踩一遍、也别重新摸索已经记过的做法。"
+            "标「已失效」的条目已经过时，不要照它做。\n\n"
             + "\n\n".join(blocks) + "\n\n")
 
 
@@ -277,7 +441,19 @@ def judge_prompt(requirement: str, summary: str, changed_files: list[str],
                  existing_titles: list[str]) -> str:
     """让模型判断本轮值不值得沉淀，值得就给出分类条目（JSON）。"""
     files = "、".join(changed_files[:20]) or "（未记录到文件改动）"
-    titles = "\n".join(f"- {t}" for t in existing_titles[:60]) or "（还没有任何经验条目）"
+    # 按类别分组列全量：平铺 + 截断会让后半部分的类别（conventions/playbook/codemap）
+    # 对判断模型完全隐形，结果就是同一件事换句话反复沉淀。
+    grouped: dict[str, list[str]] = {}
+    for t in existing_titles:
+        cn, _, title = t.partition(" · ")
+        grouped.setdefault(cn or "其他", []).append(title or t)
+    if grouped:
+        lines = []
+        for cn, titles in grouped.items():
+            lines.append(f"【{cn}】" + "；".join(titles))
+        titles = "\n".join(lines)
+    else:
+        titles = "（还没有任何经验条目）"
     return (
         "你在为一个项目沉淀「改动经验」，供后续改这个项目的人/智能体参考。\n"
         "先判断这次调整是否值得记：值得 = 后来人需要延续的约定、会影响做法的决策、"
@@ -290,7 +466,11 @@ def judge_prompt(requirement: str, summary: str, changed_files: list[str],
         '"title": "不超过 24 字，说清是什么事（不要写日期）", '
         '"detail": "1-3 句：结论 + 怎么做 / 为什么，用 - 开头分点", '
         '"files": ["相关路径"]}]}\n'
-        "worth=false 时 entries 必须是空数组。一条经验一个条目，不要把三件事塞进一条。\n"
+                 "worth=false 时 entries 必须是空数组。一条经验一个条目，不要把三件事塞进一条。\n"
+         "判重要严：标题相同、或**意思相同**（同一件事换个说法、把上限数字写全/省略）都算重复，"
+         "别再写第二遍；确实口径变了（旧条已作废），就写新条目，并在 detail 里首发一句"
+         "「取代：<旧条标题>」——平台据此把旧条标记为失效（不删除、留痕）。\n"
+         "只写「现在仍然成立」的结论；已经被后续改动推翻、或只属于那次过程的选择，不要写进 entries。\n"
         "codemap（代码地图）单独说：如果本次 run 弄清楚了此前未记录的结构位置"
         "（例如「布局骨架在 style.css 约 200-244 行」「首页网格在 home-grid 一段」），"
         "就输出一条 codemap：title 写清是什么区域，detail 用 - 分点写"

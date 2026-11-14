@@ -54,9 +54,7 @@
 三、.env 关键项说明
 --------------------------------------------------------
 - GA_MODE=lite                      运行模式（不要改）
-- DATABASE_URL=                     留空 = 自动用 SQLite（推荐单机）
-                                    要用 MySQL 才填 mysql+aiomysql://user:pass@host:3306/game_agent?charset=utf8mb4
-                                    （用 MySQL 还需 pip install aiomysql，并先建库 utf8mb4）
+- DATABASE_URL=                     留空 = 用内置 SQLite（本版本只支持 SQLite）
 - GA_HOST=127.0.0.1                 仅本机访问
 - GA_PORT=18888                      端口
    → 要让局域网其他电脑访问：GA_HOST=0.0.0.0，并在 Windows 防火墙放行 18888
@@ -77,7 +75,7 @@
 --------------------------------------------------------
 五、可选增强（不装也能用，只是对应功能降级）
 --------------------------------------------------------
-- 本地生图 ComfyUI：.env 里 COMFYUI_BASE_URL=http://127.0.0.1:8588
+- 本地生图 ComfyUI：.env 里 COMFYUI_BASE_URL=http://127.0.0.1:10188
      （未配置则出「占位图」）
 - 本地语音 IndexTTS2：.env 里 TTS_BASE_URL=... 与 TTS_HOME=<安装目录>
      （未配置则配音回退占位静音）
@@ -114,8 +112,8 @@
 4) 想给局域网同事用
    → .env 设 GA_HOST=0.0.0.0，防火墙放行 18888，同事访问 http://<本机IP>:18888
 
-5) 用 MySQL 时报驱动错误
-   → pip install aiomysql；确认库字符集 utf8mb4。
+5) 数据库相关报错
+   → 本版本只用 SQLite，无需安装数据库服务；确认 .env 里 DATABASE_URL 为空或 sqlite+aiosqlite:///…。
 
 --------------------------------------------------------
 八、升级

@@ -134,3 +134,78 @@ def test_no_proxy_env_forces_direct_even_if_system_proxy_set(monkeypatch):
         assert resp.text == "直连成功"  # 用户强制直连：压根不碰那个死代理
     finally:
         srv.should_exit = True
+
+
+# ---------------------------------------------------------------- 会话级直连记忆
+def test_session_direct_memory_basics(monkeypatch):
+    oa.clear_session_direct()
+    assert oa.session_is_direct("s1") is False
+    assert oa.session_is_direct("") is False
+    oa.mark_session_direct(None)  # 没会话 id：不是错误，只是不记
+    assert oa.session_is_direct("") is False
+    oa.mark_session_direct("s1")
+    assert oa.session_is_direct("s1") is True
+    assert oa.session_is_direct("s2") is False, "按会话记，别串到别的会话上去"
+    # 过期即忘（换网络 / 用户重开代理客户端后要能再给代理一次机会）
+    monkeypatch.setattr(oa, "_SESSION_DIRECT_TTL_S", 0.0)
+    oa.mark_session_direct("s1")
+    assert oa.session_is_direct("s1") is False
+    oa.clear_session_direct("s1")
+    oa.mark_session_direct("s1")
+    oa.clear_session_direct()
+    assert oa.session_is_direct("s1") is False
+
+
+def test_session_direct_sticks_after_downgrade(monkeypatch):
+    """一次会话降级直连后，后续往返不再尝试代理（也不再报重试提醒）。
+
+    以前只有 120s 的进程级冷却：一次长 run 过了冷却期就重新撞一次死代理，用户看到的是
+    一阵阵无缘无故的卡顿 + 一条「已重试模型请求」。
+    """
+    srv, base = _start_server()
+    endpoint = base.rstrip("/") + "/v1"
+    hits: list[int] = []
+
+    def fake_proxy():
+        hits.append(1)
+        return DEAD_PROXY
+
+    monkeypatch.setattr(oa, "_system_proxy", fake_proxy)
+    monkeypatch.delenv("GA_LLM_NO_PROXY", raising=False)
+    oa.clear_session_direct()
+    # 前面的用例会把这个死代理塞进 120s 冷却表：清掉，否则首轮压根不会去试代理
+    oa._dead_proxies.clear()
+    oa._proxy_cache = None
+    try:
+        first = oa.OpenAICompatibleLLM("main", model="m", api_key="k", base_url=endpoint)
+        first.session_key = "sess-sticky"
+        ctx = Ctx(role="main")
+        notes: list[tuple] = []
+        ctx.on_llm_retry = lambda *a: notes.append(a)
+        resp = asyncio.run(first.chat([{"role": "user", "content": "hi"}], [], ctx,
+                                      timeout_s=15, max_attempts=3))
+        assert resp.text == "直连成功"
+        assert hits, "首次应该真的去问了系统代理"
+        assert notes, "首次是「代理不通 → 改直连」，这条内部提醒仍然会发（界面不再显示）"
+        assert oa.session_is_direct("sess-sticky") is True
+
+        # 新一轮 run（适配器重建）+ 冷却期已过 + 代理缓存清空：仍然不该碰代理
+        oa._dead_proxies.clear()
+        oa._proxy_cache = None
+        hits.clear()
+        second = oa.OpenAICompatibleLLM("main", model="m", api_key="k", base_url=endpoint)
+        second.session_key = "sess-sticky"
+        ctx2 = Ctx(role="main")
+        notes2: list[tuple] = []
+        ctx2.on_llm_retry = lambda *a: notes2.append(a)
+        resp2 = asyncio.run(second.chat([{"role": "user", "content": "hi"}], [], ctx2,
+                                        timeout_s=15, max_attempts=3))
+        assert resp2.text == "直连成功"
+        assert hits == [], "本会话已改直连：不该再去读系统代理"
+        assert notes2 == [], "本会话已改直连：不该再出现代理降级的重试"
+        # 别的会话不受影响：这条会话的直连决定不串台
+        assert oa.session_is_direct("other-session") is False
+    finally:
+        oa.clear_session_direct()
+        oa._dead_proxies.clear()
+        srv.should_exit = True

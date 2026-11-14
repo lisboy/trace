@@ -8,11 +8,11 @@
 
 这里把四条修复各自钉死：
 1. 过程文件不算落地；
-2. 故障描述（「…操作失败」）必须触发「只勘察不动手」守卫；
+2. 「要动手还是只勘察」由**模型推理**判定（见 test_intent_*），不再用关键词；
 3. search_history 同关键词不重复返回、整轮有上限、并告知真实可搜范围；
 4. 上下文压缩必须原样保留第一条用户需求。
 后面又补了两条（同一会话的另一半账）：
-5. 疑问式故障描述（「首页为啥还有滚动条」）也要触发这两道守卫；
+5. 意图判定走模型推理：survey=只勘察/答疑，modify=动手落地（含「移除…导入…」这类词表外的表达）；
 6. 只读查询工具的描述教模型「互不依赖的一次问全」，少几趟串行等待。
 """
 from __future__ import annotations
@@ -50,81 +50,76 @@ def test_scratch_paths_are_not_product_landing() -> None:
 
 
 def test_failure_report_counts_as_action_request() -> None:
-    """只描述现象的 bug 报告也要触发「必须动手」守卫（原来判 False）。"""
-    assert Orchestrator._needs_action("出战提示操作失败")
-    assert Orchestrator._needs_action("点全部翻开卡死了")
-    assert Orchestrator._needs_action("页面白屏")
-    # 明确只要分析/不要改的仍然不触发
-    assert not Orchestrator._needs_action("只分析一下这个报错，不要改代码")
-    assert not Orchestrator._needs_action("这是什么")
+    """（2026-11-10 起）意图判定改用模型推理，不再靠关键词。
+
+    旧实现用 _ACTION_WORDS 关键词判「要动手」，这里原本钉的是「出战提示操作失败」这类
+    现象描述也要触发守卫。现在判定统一走 classify_intent（见 test_intent_model.py），
+    本用例仅保留一个不变式：只要不是空串，模型无法判断时按「动手」安全兜底。
+    """
+    assert Orchestrator._needs_action("出战提示操作失败")  # 兼容壳：非空 → 按动手兜底
+    assert not Orchestrator._needs_action("")
 
 
 def test_fix_task_scope_for_exploration_brake() -> None:
-    """「只排查不动手」刹车只对修 bug/小改动生效，批量任务和出图不被误伤。"""
-    from game_agent.agents.runtime import _is_fix_task
-    assert _is_fix_task("出战提示操作失败")
-    assert _is_fix_task("点全部翻开卡死了")
-    assert _is_fix_task("改一下结算界面适配手机")
-    assert not _is_fix_task("给所有角色配上语音")
-    assert not _is_fix_task("生成 20 张角色立绘")
-    assert not _is_fix_task("对全量 536 条语音做重构")
+    """意图分流（修 bug vs 创建/生成）改由模型推理给出 mode，不再用关键词。
 
-
-# ---------------------------------------------------------------- 1·五 疑问式故障描述
-def test_interrogative_symptom_arms_the_guards() -> None:
-    """「首页为啥还有滚动条」要的是把滚动条弄掉，不是要一个解释。
-
-    2026-10-28 那次会话里这句话一个动作词都没有，两道守卫（收尾的 _needs_action、
-    过程中的 _is_fix_task 刹车）全程判 False，模型查了半天没改一行。
+    这里只钉一个不变式：废弃的 _is_fix_task 兼容壳恒为 False（真正的开关是
+    AgentRuntime.engage/fix_task，由编排器从 IntentResult 传入）。
     """
-    from game_agent.agents.runtime import _is_fix_task, is_symptom_complaint
-    assert is_symptom_complaint("首页为啥还有滚动条")
-    assert Orchestrator._needs_action("首页为啥还有滚动条")
-    assert _is_fix_task("首页为啥还有滚动条")
-    assert Orchestrator._needs_action("这个滚动条为什么去不掉")
-    assert _is_fix_task("按钮怎么还是点不动")
-
-
-def test_plain_questions_stay_questions() -> None:
-    """没有「问题还在」这一截，就还是纯提问/纯问答，不该被逼着动手。"""
     from game_agent.agents.runtime import _is_fix_task
-    for t in ("这个项目是做什么的？", "这个函数为什么要这样写",
-              "首页的排版是怎么做的"):
-        assert not Orchestrator._needs_action(t), t
-        assert not _is_fix_task(t), t
-    # 「这个报错怎么回事」里「报错」是故障词，收尾守卫按纯提问放行（_needs_action False），
-    # 但过程刹车照旧启用——在 modify run 里问报错，默认就是要你把它弄好。
-    assert not Orchestrator._needs_action("这个报错怎么回事")
-    assert _is_fix_task("这个报错怎么回事")
+    assert _is_fix_task("任何内容") is False
 
 
-def test_explicit_no_action_still_wins() -> None:
-    """用户明说只要分析/别动代码时，疑问式描述也不触发守卫；跑命令类交付物不变。"""
-    from game_agent.agents.runtime import _is_fix_task
-    for t in ("首页为啥还有滚动条，只分析原因", "首页为啥还有滚动条？先别动代码",
-              "首页为啥还有滚动条（别改，我自己来）"):
-        assert not Orchestrator._needs_action(t), t
-        assert not _is_fix_task(t), t
-    assert not Orchestrator._needs_action("跑一遍单测")
-    assert not _is_fix_task("生成 20 张角色立绘")
+# ---------------------------------------------------------------- 1·五 意图盘查只当提示
+def test_intent_classification_never_blocks_when_model_down() -> None:
+    """盘查保留判别，但**模型不可用时一律放行**（判 modify 兜底），绝不误禁手（2026-11-14）。
 
-
-def test_noun_wording_in_question_is_not_an_action_request() -> None:
-    """纯问答里的「处理」是名词，不是动手指令（run 9a9656bc 回归）。
-
-    用户原话：「这一块，一次接口请求，能完成查重处理和编制完成吗？为什么有时候请求一次没用？」
-    ——「处理」属于「查重处理」（名词），句子是一个问句，要的是解释。旧实现因为
-    _EXPLICIT_ACTION_WORDS 含「处理」，跳过了纯提问豁免 → 判成动手指令 → 把 5 分钟的
-    正确答案强行推翻重做成 23 分钟的代码改造。修法：疑问句豁免里不再把「处理」当例外。
+    用户选了「保留判别但不作为闸门」：盘查可以判 survey（只换一句软提示），
+    但判不出来时必须按「放行」处理——老实现的兜底方向就是对的，这里钉住它别回退。
     """
-    q = "这一块，一次接口请求，能完成查重处理和编制完成吗？为什么有时候请求一次没用？"
-    assert not Orchestrator._needs_action(q), "纯问答被判成动手指令了"
-    # 真·祈使式（无问号 / 明确「帮我」）仍必须是动手指令
-    assert Orchestrator._needs_action("帮我处理这个问题")
-    assert Orchestrator._needs_action("把这个 bug 处理一下")
-    assert Orchestrator._needs_action("改一下 compileComplete")
-    # 疑问式故障描述仍按动手指令处理（is_symptom_complaint 不受影响）
-    assert Orchestrator._needs_action("首页为啥还有滚动条")
+    import asyncio
+
+    import pytest
+
+    from game_agent.orchestration import intent as intent_mod
+
+    def _boom(*a, **k):  # pragma: no cover - 被调用就说明想调模型
+        raise AssertionError("命中关键词就不该再调模型")
+
+    # 明确动手 → 关键词短路判 modify，不调模型、不额外等一次往返
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(intent_mod, "build_llm", _boom, raising=False)
+        res = asyncio.run(intent_mod.classify_intent(
+            "PmsHistoryBatch 给我移除所有和这个表相关的内容，导入历史项目"))
+    assert res.intent == "modify" and res.decided_by == "keyword"
+
+    # 模型挂了 → 兜底放行（modify），不会把「要改」误降级成「只勘察」
+    class _Boom:
+        async def chat(self, *a, **k):
+            raise RuntimeError("down")
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(intent_mod, "build_llm", lambda role, ctx=None: _Boom(), raising=False)
+        res = asyncio.run(intent_mod.classify_intent("先别改，先看看问题出在哪"))
+    assert res.intent == "modify" and res.decided_by == "fallback"
+
+
+def test_landed_action_guard_needs_model_commitment() -> None:
+    """收尾纠正不再按系统预判的意图触发，只看模型自己说过什么。
+
+    「claimed_action」= 汇报/清单里自称已改；命中却零落地才纠正。
+    纯结论/方案汇报不该命中，否则又会变成系统逼无关任务去改代码。
+    """
+    class _Res:
+        def __init__(self, text: str):
+            self.text = text
+
+    assert Orchestrator._claims_action(_Res("已修改 web/src/App.tsx，改动如下…"), "")
+    assert Orchestrator._claims_action(_Res(""), "已生成 6 张立绘，路径在 assets/art/")
+    # 纯结论/方案的汇报：不应被当成「说了改了」
+    assert not Orchestrator._claims_action(
+        _Res("结论：登录失败是因为 token 过期后没有刷新。建议在拦截器里加续期。"), "")
+
 
 
 

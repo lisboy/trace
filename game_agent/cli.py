@@ -1,29 +1,22 @@
 """命令行工具（打包版与源码通用）。
 
-用途：忘记登录密码时重置账号密码（无需旧密码）。
-
-用法：
-    python -m game_agent.cli --list                      # 只列出所有账号
-    python -m game_agent.cli reset-password              # 交互式：选账号 -> 输入新密码
-    python -m game_agent.cli reset-password --email demo@local --password 新密码
-
-打包版（Trace.exe）：
-    Trace.exe --reset-password                           # 等价于 reset-password
-    start.cmd 菜单里选 [2] 会调起它
-
-连接的是 .env 里 DATABASE_URL 指向的那套库（与 start.cmd 启动的服务同一套数据）。
-故意用纯文本交互（getpass 隐藏输入 + 普通 input 兜底），不依赖任何第三方 CLI 库，
-以免打进 exe 后受终端/编码影响。
+这个版本**没有账号密码**，所以不再有「重置密码」这类命令。留着这个入口只为两件事：
+  1. 老用户/老脚本还会敲 ``Trace.exe --reset-password``，要能给出人话，
+     而不是 argparse 的报错；
+  2. 需要一个不开服务、只查配置的地方时（数据目录 / 库文件 / 端口在哪），
+     ``--info`` 能直接打印。
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
-import getpass
 import sys
 
+_NO_ACCOUNTS = (
+    "本版本不需要账号密码：没有登录，也没有注册/找回。\n"
+    "打开浏览器访问服务地址即可直接使用（数据全部保存在本机数据目录里）。"
+)
 
-# ---------------------------------------------------------------- 输出兜底
+
 def _safe_print(text: str = "") -> None:
     """Windows 控制台编码各异，打印失败也绝不能让命令崩掉。"""
     try:
@@ -35,172 +28,45 @@ def _safe_print(text: str = "") -> None:
             pass
 
 
-def _ask(prompt: str) -> str:
-    """读一行密码：真实控制台用 getpass 隐藏输入；stdin 不是终端（管道/自动化）
-    时退回普通 input，否则 getpass 会一直等一个不存在的 tty 而挂住。"""
-    try:
-        if sys.stdin is not None and sys.stdin.isatty():
-            return getpass.getpass(prompt)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        return input(prompt)
-    except EOFError:
-        return ""
+def _print_info() -> int:
+    from game_agent import config as cfg
 
-
-def _prompt_new_password() -> str:
-    while True:
-        p1 = _ask("请输入新密码（至少 8 位）：")
-        if len(p1) < 8:
-            _safe_print("  密码太短，至少 8 位，请重来。\n")
-            continue
-        if len(p1) > 200:
-            _safe_print("  密码过长（>200），请重来。\n")
-            continue
-        p2 = _ask("请再输入一次确认：")
-        if p1 != p2:
-            _safe_print("  两次输入不一致，请重来。\n")
-            continue
-        return p1
-
-
-# ---------------------------------------------------------------- DB 操作
-async def _collect_users():
-    from sqlalchemy import select
-
-    from game_agent.db.models import User
-    from game_agent.db.session import SessionLocal
-
-    async with SessionLocal() as s:
-        return list((await s.execute(select(User).order_by(User.email))).scalars())
-
-
-async def _do_reset(email: str, password: str) -> bool:
-    from sqlalchemy import select
-
-    from game_agent.auth.passwords import hash_password
-    from game_agent.db.models import User
-    from game_agent.db.session import SessionLocal
-
-    async with SessionLocal() as s:
-        user = await s.scalar(select(User).where(User.email == email))
-        if user is None:
-            return False
-        user.password_hash = hash_password(password)
-        user.failed_logins = 0
-        user.locked_until = None
-        user.is_active = True
-        await s.commit()
-    return True
-
-
-def _print_users(users) -> None:
-    if not users:
-        _safe_print("  库中还没有任何账号（说明服务还没完成首启初始化）。")
-        return
-    _safe_print(f"  共有 {len(users)} 个账号：")
-    for u in users:
-        flags = []
-        if not getattr(u, "is_active", True):
-            flags.append("已停用")
-        if getattr(u, "locked_until", None):
-            flags.append("锁定中")
-        if getattr(u, "is_superuser", False):
-            flags.append("超管")
-        tail = ("  [" + "/".join(flags) + "]") if flags else ""
-        _safe_print(f"    - {u.email:<32} {u.display_name}{tail}")
-
-
-# ---------------------------------------------------------------- 命令实现
-async def _run_reset(args: argparse.Namespace) -> int:
-    users = await _collect_users()
-
-    if args.list:
-        _print_users(users)
-        return 0
-
-    if not users:
-        _safe_print("库中还没有任何账号，先启动一次服务完成初始化，再来重置。")
-        return 2
-
-    email = (args.email or "").strip().lower()
-    if not email:
-        _print_users(users)
-        _safe_print()
-        email = input("要重置哪个账号？输入上面的邮箱后回车：").strip().lower()
-        if not email:
-            _safe_print("没有输入邮箱，已取消。")
-            return 1
-
-    password = args.password or ""
-    if not password:
-        password = _prompt_new_password()
-
-    ok = await _do_reset(email, password)
-    if not ok:
-        _safe_print(f"找不到账号：{email}")
-        _safe_print("可用账号：")
-        _print_users(users)
-        return 3
-
-    _safe_print(f"\n已重置 {email} 的密码，并已解锁/启用该账号。现在可以用新密码登录了。")
+    _safe_print("循迹（Trace）配置")
+    _safe_print(f"  数据目录：{cfg.DATA_DIR}")
+    _safe_print(f"  数据库  ：{cfg.DB_PATH}")
+    _safe_print(f"  项目目录：{cfg.PROJECTS_ROOT}")
+    _safe_print(f"  监听    ：{cfg.HOST}:{cfg.PORT}")
+    _safe_print("  账号    ：无（本版本没有登录/账号密码）")
     return 0
-
-
-def _dispatch(args: argparse.Namespace) -> int:
-    from game_agent.db.session import engine
-
-    async def _wrap() -> int:
-        try:
-            return await _run_reset(args)
-        finally:
-            # 必须在同一个事件循环里 dispose，否则 aiomysql 在另一个 loop 里关连接会炸
-            try:
-                await engine.dispose()
-            except Exception:  # noqa: BLE001
-                pass
-
-    try:
-        if sys.platform == "win32":
-            # aiomysql 在 Windows 上要求 Selector 事件循环（默认 Proactor 不兼容）
-            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-        return asyncio.run(_wrap())
-    except Exception as e:  # noqa: BLE001
-        _safe_print(f"\n连接数据库失败或执行出错：{e}")
-        _safe_print("请确认 .env 的 DATABASE_URL 正确；用 SQLite 时无需数据库服务，"
-                    "用 MySQL 时请先启动数据库。")
-        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="trace",
-        description="Trace 命令行工具（重置账号密码）。",
+        description="Trace 命令行工具（本版本无账号密码，仅保留信息查询）。",
     )
     sub = ap.add_subparsers(dest="cmd")
-    rp = sub.add_parser("reset-password", help="重置某个账号的密码（无需旧密码）")
-    rp.add_argument("--list", action="store_true", help="只列出所有账号")
-    rp.add_argument("--email", help="要重置的账号邮箱")
-    rp.add_argument("--password", help="新密码（不传则交互式输入，更安全）")
+    sub.add_parser("info", help="打印数据目录 / 数据库 / 端口等配置")
+    sub.add_parser("reset-password", help="（已废弃）本版本没有账号密码")
+    ap.add_argument("--info", action="store_true", help="等价于 info 子命令")
+    ap.add_argument("--list", action="store_true", help="（已废弃）本版本没有账号")
     return ap
 
 
 def main(argv=None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
-    # 允许不带子命令的便捷写法：
-    #   Trace.exe --reset-password
-    #   Trace.exe --list / --email x@y --password z
     if raw and raw[0] in ("--reset-password", "reset_password", "-rp"):
-        raw = ["reset-password", *raw[1:]]
-    elif raw and raw[0].startswith("-"):
-        raw = ["reset-password", *raw]
+        _safe_print(_NO_ACCOUNTS)
+        return 0
     ap = build_parser()
     args = ap.parse_args(raw)
-    if args.cmd != "reset-password":
-        ap.print_help()
-        return 2
-    return _dispatch(args)
+    if args.info or args.cmd == "info":
+        return _print_info()
+    if args.cmd == "reset-password" or args.list:
+        _safe_print(_NO_ACCOUNTS)
+        return 0
+    ap.print_help()
+    return 2
 
 
 if __name__ == "__main__":

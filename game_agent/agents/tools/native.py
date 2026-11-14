@@ -20,6 +20,105 @@ from game_agent.orchestration import envfacts
 MAX_READ = 16000
 MAX_WRITE = 2 * 1024 * 1024  # 2MB
 
+# ---------------- edit_file 模糊命中辅助 ----------------
+# 长编辑（文档段落/长代码块）是 edit_file 失败的主要来源：模型凭上一次读取的印象
+# 重构 old_string，全角标点/连续空格/行尾空白/措辞有细微出入 → 精确匹配 0 处 →
+# 模型只能整段重贴再赌一次，实测能连烧 3-5 轮（用户截图 2026-11-11）。
+# 两级缓解：
+#   1) 空白归一化匹配：只差缩进/行尾空格/连续空格/空白类型时自动命中并按真实内容替换；
+#   2) 真未命中时回传文件里最接近的真实片段 + 行号，模型直接照抄，不用重读文件猜。
+
+
+def _norm_ws(s: str) -> str:
+    """空白归一化：所有连续空白（含全角空格/换行）压成单个半角空格、去首尾空白。"""
+    return re.sub(r"[ \t\r\n\u00a0\u3000]+", " ", s).strip()
+
+
+def _norm_key(s: str) -> str:
+    """与 _norm_ws 相同的归一键（行尾差空格/换行位置差一个都不影响匹配）。"""
+    return _norm_ws(s)
+
+
+_WS_CHARS = (" ", "\t", "\r", "\n", "\u00a0", "\u3000")
+
+
+def _is_ws(ch: str) -> bool:
+    return ch in _WS_CHARS
+
+
+def _ws_fuzzy_match(text: str, old: str) -> tuple[int, int] | None:
+    """空白不敏感匹配 old → 返回原文 (start, end) 字符区间；唯一命中才算，否则 None。
+
+    按空白归一化后的文本滑窗定位：归一化串里每个字符对应原文一个区间，
+    命中段的原文范围 = 首字符起点 … 末字符终点（含中间被压掉的空白原文）。
+    """
+    if not old.strip():
+        return None
+    norm_text = _norm_ws(text)
+    norm_old = _norm_ws(old)
+    if not norm_old:
+        return None
+    # 原文滑窗重演归一化：每个归一化字符对应原文区间 (start, end)
+    hits = [m.start() for m in re.finditer(re.escape(norm_old), norm_text)]
+    if len(hits) != 1:
+        return None
+    h = hits[0]
+    spans: list[tuple[int, int]] = []  # norm_text 每个字符 → (原文起点, 原文终点)
+    i = 0
+    n = len(text)
+    while i < n:
+        if _is_ws(text[i]):
+            j = i
+            while j < n and _is_ws(text[j]):
+                j += 1
+            spans.append((i, j))  # 整段连续空白 → 归一化成一个空格
+            i = j
+        else:
+            spans.append((i, i + 1))
+            i += 1
+    # _norm_ws 会 strip 首尾空白：spans 里对应的首/尾空白段不映射归一化字符，去掉
+    if spans and _is_ws(text[spans[0][0]]):
+        spans.pop(0)
+    if spans and _is_ws(text[spans[-1][1] - 1]):
+        spans.pop()
+    if len(spans) != len(norm_text):
+        return None
+    start = spans[h][0]
+    end = spans[h + len(norm_old) - 1][1]
+    return (start, end)
+
+
+def _closest_window(text: str, old: str, max_chars: int = 600) -> str:
+    """未命中时找文件里与 old 最接近的行窗口（按归一化相似度），返回带行号的真实内容。
+
+    给模型的纠错材料：直接照抄它去重试，一轮收敛，不用重读文件、不用猜哪里不一样。
+    """
+    lines = text.replace("\r\n", "\n").split("\n")
+    key_old = _norm_key(old)
+    if not key_old:
+        return ""
+    old_words = set(key_old.split(" "))
+    old_nlines = max(1, len(old.replace("\r\n", "\n").split("\n")))
+    best: tuple[float, int, int] = (0.0, 0, min(len(lines), old_nlines))
+    # 滑窗长度取 old 行数 ±30%：覆盖「模型把两行并成一行/拆开」的情况
+    win_sizes = sorted({max(1, int(old_nlines * f)) for f in (0.7, 1.0, 1.3)})
+    for wsize in win_sizes:
+        for i in range(0, max(1, len(lines) - wsize + 1)):
+            window = "\n".join(lines[i:i + wsize])
+            key_win = _norm_key(window)
+            if not key_win:
+                continue
+            win_words = set(key_win.split(" "))
+            denom = max(len(old_words), len(win_words)) or 1
+            sim = len(old_words & win_words) / denom
+            if sim > best[0]:
+                best = (sim, i, i + wsize)
+    sim, lo, hi = best
+    if sim < 0.35:
+        return ""
+    body = "\n".join(f"{lo + k + 1}| {ln}" for k, ln in enumerate(lines[lo:hi]))
+    return f"（相似度 {sim:.0%}）第 {lo + 1}-{hi} 行的真实内容：\n{body[:max_chars]}"
+
 # run_command 并发上限（**不是**串行锁）：见 _run_shell_cmd docstring。
 # 历史：2026-10-28 两次 python313 段错误曾被归因为「并发 subprocess」，于是加了一把进程级
 # threading.Lock 把 run_command 整体串行化。后来定位到真正的元凶是 faulthandler 看门狗的
@@ -519,25 +618,49 @@ async def edit_file(args: dict, t: ToolContext) -> str:
     key = str(path)
     if key not in t.read_set:
         raise ToolError(f"未读不许写：请先 read_file {rel}（要看你要替换的那几行，不用整读）")
-    st_now = path.stat()
-    stamp = t.read_stamp.get(key)
-    if stamp and stamp != (st_now.st_mtime, st_now.st_size):
-        raise ToolError(
-            f"文件在你读过之后已经被改过：{rel}（大小/时间变了，可能是别的会话或构建产出）。"
-            "请重新 read_file 确认现状再改。")
+    # 不做「读过之后是否被改过」的 stale 检查：edit_file 是精确替换，
+    # old_string 唯一命中本身就是最强的安全闸——只动模型明确指认的那一段，
+    # 不可能闭眼覆盖别人的改动。stale 检查在这里只有误报：
+    #   · 同轮并行对同一文件发多个 edit（模型一轮常发 4+ 个），第一个改完
+    #     mtime/size 就变了，其余全部误报「被别的会话改过」（实测 4 连撞，
+    #     唯一改不同文件的那个却成功）；
+    #   · 模型自己用 run_command 跑构建/脚本改过文件后，read_stamp 不会刷新，
+    #     下一次 edit 必撞 stale，模型就会误判「有别的会话在动这个文件」。
+    # 真被别人改过时，old_string 要么不命中、要么不唯一，同样会被拦下并提示重读。
     old = args["old_string"]
     new = args.get("new_string", "")
     text = path.read_text(encoding="utf-8", errors="replace")
     cnt = text.count(old)
-    if cnt == 0:
-        raise ToolError("old_string 未命中，请确认内容一致")
-    if cnt > 1:
-        raise ToolError(f"old_string 命中 {cnt} 处，不唯一，请扩大上下文")
-    text = text.replace(old, new, 1)
+    replaced: str | None = None  # 最终要写回的全文；None = 校验失败
+    note = "1 处替换"
+    if cnt == 1:
+        replaced = text.replace(old, new, 1)
+    elif cnt == 0:
+        # 精确 0 处 → 空白不敏感匹配：只差缩进/行尾空格/连续空格/全角空格/换行位置时
+        # 唯一命中就直接替换，不让模型为这点出入重贴整段（长编辑失败的主因，实测连烧 3-5 轮）
+        span = _ws_fuzzy_match(text, old)
+        if span is not None:
+            start, end = span
+            # new 是新内容，缩进对齐是模型自己的责任；这里只替换命中的真实原文区间
+            replaced = text[:start] + new + text[end:]
+            note = "空白差异已自动对齐，1 处替换"
+    if replaced is None:
+        if cnt > 1:
+            raise ToolError(
+                f"old_string 命中 {cnt} 处，不唯一。请在 old_string 前后各带 1-2 行上下文"
+                "（贴文件里的真实原文，不要凭记忆重构）再试")
+        # 真未命中：回传文件里最接近的真实片段 + 行号，模型直接照抄重试，
+        # 不用重读整个文件、不用猜哪里差了一个字（长编辑反复失败烧轮次的根源）
+        hint = _closest_window(text, old)
+        guidance = ("edit_file 用法：old_string 必须是文件里的**真实原文**（从 read_file/grep "
+                    "结果里照抄，含缩进），不要凭印象重写；长段落只取要改的行 ±2 行，"
+                    "改多少贴多少——贴得越短越不容易错。")
+        raise ToolError("old_string 未命中，请确认内容一致。"
+                        + (guidance + ("\n文件里最接近的段落" + hint if hint else "")))
     _snapshot_before_write(t, rel, "edit_file")
-    path.write_text(text, encoding="utf-8")
+    path.write_text(replaced, encoding="utf-8")
     _restamp_after_write(t, key, path)
-    return f"已修改 {rel}（1 处替换）"
+    return f"已修改 {rel}（{note}）"
 
 
 def _effective_whitelist(ws: Path) -> set[str]:
@@ -878,7 +1001,7 @@ async def load_skill(args: dict, t: ToolContext) -> str:
         head += (
             "⚠️ 平台调用规则（优先于本技能正文里的命令行）：在 循迹（Trace） 里生成配音一律直接调用 "
             "**generate_audio** 工具——语音服务由它内部自动拉起，不要自己 "
-            "start_service 起 IndexTTS2、不要 curl 127.0.0.1:8860、不要跑 cv_gen.py / "
+            "start_service 起 IndexTTS2、不要跑 cv_gen.py / "
             "gen-cv-indextts.py / cv-presets.py。需要新音色时给 generate_audio 传 "
             "design_desc（音色描述）+ preset_name（预设名），它会先造音色再合成。"
             "本技能里的 python 命令只用于用户明确要求「按之前 python 脚本的方式」时，"
@@ -1031,7 +1154,7 @@ async def _run_shell_cmd(cmd: str, cwd: str, timeout_s: float, scan: bool = Fals
     """异步执行命令，**可被取消**（取消即杀掉整棵子进程树）。
 
     ⚠️ 不能用 asyncio.create_subprocess_shell：本进程在 Windows 上强制 Selector 事件循环
-    （aiomysql 要求，见 main.py），而 SelectorEventLoop 不支持子进程，会抛
+    （见 main.py），而 SelectorEventLoop 不支持子进程，会抛
     NotImplementedError —— 表现正是「所有 run_command 一律 启动命令失败」。所以用
     subprocess.Popen（同步 API）+ 一个专门的读线程抽输出，事件循环侧用轮询等待。
 

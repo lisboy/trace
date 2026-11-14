@@ -296,7 +296,13 @@ Team（团队 = 租户，数据隔离边界）
 
 **认证上下文**：`RequestContext(user_id, team_id, role, project_ids, request_id)` 贯穿日志与审计。
 
-#### 3.4.1 OIDC 接入（D17，M1 落地）
+> **现状（个人版已改）**：本文档早期按「多用户 + 密码/OIDC 登录」设计。个人版已**整体移除登录与账号体系**
+> （没有注册、密码、PAT、引导 token、OIDC）：身份固定取本机默认用户（`game_agent/auth/local.py`，
+> 首启幂等创建「一个用户 + 一个工作区」，老库复用最早的账号），`deps.get_current_context` 不看任何凭证、
+> role 恒为 owner。`users / teams / team_members` 表保留，只作为会话/项目/审计的内部外键分区。
+> 下文 OIDC 与相关配置项**仅作历史记录**，代码里已不存在。
+
+#### 3.4.1 OIDC 接入（D17，M1 落地）—— 已移除，仅存档
 
 **目标**：让企业/团队用自己的身份系统登录，同时保留密码登录作为兜底（内网服务、OIDC 配错时还能进）。
 
@@ -500,9 +506,25 @@ write_file/edit_file → run_command（编译、pytest）→ start_service（后
 worker 自身被 cancel（服务关闭）才继续向上抛，避免取消几次把 worker 池打空。
 
 **用量观测**：`llm_calls` 每次往返即时落库（`prompt_tokens` / `completion_tokens` / `cached_tokens`
-/ `latency_ms`）。`cached_tokens` 由适配层归一（DeepSeek `prompt_cache_hit_tokens`、
+/ `latency_ms` / `ttft_ms`）。`cached_tokens` 由适配层归一（DeepSeek `prompt_cache_hit_tokens`、
 OpenAI `prompt_tokens_details.cached_tokens`）。会话级聚合 `GET /api/sessions/{id}/usage` 返回
 总消耗 token（输入+输出）、缓存命中率、生成速度 tok/s、调用次数——落库持久，重进会话仍可见。
+
+**首 token 耗时（TTFT）**：用户真正的体感是「点了发送后干等多久才出第一个字」，它和「总共跑
+多久」是两件事。适配层在流式循环里记「第一个内容增量（正文 delta 或思考 delta）到达的时刻
+− 请求发出时刻」→ `LLMResponse.ttft_ms` → 落 `llm_calls.ttft_ms`。非流式端点（`stream` 不支持、
+降级到 `_parse_completion`）拿不到首字时刻，记 0，接口返回 0 + `ttft_calls` 计数，前端显示
+「未测到」而不是假报 0 秒。顶栏「首字」显示最近一轮实测值，悬浮里另给本会话中位数——用中位数
+而不是平均，是因为偶发一次排队/限流重试就能把平均拉爆，「常态等多久」只能靠中位数表达。
+
+**缓存命中明细（点开看）**：顶栏「缓存命中」可点击，弹层按「总量 = 未缓存输入 + 缓存读取 +
+输出」逐行列账（头部给总 token）。只给百分比看不出分母是 6.9M 还是 69k，也就判断不了这个会话
+贵不贵；把加法摆开就能自己核对。弹层还带「最近一轮」与「按角色」两个小表：最近一轮回答
+「刚才那次为什么这么慢/这么贵」，按角色回答「哪个角色在烧钱」（子 agent 的缓存几乎打不中，
+命中率会把主对话的高命中摊薄，按角色拆开才不会误判）。端点没上报缓存字段时，百分比与
+「缓存读取」都显示「未上报」而不是 0%——「不知道」和「真没命中」是两件事。
+按角色合计只累加「输入量在窗口 1.5 倍以内」的可信行：中转偶尔把整轮累计量塞进单条 usage，
+那种行加进来会让按角色表比会话总量还大（与上下文占用条同一套排除口径）。
 
 ### 4.5 不确定就问（ask_user）与提问续跑
 
@@ -927,6 +949,10 @@ dispatch_development → DevReport → dispatch_testing → TestReport
 
 策划经理渲染成固定六段（目标 / 改动 / 原因与说明 / 风险点与影响 / 验证证据 / 回滚与后续）。
 **收尾总结必须写清「为什么这么改、改完意味着什么、可能出什么问题」**，不能只罗列改了哪些文件：
+
+> **中途进度不套这套格式**：活跑得久时，主 agent 可以随时用 `report_to_user` 发一两句口语化进度
+> （「现在在改 X，前面 Y 已经跑通了」），由模型自己决定说不说——界面上标成「进度」并注明
+> 还有几项没做完，**不是交付**。六段格式只用于全部做完后的最后一次汇报。
 
 ```markdown
 ## ✅ 已完成：卡牌详情弹窗

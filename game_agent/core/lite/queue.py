@@ -4,9 +4,6 @@
   SAME_PROJECT_PARALLEL 开启时（默认），同项目也允许并行领取；关掉则同项目串行。
 - 领取用「UPDATE ... WHERE status='queued'」原子防双领，多个 worker 竞争同一条时
   只有拿到 rowcount=1 的那个赢，其余顺延下一条——单机 SQLite 下也安全。
-- MySQL/MariaDB（server 模式）额外用 ``SELECT ... FOR UPDATE SKIP LOCKED`` 先在事务里
-  锁住候选行：并发 worker 直接跳过已被别人锁住的行，不必每次都撞一遍 UPDATE 再回退。
-  这就是 server 模式多进程编排的正确姿势（业务代码不变，仅领取实现按方言切换）。
 - SQLite 并发写会偶发 ``database is locked``（默认 busy_timeout 之外的情况），
   claim 整体带几次退避重试，避免一次抖动就让某个 worker 空转、run 没人领。
 """
@@ -58,18 +55,12 @@ class LiteQueue(Queue):
 
     async def _claim_once(self) -> Optional[str]:
         async with self._sf() as s:
-            dialect = s.bind.dialect.name if s.bind is not None else ""
-            # MySQL：事务内 SELECT ... FOR UPDATE SKIP LOCKED，先锁住候选行再改状态。
-            # 并发 worker 会跳过已被锁住的行，天然不会抢同一条。
-            use_skip_locked = dialect in ("mysql", "mariadb")
             stmt = (
                 select(Run)
                 .where(Run.status == "queued")
                 .order_by(Run.priority.desc(), Run.created_at)
                 .limit(20)
             )
-            if use_skip_locked:
-                stmt = stmt.with_for_update(skip_locked=True)
             rows = await s.execute(stmt)
             for run in rows.scalars().all():
                 # 平台不接管 git，同项目要不要串行只剩 SAME_PROJECT_PARALLEL 这一条规则。

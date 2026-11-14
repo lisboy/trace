@@ -4,14 +4,12 @@ import { navigateKeep, paramsOf, parseHash, type Route } from "./router";
 import { initTheme, usePrefs } from "./theme";
 import { usePolicy } from "./assistantPolicy";
 import { api } from "./api";
-import Login from "./pages/Login";
 import Chat from "./pages/Chat";
 import Projects from "./pages/Projects";
 import RunDetail from "./pages/RunDetail";
 import Assets from "./pages/Assets";
 import Config from "./pages/Config";
-import Team from "./pages/Team";
-import Topbar from "./components/Topbar";
+import Usage from "./pages/Usage";import Topbar from "./components/Topbar";
 import ErrorBoundary from "./components/ErrorBoundary";
 
 /** 全局背景壁纸层：外链图片 / 上传的图片或视频 / Wallpaper Engine 工坊文件。
@@ -66,7 +64,6 @@ function BackgroundLayer() {
 }
 
 export default function App() {
-  const token = useAuth((s) => s.token);
   const [route, setRoute] = useState<Route>(parseHash());
   // 「配置」不再占一整页，而是盖在当前页上的设置弹窗。hash 仍然是入口
   // （所以 F5／后退能恢复），但底下渲染的页面保持打开弹窗前那一个。
@@ -78,15 +75,14 @@ export default function App() {
     initTheme();
   }, []);
 
-  // 登录态恢复后同步一次个人资料（换设备/改过头像时，本地缓存可能是旧的）
+  // 启动就把本机身份/工作区拉回来（没有登录，所以不需要等任何凭证）
   useEffect(() => {
-    if (!token) return;
     api.me().then((r: any) => {
-      if (r?.user) useAuth.getState().setUser(r.user);
+      if (r?.user) useAuth.getState().setIdentity(r.user, r.teams || []);
     }).catch(() => {});
     // 助手行为设置（默认权限 / 指导项）：输入框草稿与设置页共用这份
     usePolicy.getState().load();
-  }, [token]);
+  }, []);
 
   useEffect(() => {
     const onHash = () => {
@@ -111,15 +107,7 @@ export default function App() {
     };
   }, []);
 
-  if (!token)
-    return (
-      <>
-        <BackgroundLayer />
-        <div className="relative z-10 h-screen">
-          <Login />
-        </div>
-      </>
-    );
+  // 没有登录：App 一进来就是主界面，不需要任何「未认证」分支。
 
   // 弹窗盖住时，底下渲染的仍是打开前那一页（含它自己的参数）
   const baseRoute: Route = route.view === "config"
@@ -140,7 +128,9 @@ export default function App() {
           <ErrorBoundary resetKey={baseRoute.view}>
             {baseRoute.view === "projects" && <Projects />}
             {baseRoute.view === "assets" && <Assets route={baseRoute} />}
-            {baseRoute.view === "team" && <Team />}
+            {baseRoute.view === "usage" && <Usage />}
+            {/* 旧链接 #/team 落到「用量」页（历史书签/缓存不报空白页） */}
+            {baseRoute.view === "team" && <Usage />}
             {baseRoute.view === "runs" &&
               (baseRoute.params.id ? (
                 <RunDetail runId={baseRoute.params.id} initialFile={baseRoute.params.file}
