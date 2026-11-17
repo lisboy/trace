@@ -120,11 +120,6 @@ class IntentResult:
     def is_fix(self) -> bool:
         return self.intent == "modify" and self.mode == "fix"
 
-    def as_answer(self) -> str:
-        """测试用：模拟一次直接给出该结论。"""
-        return json.dumps({"intent": self.intent, "mode": self.mode,
-                           "reason": self.reason}, ensure_ascii=False)
-
 
 def guess_mode(user_request: str) -> str:
     """按措辞粗分 fix/build，只用于提示语气，不影响权限与守卫开关。"""

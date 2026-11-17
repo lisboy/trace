@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import re
+
 from game_agent.agents.runtime import _call_signature, _sig_arg, _tail_keep_head
 
 
@@ -23,7 +25,42 @@ def test_tail_keeps_tail_when_over_limit() -> None:
     cut = _tail_keep_head(text, 100, head=10)
     assert "末尾结论" in cut          # 尾部保住
     assert len(cut) <= 130            # head + 中略标记 + tail，不会无界膨胀
-    assert "…[中略]…" in cut          # 省略标记存在
+    assert "中略" in cut              # 省略标记存在
+
+
+def test_tail_marker_reports_omitted_chars() -> None:
+    """标记里要写清中间省略了多少字。
+
+    现场：用户截图圈住「…[中略]…」问「这个是啥意思」——不带字数的标记看着既不像
+    模型的话也不像报错。带上字数才是自解释的。
+    """
+    text = "头" * 50 + "中" * 5000 + "尾" * 50
+    cut = _tail_keep_head(text, 500, head=80)
+    m = re.search(r"…\[中略 (\d+) 字\]…", cut)
+    assert m, cut[:200]
+    omitted = int(m.group(1))
+    assert omitted > 4000                      # 省略量被如实报出
+    assert len(cut) - omitted <= 600           # 保留下来的部分符合预算
+
+
+def test_tail_cuts_at_boundary_not_mid_word() -> None:
+    """切点吸附到换行/句末，不按字符硬切出半句。
+
+    现场：截图里头部锚点「…这个接口是不是有问题？…传」后面直接接
+    「+ reviewOpinionFiled …」，正好切在词中间，看起来像句子断了。
+    """
+    head_part = "第一行完整的话。\n" + "第二行也完整。\n"
+    body = "x" * 2000
+    tail_part = "\n结论：根因在接口参数上。"
+    text = head_part + body + tail_part
+    cut = _tail_keep_head(text, 400, head=len(head_part))
+    # 头部锚点应整行收在换行处（含换行后的空格已在 rstrip 里去掉了）
+    assert cut.startswith("第一行完整的话。\n第二行也完整。")
+    assert "第二行也完整。" in cut
+    # 尾部从换行/句末之后起头，不以裸字符接在半句上
+    tail = cut.split("…", 2)[-1]
+    assert tail.lstrip().startswith("结论") or tail.lstrip().startswith("x")
+    assert cut.rstrip().endswith("结论：根因在接口参数上。")
 
 
 def test_tail_head_anchor_kept() -> None:

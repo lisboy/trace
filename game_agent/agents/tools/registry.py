@@ -102,7 +102,9 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "list_dir": {"description": "列出目录内容", "parameters": {
         "type": "object", "properties": {"path": _STR}}},
     "parse_document": {"description": "解析工作区里的 xlsx / docx / pdf 为文本（xlsx 所有列转 TSV 并标行号，"
-                                       "docx 按正文段落/表格原顺序，pdf 每次只提取一页、默认第 1 页）。"
+                                       "pdf 每次只提取一页、默认第 1 页）。docx 除正文段落/表格外还会给出"
+                                       "图片（导出到 .trace/docx-assets/ 并用 view_image 查看）、内嵌 Excel（展开成 TSV）、"
+                                       "图表数值、文本框、批注、页眉页脚。"
                                        "用 offset/limit 按字符分页，按末尾提示继续；不要用 read_file 读这些二进制文件", "parameters": {
         "type": "object", "properties": {
             "path": {**_STR, "description": "工作区内相对路径"},

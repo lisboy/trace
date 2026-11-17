@@ -193,3 +193,34 @@ def test_spawn_rejects_single_item() -> None:
             "items": [{"name": "A", "question": "查 a"}],
         }, _ctx(orch)))
     assert orch.calls == []
+
+
+def test_spawn_batch_counts_only_unfinished() -> None:
+    """批次计数只数没跑完的子agent。
+
+    2026-11-15 用户实测：4 个里 3 个已经完工，界面仍报「还有 4 个在后台跑」——
+    因为心跳用的是 len(batch.tasks)（批次总任务数）。另外空批次必须算 ready，
+    否则等待循环永远退不出去（旧代码还会在 tasks 为空时不 await，变成 CPU 空转）。
+    """
+    from game_agent.agents.tools.spawn import SpawnBatch
+
+    async def _flow():  # noqa: ANN202
+        loop = asyncio.get_running_loop()
+        f1, f2, f3 = loop.create_future(), loop.create_future(), loop.create_future()
+        batch = SpawnBatch(names=["A", "B", "C"], tasks=[f1, f2, f3])  # type: ignore[list-item]
+        snapshots = [(batch.pending(), batch.ready())]
+        f1.set_result("ok")
+        snapshots.append((batch.pending(), batch.ready()))
+        f2.set_result("ok")
+        snapshots.append((batch.pending(), batch.ready()))
+        f3.set_result("ok")
+        snapshots.append((batch.pending(), batch.ready()))
+        empty = SpawnBatch(names=[], tasks=[])
+        return snapshots, empty.pending(), empty.ready()
+
+    snapshots, empty_pending, empty_ready = _run(_flow())
+    assert snapshots[0] == (3, False)
+    assert snapshots[1] == (2, False), "1 个完工后应只剩 2 个（不是 3 个）"
+    assert snapshots[2] == (1, False)
+    assert snapshots[3] == (0, True)
+    assert (empty_pending, empty_ready) == (0, True), "空批次必须 ready，否则永远等不到"

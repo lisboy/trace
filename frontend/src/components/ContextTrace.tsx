@@ -3,6 +3,7 @@ import { api } from "../api";
 import Markdown from "./Markdown";
 import CopyButton from "./CopyButton";
 import { ROLE_LABEL, type OaiMessage, type TranscriptDetail, type TranscriptRound } from "../types";
+import { decorateElided } from "../elided";
 
 /* 上下文请求：逐轮往返的现场（发给模型什么 / 模型返回什么）。
    数据来自 llm_transcripts —— 那是压缩之后真正上线的 payload，
@@ -318,7 +319,9 @@ function RoundDetail({ id }: { id: string }) {
               <CopyButton title="复制这段思考" get={() => String(resp.reasoning)} />
             </summary>
             <div className="mt-1 pl-2 border-l-2 border-purple-200 text-slate-500 text-[11px] whitespace-pre-wrap">
-              {resp.reasoning}
+              {/* 超长思考在落库时已被后端截成「头 + 中略标记 + 尾」，这里把标记换成
+                  一句人话，避免用户把它当成模型原话或报错。 */}
+              {decorateElided(String(resp.reasoning))}
             </div>
           </details>
         )}

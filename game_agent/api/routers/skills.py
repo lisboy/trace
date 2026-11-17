@@ -21,8 +21,6 @@ from game_agent.db.session import SessionLocal
 
 router = APIRouter(prefix="/api", tags=["skills"])
 
-ROLE_HINTS = {k: ", ".join(v) for k, v in ROLE_TOOLS.items()}
-
 
 async def _workspace(project_id: str | None, ctx: RequestContext) -> str | None:
     if not project_id:

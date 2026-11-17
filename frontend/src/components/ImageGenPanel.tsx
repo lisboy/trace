@@ -9,6 +9,7 @@ type Options = {
   error?: string | null;
   views?: { key: string; label: string; group: string }[];
   default_negative_prompt?: string;
+  faceswap_ready?: boolean;
 };
 type Preset = {
   id: string; key: string; label: string; params: Record<string, any>; builtin: boolean;
@@ -74,6 +75,20 @@ export default function ImageGenPanel(
   const [prompt, setPrompt] = useState("");
   const [refFile, setRefFile] = useState<File | null>(null);
   const [refMode, setRefMode] = useState<"none" | "style" | "img2img">("none");
+  // 上传后的本地缩略图（blob URL）：<input type="file"> 本身只显示文件名，选完看不出是哪张图，
+  // 参考图和「换脸用脸」都必须能立刻确认选对了没有。URL 在换图/移除/卸载时回收。
+  const [refPreview, setRefPreview] = useState("");
+  const [ref2Preview, setRef2Preview] = useState("");
+  const refInput = useRef<HTMLInputElement | null>(null);
+  const ref2Input = useRef<HTMLInputElement | null>(null);
+  // 第二张参考图（人脸来源）：与第 1 张一起构成「双图换脸」——第 1 张是底图/主体，
+  // 第 2 张只提供脸。走后端 Qwen 多图条件链路，不依赖 ReActor/IPAdapter。
+  const [refFile2, setRefFile2] = useState<File | null>(null);
+  // 重绘度：img2img / 换脸时「改多少」。不传则后端用 .env 默认 0.42。
+  // 人脸在画面里占比小，越高越容易被重画成平均脸，换脸建议 0.30~0.45。
+  const [refDenoise, setRefDenoise] = useState(0.4);
+  // 出图尺寸跟随参考图比例（避免竖版立绘被 center 裁成横版削掉脸）
+  const [keepRefAspect, setKeepRefAspect] = useState(false);
   const [workflowMode, setWorkflowMode] = useState<"auto" | "checkpoint" | "diffusion">("diffusion");
   const [model, setModel] = useState("");
   // 「大模型先分析重组提示词」(enhance) 已从本工作台移除：直接用用户原样提示词出图。
@@ -200,9 +215,39 @@ export default function ImageGenPanel(
     blobUrls.current.forEach((u) => { try { URL.revokeObjectURL(u); } catch { /* ignore */ } });
     blobUrls.current.clear();
   }, []);
+  // 参考图缩略图同样是 blob URL，单独回收（换图时已在 pickRef* 里即时回收旧 URL）
+  const refPreviewRef = useRef("");
+  const ref2PreviewRef = useRef("");
+  refPreviewRef.current = refPreview;
+  ref2PreviewRef.current = ref2Preview;
+  useEffect(() => () => {
+    [refPreviewRef.current, ref2PreviewRef.current].forEach((u) => {
+      if (u) { try { URL.revokeObjectURL(u); } catch { /* ignore */ } }
+    });
+  }, []);
   const modelList = workflowMode === "checkpoint" ? opts?.checkpoints ?? [] : opts?.diffusion ?? [];
   const loraList = opts?.loras ?? [];
   const selectedPreset = presets.find((p) => p.id === presetId);
+
+  /** 选/换/移除第 1 张参考图：同时维护本地缩略图，并让「上传即照图生图」的默认生效。 */
+  function pickRef(f: File | null) {
+    setRefFile(f);
+    setRefPreview((old) => { if (old) URL.revokeObjectURL(old); return f ? URL.createObjectURL(f) : ""; });
+    if (!f) {
+      // 移除底图时连带清掉换脸图，避免留下「只有换脸用脸」的半截状态
+      pickRef2(null);
+      return;
+    }
+    // 以前默认落到 style（提示词里明说「不照搬参考图内容」），等于系统主动让人脸变化。
+    // 上传即默认「照图生图」，才是用户上传参考图时真正想要的效果。
+    if (refMode === "none") setRefMode("img2img");
+  }
+
+  /** 选/换/移除第 2 张参考图（换脸用脸）。 */
+  function pickRef2(f: File | null) {
+    setRefFile2(f);
+    setRef2Preview((old) => { if (old) URL.revokeObjectURL(old); return f ? URL.createObjectURL(f) : ""; });
+  }
 
   async function loadPresets() {
     try {
@@ -379,7 +424,9 @@ export default function ImageGenPanel(
     setSaveMsg("");
     setReviewNote("");
     if (!prompt.trim()) { setErr("请输入提示词"); return; }
-    if (refFile && refMode === "none") setRefMode("style");
+    // 兜底：参考图已选但模式仍是 none（极少数路径），按「照图生图」处理，
+    // 绝不默认落到 style——那等于命令模型别照搬参考图里的人。
+    if (refFile && refMode === "none") setRefMode("img2img");
     const jobId = newJobId();
     setBusy(true);
     // 轮询任务表：每 1.2s 拉一次阶段快照；阶段文案一变就往日志里追加一行（去重），
@@ -391,9 +438,17 @@ export default function ImageGenPanel(
         const up = await api.imageGenUpload(refFile);
         refName = up.file;
       }
+      let refName2 = "";
+      if (refFile2 && refFile) {
+        const up2 = await api.imageGenUpload(refFile2);
+        refName2 = up2.file;
+      }
       const r: GenResult = await api.imageGen({
-        prompt, reference: refName,
-        reference_mode: refFile ? (refMode === "img2img" ? "img2img" : "style") : "style",
+        prompt, reference: refName, reference2: refName2,
+        reference_mode: refFile2 ? "img2img" : (refFile ? (refMode === "img2img" ? "img2img" : "style") : "style"),
+        // 只有参考图真的参与重绘时才有意义；换脸链路必须带上
+        reference_denoise: (refFile2 || refMode === "img2img") ? refDenoise : undefined,
+        keep_ref_aspect: keepRefAspect,
         workflow_mode: workflowMode, model, enhance: false, size, count,
         lora, lora_strength: lora ? loraStrength : 0,
         negative_prompt: negative,
@@ -707,18 +762,94 @@ export default function ImageGenPanel(
           </label>
           {loraNote && <span className="text-[11px] text-emerald-700 break-all">{loraNote}</span>}
         </div>
+        {/* 换脸能力提示独立成行常驻：挂在「参考图」那行行尾时，缩略图一多就被挤到很右边，
+            而且只有选了第 2 张图才出现，用户容易以为「换脸能用」。这里无条件跟着能力显示。 */}
+        {opts && opts.faceswap_ready === false && (
+          <div className="flex items-start gap-1.5 rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-800">
+            <span className="font-medium shrink-0">换脸受限</span>
+            <span className="min-w-0"
+              title="本机 ComfyUI 的 models/diffusion_models 里没有 Qwen-Image-Edit 权重，只有文生图权重 qwen_image_2.1。选第 2 张「换脸用脸」时走多图条件近似：底图/服装/构图能保住，但身份迁移能力弱，脸未必真的换成第 2 张。要真正换脸需把 Qwen-Image-Edit 权重放进 models/diffusion_models。">
+              本机没装 Qwen-Image-Edit 权重，选「换脸用脸」也未必真换过去（底图/构图仍会保住）。
+            </span>
+          </div>
+        )}
         <div className="flex flex-wrap items-center gap-3 text-xs">
-          <label className="flex items-center gap-1.5">
-            参考图
-            <input type="file" accept="image/*" className="text-xs"
-              onChange={(e) => { setRefFile(e.target.files?.[0] ?? null); if (e.target.files?.[0] && refMode === "none") setRefMode("style"); }} />
-          </label>
+          {/* 参考图（底图）：选择按钮 + 选完立刻出现的缩略图。原来的裸 input 只显示文件名，
+              用户无法确认自己选了哪张图（2026-11-17 反馈「上传后还是不能看上传后的缩略图」）。 */}
+          <div className="flex items-center gap-1.5" title="第 1 张参考图：画面主体（姿势/服装/背景的来源）">
+            <span>参考图</span>
+            <button type="button"
+              className={`ga-btn ga-btn-sm ${refFile ? "ga-btn-secondary" : "ga-btn-primary"}`}
+              onClick={() => refInput.current?.click()}>
+              {refFile ? "更换" : "选择文件"}
+            </button>
+            <input ref={refInput} type="file" accept="image/*" className="hidden"
+              onChange={(e) => { pickRef(e.target.files?.[0] ?? null); e.target.value = ""; }} />
+            {refPreview && (
+              <span className="flex items-center gap-1">
+                <img src={refPreview} alt={refFile?.name || "参考图"}
+                  title={`${refFile?.name || "参考图"}（点击放大）`}
+                  className="h-9 w-9 rounded object-cover border border-slate-300 bg-slate-50 cursor-zoom-in"
+                  onClick={() => setPreview({ url: refPreview, label: `参考图：${refFile?.name || ""}` })} />
+                <span className="max-w-[120px] truncate text-slate-500" title={refFile?.name}>
+                  {refFile?.name}
+                </span>
+                <button type="button" className="text-[11px] text-slate-400 hover:text-red-500"
+                  title="移除参考图" onClick={() => pickRef(null)}>移除</button>
+              </span>
+            )}
+          </div>
           {refFile && (
             <select className="border border-slate-200 rounded px-2 py-1 text-xs" value={refMode}
+              disabled={!!refFile2}
               onChange={(e) => setRefMode(e.target.value as any)}>
-              <option value="style">按参考图风格出图（内容全新）</option>
-              <option value="img2img">照图生图（以参考图为底重绘）</option>
+              <option value="img2img">照图生图（以参考图为底重绘，人物更稳）</option>
+              <option value="style">按参考图风格出图（内容全新，脸会变）</option>
             </select>
+          )}
+          {/* 换脸用脸：第 2 张图，同样带缩略图（脸这种"选错就全废"的输入必须能看清） */}
+          <div className="flex items-center gap-1.5"
+            title="双图换脸：第 1 张=画面主体（姿势/服装/背景），这张=人脸来源。只有脸会变，其余保持第 1 张。">
+            <span>换脸用脸</span>
+            <button type="button" disabled={!refFile}
+              className={`ga-btn ga-btn-sm ${refFile ? "ga-btn-secondary" : "ga-btn-secondary opacity-50"}`}
+              onClick={() => ref2Input.current?.click()}>
+              {refFile2 ? "更换" : "选择文件"}
+            </button>
+            <input ref={ref2Input} type="file" accept="image/*" className="hidden"
+              onChange={(e) => { pickRef2(e.target.files?.[0] ?? null); e.target.value = ""; }} />
+            {ref2Preview && (
+              <span className="flex items-center gap-1">
+                <img src={ref2Preview} alt={refFile2?.name || "换脸用脸"}
+                  title={`${refFile2?.name || "换脸用脸"}（点击放大）`}
+                  className="h-9 w-9 rounded-full object-cover border border-amber-300 bg-slate-50 cursor-zoom-in"
+                  onClick={() => setPreview({ url: ref2Preview, label: `换脸用脸：${refFile2?.name || ""}` })} />
+                <span className="max-w-[120px] truncate text-slate-500" title={refFile2?.name}>
+                  {refFile2?.name}
+                </span>
+                <button type="button" className="text-[11px] text-slate-400 hover:text-red-500"
+                  title="移除换脸用脸" onClick={() => pickRef2(null)}>移除</button>
+              </span>
+            )}
+          </div>
+          {refFile2 && !refFile && <span className="text-amber-700">先选第 1 张参考图（画面主体）</span>}
+          {/* 换脸能力提示已上移到参考图区块上方的常驻横幅，这里不再重复输出。 */}
+          {(refFile2 || refMode === "img2img") && (
+            <label className="flex items-center gap-1.5"
+              title="改动幅度：0.30~0.45 微调（最保脸）；0.5~0.65 换背景/改动作；0.75+ 大改（脸一定变）">
+              重绘度
+              <input type="range" min={0.15} max={1} step={0.05} value={refDenoise}
+                onChange={(e) => setRefDenoise(Number(e.target.value))} />
+              <span className="tabular-nums text-slate-600">{refDenoise.toFixed(2)}</span>
+            </label>
+          )}
+          {refFile && (
+            <label className="flex items-center gap-1.5"
+              title="勾上后按参考图长宽比出图，参考图不会被 center 裁切（竖版立绘建议勾）">
+              <input type="checkbox" checked={keepRefAspect}
+                onChange={(e) => setKeepRefAspect(e.target.checked)} />
+              跟随参考图比例
+            </label>
           )}
           <label className="flex items-center gap-1.5">
             尺寸

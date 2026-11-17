@@ -6,6 +6,7 @@ import Markdown from "./Markdown";
 import RunChanges from "./RunChanges";
 import ContextTrace from "./ContextTrace";
 import ContextStatsView from "./ContextStats";
+import SubagentsPanel from "./SubagentsPanel";
 import PreviewModal, { type Preview } from "./PreviewModal";
 import {
   STATUS_COLOR,
@@ -17,7 +18,7 @@ import {
 
 const TERMINAL = new Set(["succeeded", "failed", "cancelled", "blocked"]); // blocked=等用户回答，不再刷
 
-type Tab = "result" | "trace" | "stats";
+type Tab = "result" | "trace" | "stats" | "subagents";
 
 const IMG_EXTS = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"];
 const AUDIO_EXTS = [".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".opus"];
@@ -135,6 +136,9 @@ export default function RunPanel({
     ...(showResult ? ([{ id: "result" as Tab, label: "结果" }]) : []),
     { id: "trace", label: "上下文请求" },
     { id: "stats", label: "上下文统计" },
+    // 子agent 单独一格：顶栏/上下文统计都只算主对话，子agent 的账在这里看
+    // （用户 2026-11-16：「子的在子里面看，运行面板要有单独 tab」）
+    { id: "subagents", label: "子agent" },
   ];
 
   return (
@@ -151,14 +155,18 @@ export default function RunPanel({
         {run?.usage && run.usage.calls > 0 && (
           <span
             className="text-[10px] px-1.5 py-0.5 rounded bg-sky-50 text-sky-700 min-w-0 truncate whitespace-nowrap"
-            title={`输入 ${run.usage.prompt} / 输出 ${run.usage.completion} tokens · 缓存命中 ${run.usage.cached ?? 0} · 总耗时 ${(run.usage.latency_ms / 1000).toFixed(1)}s（含重试、工具等待的空档）`}
+            title={`主对话输入 ${run.usage.prompt} / 输出 ${run.usage.completion} tokens · 缓存命中 ${run.usage.cached ?? 0} · 总耗时 ${(run.usage.latency_ms / 1000).toFixed(1)}s（含重试、工具等待的空档）`
+              + ((run.usage as any).sub_calls
+                ? `\n另有 ${(run.usage as any).sub_calls} 次子agent 调用（${((run.usage as any).sub_tokens || 0).toLocaleString()} tok），不计入本行，见「子agent」标签`
+                : "")}
           >
-            {run.usage.calls} 次调用 ·{" "}
+            主对话 {run.usage.calls} 次调用 ·{" "}
             {(run.usage.prompt + run.usage.completion).toLocaleString()} tok
             {run.usage.tokens_per_sec != null ? ` · 均 ${run.usage.tokens_per_sec} tok/s` : ""}
             {(run.usage as any).cache_hit_rate != null
               ? ` · 缓存 ${(run.usage as any).cache_hit_rate}%`
               : " · 缓存未上报"}
+            {(run.usage as any).sub_calls ? ` · 另有子agent ${(run.usage as any).sub_calls} 次` : ""}
           </span>
         )}
         {onCollapse && (
@@ -291,6 +299,15 @@ export default function RunPanel({
       {/* 上下文统计 tab */}
       {!compact && tab === "stats" && (
         <ContextStatsView
+          sessionId={run?.session_id || ""}
+          runId={runId}
+          refreshKey={status + "|" + (run?.usage?.calls || 0)}
+        />
+      )}
+
+      {/* 子agent tab：本会话所有跑过的只读调研子agent（顶栏统计不含它们） */}
+      {!compact && tab === "subagents" && (
+        <SubagentsPanel
           sessionId={run?.session_id || ""}
           runId={runId}
           refreshKey={status + "|" + (run?.usage?.calls || 0)}

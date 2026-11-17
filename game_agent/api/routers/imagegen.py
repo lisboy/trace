@@ -348,6 +348,11 @@ async def options(ctx: RequestContext = Depends(require(PERM_AGENT_CONFIG))):
     # 附带多视角目录与默认负面词，前端渲染视角选择器/负面框直接取用
     data["views"] = img_views.view_catalog()
     data["default_negative_prompt"] = COMFYUI_NEGATIVE_PROMPT
+    # 双图换脸是否真能换：只有 Qwen-Image-Edit 权重才有身份迁移能力；本机是文生图权重
+    # （qwen_image_2.1）时，多图链路只能保住底图，脸未必换成第 2 张，界面要提前说明。
+    data["faceswap_ready"] = any(
+        "qwen" in str(n).lower() and "edit" in str(n).lower()
+        for n in (data.get("diffusion") or []))
     return data
 
 
@@ -644,6 +649,14 @@ class GenIn(BaseModel):
     prompt: str
     reference: str = ""            # /reference 返回的文件名，空=无参考图
     reference_mode: str = "style"  # style | img2img
+    # 第二张参考图：给了就进「双图换脸」链路（第 1 张=底图/主体，第 2 张=人脸来源），
+    # 仅 Qwen 三件套（workflow_mode=diffusion/auto）支持，checkpoint 方式会直接报错。
+    reference2: str = ""
+    # img2img/换脸的重绘度：None=用 .env 的 COMFYUI_IMG2IMG_DENOISE（0.42）。
+    # 人脸占比小，重绘度越高越容易被"重长成平均脸"，换脸建议 0.3~0.45。
+    reference_denoise: float | None = None
+    # 出图尺寸跟随参考图比例（不再把竖版立绘 center 裁成横版，避免削掉脸）
+    keep_ref_aspect: bool = False
     workflow_mode: str = "auto"    # auto | checkpoint | diffusion
     model: str = ""                # 手动指定模型文件名（可选）
     enhance: bool = True           # 走 LLM 分析重组提示词
@@ -669,6 +682,10 @@ class GenIn(BaseModel):
 # 各阶段经验耗时（秒），仅用于 percent 估算；2K 大图实测约 330~340s。
 _SAMPLING_BASE_S = 40.0   # 小图基础耗时
 _SAMPLING_PER_MP_S = 70.0  # 每百万像素追加耗时（2K≈3.87MP → 40+271≈311s，接近实测）
+
+# AI 质检自动修复时的重绘度：以「刚出的这张图」为底做局部修补，只改坏掉的手指/肢体，
+# 脸几乎不动。太高会整图重画（等于换个人），太低修不好。
+_FIX_DENOISE = 0.35
 
 
 def _est_total_s(w: int, h: int, count: int) -> float:
@@ -745,7 +762,19 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
         if not rp.is_file():
             raise HTTPException(status_code=400, detail="参考图不存在或已过期，请重新上传")
         ref_bytes = rp.read_bytes()
+    ref2_bytes = None
+    if body.reference2:
+        rp2 = _UPLOAD_DIR / _clean(body.reference2)
+        if not rp2.is_file():
+            raise HTTPException(status_code=400, detail="第二张参考图不存在或已过期，请重新上传")
+        ref2_bytes = rp2.read_bytes()
+    if ref2_bytes and not ref_bytes:
+        raise HTTPException(status_code=400,
+                            detail="换脸需要两张图：第 1 张是画面主体（底图），第 2 张是人脸来源")
     ref_mode = body.reference_mode if body.reference_mode in ("style", "img2img") else "style"
+    if ref2_bytes:
+        # 换脸必须走 img2img 语义（采样 latent=底图），否则底图会被整个重画
+        ref_mode = "img2img"
     if ref_bytes and ref_mode == "style" and body.workflow_mode == "checkpoint":
         enhance_note += "；checkpoint 方式不支持风格参考，已按图生图处理"
 
@@ -760,6 +789,23 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
     #      实际一律按 generate_images_bytes 的默认 512x512 出图（DiT 文生图再被抬到 1024²）。
     #      这里真正落成 width/height，工作台的预设尺寸（1792x1024 / 1024x1536 等）才会生效。
     w, h = _parse_size(body.size)
+    # 跟随参考图比例：参考图被 ImageScale 以 crop=center 硬拉成请求宽高，竖版立绘配横版
+    # 输出会被上下切掉一大块、脸被压扁平移，是"换完不像本人"的常见原因之一。
+    # 这里按参考图长宽比改算输出宽高（保持像素量级不变），让参考图基本不被裁。
+    if body.keep_ref_aspect and ref_bytes:
+        try:
+            import io
+
+            from PIL import Image
+            with Image.open(io.BytesIO(ref_bytes)) as _im:
+                rw, rh = _im.size
+            if rw > 0 and rh > 0:
+                px = max(1, w * h)
+                k = (px / float(rw * rh)) ** 0.5
+                w, h = max(64, int(round(rw * k))), max(64, int(round(rh * k)))
+                enhance_note += f"；出图尺寸已跟随参考图比例改为 {w}x{h}"
+        except Exception as e:  # noqa: BLE001 - 读不出比例就退回请求尺寸，不影响出图
+            log.warning("读取参考图比例失败，按请求尺寸出图：%s", e)
     # 多视角（人物多角度参考图）：每张都是「单人全身」，必须是竖构图；横版/方形会把全身像
     # 裁成半身/胸像（实测横版 16:9 只拍到腰以上）。若用户给的画幅不够竖，强制改成等高竖版。
     _view_keys_probe = img_views.normalize_views(body.views)
@@ -781,6 +827,10 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
     negative = COMFYUI_NEGATIVE_PROMPT if body.negative_prompt is None else body.negative_prompt
     # 多视角（八方画像）：给了 views 就按视角逐张出图（每张独立提示词），忽略 count。
     view_keys = img_views.normalize_views(body.views)
+    if view_keys and ref2_bytes:
+        # 换脸是「一张底图 + 一张脸」的点对点合成，多视角会为每个方向重写提示词、
+        # 把换脸语义冲掉，直接互斥更清楚
+        raise HTTPException(status_code=400, detail="多视角出图与双图换脸不能同时使用")
     if view_keys:
         # 每一个视角都「重新推理出一条只属于该视角的提示词」：在总提示词基础上，剥离所有
         # 镜头/景别词，只保留人物外观，再交给主模型重写为该视角的「单人、单视角、全身」提示词。
@@ -840,6 +890,13 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
                     f"AI 质检：第 {i + 1}/{n} 张发现「{iss_txt}」→ 补负面词重生成…"
                     + (f" · {reason}" if reason else ""),
                     image_index=i, prompt_id="", queue_state="", detail="")
+                # 修复要「以刚出的这张图为底」低重绘度重画，而不是拿原始参考图另跑一遍：
+                # 带着参考图重跑 = 新 seed 的又一次采样，人脸会再变一次，越修越不像本人
+                # （2026-11-16 定位）。以本图为 base 只重绘局部，脸基本不动。
+                fix_kw = dict(kw_now)
+                fix_kw.pop("reference2", None)
+                fix_kw.update(reference=data, reference_mode="img2img",
+                              reference_denoise=_FIX_DENOISE)
                 got2 = await generate_images_bytes(
                     job_prompt, negative_prompt=new_neg,
                     base_url=COMFYUI_BASE_URL, timeout_s=COMFYUI_TIMEOUT_S,
@@ -849,7 +906,7 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
                     on_prompt_id=((lambda pid, _i=i: progress.set_stage(
                         job_id, "review", f"AI 质检：第 {_i + 1}/{n} 张修复重生成中…",
                         image_index=_i, prompt_id=pid, queue_state="running")) if job_id else None),
-                    **kw_now)
+                    **fix_kw)
                 if got2:
                     fixed += 1
                     review_note += f"；第{i + 1}张异常（{iss_txt}）→ 已修复提示词并重生成"
@@ -867,13 +924,35 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
         return data, "kept", iss, False, reason
 
     attempts = []
+    ref_denoise = body.reference_denoise
+    if ref_denoise is not None and not (0.0 < float(ref_denoise) <= 1.0):
+        ref_denoise = None
+    base_kw: dict = {}
     if ref_bytes:
+        base_kw["reference"] = ref_bytes
+    if ref2_bytes:
+        base_kw["reference2"] = ref2_bytes
+    if ref_denoise is not None:
+        base_kw["reference_denoise"] = float(ref_denoise)
+    if ref2_bytes:
+        # 换脸链路：**不能**回退到「纯文生图」——那样出的图脸必然完全不同，
+        # 用户会以为换脸成功了却拿到一张陌生人的图。只做一次真实尝试，失败就报错。
+        # 重绘度默认 0.55：实测 0.3~0.35 时连脸都不变（出图≈底图），0.55 才既保住
+        # 服装/构图又让脸部区域被重绘成第二张图的脸。
+        if "reference_denoise" not in base_kw:
+            base_kw["reference_denoise"] = 0.55
+        attempts = [(dict(base_kw, reference_mode="img2img"), "")]
+    elif ref_bytes:
         attempts = [
-            (dict(reference=ref_bytes, reference_mode=ref_mode), ""),
+            (dict(base_kw, reference_mode=ref_mode), ""),
             (dict(reference=ref_bytes, reference_mode="img2img", reference_denoise=0.5),
              "；该模型不支持所选参考模式，已用低重绘度（0.5）图生图近似"),
-            (dict(), "；参考图在该模型上不可用，已按纯文生图生成"),
         ]
+        if ref_mode != "img2img":
+            # 只有「风格参考」才允许退化成纯文生图：它本来就不照搬参考图内容，丢掉只影响画风。
+            # 用户明确选了「照图生图」时把参考图丢掉 = 人物整个换了一个，必须宁可报错，
+            # 也不能静默交付一张"换了个人"的图（2026-11-16 排查的"脸会变"根因之一）。
+            attempts.append((dict(), "；参考图在该模型上不可用，已按纯文生图生成"))
     else:
         attempts = [(dict(), "")]
     labels: list[str] = []
@@ -989,5 +1068,6 @@ async def _generate_impl(body: GenIn, ctx: RequestContext):
             "negative_prompt": negative, "size": body.size,
             "count": len(files), "enhance": body.enhance, "prompt": body.prompt,
             "views": view_keys,
+            "reference_denoise": ref_denoise,
         },
     }

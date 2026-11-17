@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from game_agent.api.deps import get_current_context, require
@@ -31,6 +31,18 @@ log = get_logger("api.runs")
 router = APIRouter(prefix="/api", tags=["runs"])
 
 
+def _main_only_clause():
+    """「只算主对话」的过滤条件：agent_key 属于主对话角色（旧行是 planner/artist/voice，
+    极早期行没有 agent_key 记 NULL）。
+
+    与 sessions.py 的 MAIN_AGENT_KEYS 同一口径：子agent（agent_key='sub'）的往返
+    是 spawn_agents 派出的一次性只读调研，不计入主对话的 token/速度/上下文
+    （用户 2026-11-16 要求「子和主分开，这里只统计主的」）。
+    """
+    return or_(LlmCall.agent_key.is_(None),
+               LlmCall.agent_key.in_(("main", "planner", "artist", "voice")))
+
+
 @router.get("/runs/{run_id}")
 async def run_detail(run_id: str, ctx: RequestContext = Depends(require(PERM_VIEW))):
     async with SessionLocal() as s:
@@ -47,7 +59,13 @@ async def run_detail(run_id: str, ctx: RequestContext = Depends(require(PERM_VIE
                    func.coalesce(func.sum(LlmCall.cached_tokens), 0),
                    func.coalesce(func.sum(LlmCall.latency_ms), 0),
                    func.coalesce(func.sum(LlmCall.cache_reported), 0))
-            .where(LlmCall.run_id == _u(run_id)))).one()
+            .where(LlmCall.run_id == _u(run_id), _main_only_clause()))).one()
+        # 子agent 那一份单列：面板头部显示「主对话 N 次调用」，
+        # 子agent 的量挂在旁边（用户 2026-11-16：子和主分开统计，子的在「子agent」标签看）
+        sub = (await s.execute(
+            select(func.count(), func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
+                   func.coalesce(func.sum(LlmCall.completion_tokens), 0))
+            .where(LlmCall.run_id == _u(run_id), LlmCall.agent_key == "sub"))).one()
         prompt, completion, cached, total_ms = int(u[1]), int(u[2]), int(u[3]), int(u[4])
         reported = int(u[5])
         # 当前是否停在一个待回答的提问上（同一 run 内暂停）：让前端在刷新/重连后也能
@@ -65,6 +83,10 @@ async def run_detail(run_id: str, ctx: RequestContext = Depends(require(PERM_VIE
             "cache_hit_rate": round(cached / prompt * 100, 1)
             if (prompt > 0 and reported > 0) else None,
             "cache_reported": reported > 0,
+            # 子agent 那一份：**不含在**上面的主对话数字里，只给个数量让界面能提示
+            # 「另有 N 次子agent 调用」，明细在运行面板「子agent」标签。
+            "sub_calls": int(sub[0] or 0),
+            "sub_tokens": int(sub[1] or 0) + int(sub[2] or 0),
         }
     return {
         "id": str(run.id), "status": run.status, "run_type": run.run_type,
@@ -504,9 +526,41 @@ async def steer_run(run_id: str, body: SteerIn,
     return {"ok": True, "delivered": True, "images": len(images), "files": len(files)}
 
 
+async def _events_for_task(run_id: str, task_id: str) -> list[dict]:
+    """某个子agent 自己的事件流（运行面板「子agent」弹窗按需拉取用）。
+
+    为什么不复用 `get_events_since` 再在前端过滤：一条长 run 能有 1400+ 事件、1.5MB，
+    为了看一个子agent 的十几步就把整条流搬过来太浪费。也不能只按 Event.task_id 过滤：
+    `task_start`/`task_done` 由 orchestrator 广播，Event.task_id 是空的、真正的 task_id
+    只写在 payload 里（前端 groupRows 就是按 payload.task_id 归组的）。所以 SQL 先粗筛
+    「本 task 的事件 + 全部 task_start/task_done」，再按 payload 精确判一次。
+    """
+    want = task_id.replace("-", "").lower()
+    async with SessionLocal() as s:
+        rows = (await s.execute(
+            select(Event)
+            .where(Event.run_id == _u(run_id),
+                   or_(Event.task_id == _u(task_id),
+                       Event.type.in_(("task_start", "task_done"))))
+            .order_by(Event.seq))).scalars().all()
+    out: list[dict] = []
+    for e in rows:
+        tid = str(e.task_id or (e.payload_json or {}).get("task_id") or "")
+        if tid.replace("-", "").lower() != want:
+            continue
+        out.append({"seq": e.seq, "type": e.type, "payload": e.payload_json,
+                    "task_id": str(e.task_id) if e.task_id else None,
+                    "created_at": str(e.created_at)})
+    return out
+
+
 @router.get("/runs/{run_id}/events")
 async def run_events(run_id: str, since: int = Query(0),
+                     task_id: str | None = Query(None),
                      ctx: RequestContext = Depends(require(PERM_VIEW))):
+    """run 的事件流。task_id 非空时只回这个子agent 自己的事件（弹窗看对话详情用）。"""
+    if task_id:
+        return await _events_for_task(run_id, task_id)
     events = await state.services.repo.get_events_since(run_id, since)
     return [{"seq": e.seq, "type": e.type, "payload": e.payload_json,
              # task_id：子agent 的事件带自己的 task，前端靠它把行归进对应的子agent 分组
@@ -1115,12 +1169,15 @@ def _tail_head(s: str, limit: int, head: int = 80) -> str:
     """尾部优先截断：前 head 字作锚点 + 尾部主体（续跑摘要用）。
 
     模型/工具的关键结论多在尾部，旧逻辑取头会把根因/行号丢掉，续跑时二次丢失。
+    标记写明中间省略多少字：这既是给模型看的（知道中间有缺口、需要时重查），
+    也让同一套标记在 UI 上能自解释（前端把它渲染成「此处中间省略 N 字」）。
     """
     one = _one_line(s, limit * 4)
     if len(one) <= limit:
         return one
     tail = one[-(limit - head):]
-    return one[:head] + "…[中略]…" + tail
+    omitted = max(len(one) - head - len(tail), 0)
+    return one[:head] + f"…[中略 {omitted} 字]…" + tail
 
 
 async def _touched_files_brief(s, run_id) -> str:

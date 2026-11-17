@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 from pathlib import Path
@@ -19,6 +20,7 @@ from game_agent.config import DATA_DIR
 GLOBAL_SKILLS_DIR = DATA_DIR / "skills"
 SETTINGS_KEY_ROOTS = "skill_roots"
 MAX_SKILL_BODY = 12000
+_BUILTIN_HASHES_FILE = ".builtin-hashes.json"   # 记录每个内置技能「上次写入的正文哈希」
 
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,64}$")
 SKILL_SCOPE_LABELS = {"project": "项目", "global": "全局", "root": "自定义目录"}
@@ -208,7 +210,17 @@ def delete_global_skill(name: str) -> None:
 
 # ---------- 内置技能播种（excel / word / pdf 解析） ----------
 
-_BUILTIN_SKILLS_VERSION = "2"
+_BUILTIN_SKILLS_VERSION = "3"
+
+# 历史版本内置正文的规范化哈希：用于判断「文件还是我们当初写的原文」，
+# 当 .builtin-hashes.json 缺失（老版本升级上来）时也能安全刷新旧正文。
+_PREVIOUS_BUILTIN_HASHES: dict[str, tuple[str, ...]] = {
+    # v2（2025 版）正文
+    "excel": ("e98d38913be621042b26bd2e8e4f09174df87eb7cc74a9ec6b5912fe113c72d7",),
+    "word": ("1975a31dff5c31017b98684d7a30cc3e756cf1b278b2beb2dec713623b202e5e",),
+    "pdf": ("07d16379948a492864828e8dbc72d47e95c032d955d93e74296fe449d83a8f54",),
+    "imagegen": ("dc133efb5e09d13be29559a677bd254f7b712f66d027b9a7ea143146c62f7f75",),
+}
 
 _BUILTIN_SKILLS: dict[str, tuple[str, str]] = {
     "excel": (
@@ -239,22 +251,65 @@ _BUILTIN_SKILLS: dict[str, tuple[str, str]] = {
 """,
     ),
     "word": (
-        "解析用户上传的 Word 文档附件（docx→段落+表格文本）；"
+        "解析用户上传的 Word 文档附件（docx 正文+表格+图片+内嵌表格/图表+文本框/批注）；"
         "涉及 docx 需求文档、策划案、规格说明的读取时先读本技能",
-        """# Word 文档解析
+        """# Word 文档解析（正文 + 图片 + 内嵌表格）
 
 ## 什么时候用
-- 用户消息末尾的「已存入工作区」清单里出现 .docx 附件（需求文档/策划案/接口说明等）
+- 用户消息末尾的「已存入工作区」清单里出现 .docx 附件（需求文档/策划案/接口说明/验收单等）
+- 用户说「按这份文档做」而文档是 docx：必须先把文档读全，再动手改代码
 
-## 怎么读
+## 核心原则：文档里的信息不只在文字里
+策划案/需求文档常把关键信息放在**截图、UML 图、数值表、批注**里：
+- 数值（血量/伤害/掉落率/时长）常在被截图的 Excel 里，正文只写「见下表」
+- UI 布局、关卡流程、角色动作要求常是**图片**，正文写「如上图所示」
+- 评审意见常在**批注**里，正文看不到
+所以只读文字就动手 = 漏掉一多半需求。**解析结果里凡是出现图片/内嵌表格/图表/批注标记，都要按下面的方法真的看一遍再下结论。**
+
+## 第一步：读文本（段落 + 正文表格）
 parse_document 工具：{"path": "<附件路径>"}
-返回：正文段落与表格交错，保持原文顺序；表格以 `[表格 k：R 行 × C 列]` 开头、Tab 分隔的行。
-使用 offset/limit 按字符分页：offset 是所选文本的 1 基 Unicode 字符位置（按码点，不是字节，默认 1），包含格式标签、Tab 和换行，不含分页头尾；limit 默认/上限 6000。
-按末尾提示设置 offset，保持其他参数不变，直到提示文本已读完；长段落和表格都可继续读取，不必要求用户拆分。
+- 返回按原文顺序交错的正文段落与表格；正文表格以 `[表格 k：R 行 × C 列]` 开头，行内 Tab 分隔
+- 分页用 offset/limit：offset 是所选文本的 1 基 Unicode 字符位置（按码点，不是字节，默认 1），含格式标签/Tab/换行，不含分页头尾；limit 默认与上限都是 6000
+- 按末尾提示设置 offset、其余参数不变，一直读到「本段文本已读完」；长文档不要要求用户拆分
+
+## 第二步：看图（图片不进文本，要自己调工具看）
+解析结果里图片以标记出现，形如：
+`[图片 3（1280×720，PNG） → .trace/docx-assets/需求文档-a1b2c3d4/image3.png]`
+（在表格里的会带位置：`[｛表格 1 第 2 行第 3 列｝图片 5（…） → …]`）
+
+看图的规矩：
+- 一次最多 9 张：用 **view_images**（paths 传多个路径）合成一张预览图一起看；超过 9 张分批
+- 只有需要抠细节（数值、坐标、颜色、按钮文案）时才用 **view_image** 单看那一张
+- 路径就是文档里给的相对工作区路径，**不要**去 base64、不要猜图片内容
+- 看完必须把「从图里读到的信息」写成文字：需求摘要/实现清单里明确写「图 3：血条宽度 120px，左上角显示等级」，否则下一轮就等于没看过
+- 图的说明文字（alt/descr）会跟在标记后面，可作定位线索，但**不能替代看图**
+
+## 第三步：内嵌表格与图表（已自动展开，直接用）
+- 内嵌 Excel：以 `[内嵌表格开始]`…`[内嵌表格结束]` 包住，里面 `[内嵌表格 k/n：工作表名，共约 R 行]` + Tab 分隔的数据行，**就是文档里的原始数值，直接采信**
+  - 默认每表只展开前 200 行；看到「[本表只展开前 200 行]」说明被截断
+  - 需要完整数据/公式/更多 sheet 时：让用户把该 Excel 单独上传一份，再用 excel 技能按 sheet/行区间精确读，不要靠猜
+- 图表：以 `[图表 1：柱状图，标题「通关率分布」；「通关率」：一关=0.8、二关=0.55、三关=0.3]` 出现，数值来自文档里缓存的图表数据，可直接引用；没有缓存值时会写「（没有缓存数值）」
+- 其它内嵌对象（内嵌 Word/PDF/Visio 等）：只会给出 `[内嵌文件：xxx（类型）无法在正文里展开]`，需要用户另存为独立文件后再 parse_document
+
+## 其它会被提取的内容
+- 文本框：`[文本框 1：血条宽度=120]`（画在图形里的说明文字，正文段落里没有）
+- 批注：`[批注 1（策划A）：这里要求补充数值]`——评审意见与追加要求，优先级等同正文
+- 页眉页脚：`[页眉]` / `[页脚]` 后跟内容（常是项目名/版本/公司模板字段）
+
+## 汇总口径（读完 deliver 什么）
+向用户/自己汇报解析结果时，按这四块写，缺哪块明确说「文档未提供」：
+1. 功能与流程（文字 + 图片里看出的界面/流程）
+2. 数值与配置（正文表格 + 内嵌表格 + 图表缓存值，标注来源是「正文表 2」还是「内嵌表格 敌人配置」）
+3. 待确认项（批注里的追加要求、图片里读不清的地方、被截断的内嵌表）
+4. 文档没写清、需要用户拍板的口径
 
 ## 限制与坑
 - 旧版 .doc 不支持解析，回复用户请其另存为 .docx 再上传
-- 文档里的图片不会出现在解析结果中；图片内容很重要时明确告诉用户提取不了
+- 单份文档最多导出 60 张图，超出会写「[还有 N 张图片超出单次导出上限]」：先按正文顺序看关键图，剩下的向用户确认是否需要
+- EMF/WMF 等矢量图会尝试转 PNG；转不了时标记里写「此格式无法直接查看」，如实告诉用户而不是编内容
+- 图片导出目录是 `.trace/docx-assets/<文档名>-<hash>/`，同一份文档重复解析会覆盖同名文件，不会堆垃圾
+- 内嵌表格里的公式单元格：读的是保存时的缓存值，可能是空——缺数据时先说明，别瞎编数值
+- 解析失败/打不开会直接报错（损坏或加密），不要假设文档内容
 """,
     ),
     "pdf": (
@@ -303,8 +358,60 @@ parse_document 工具：{"path": "<附件路径>"}，默认只提取第 1 页；
 }
 
 
+def _skill_file_text(name: str, desc: str, body: str) -> str:
+    return f"---\nname: {name}\ndescription: {desc}\n---\n\n{body}"
+
+
+def _normalize(text: str) -> str:
+    """统一换行与首尾空白，跨平台比哈希（Windows 的 write_text 会写 \r\n）。"""
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha256(_normalize(text).encode("utf-8")).hexdigest()
+
+
+def _load_seeded_hashes() -> dict[str, str]:
+    try:
+        raw = json.loads((GLOBAL_SKILLS_DIR / _BUILTIN_HASHES_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+
+def _write_seeded_hashes(hashes: dict[str, str]) -> bool:
+    try:
+        GLOBAL_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        (GLOBAL_SKILLS_DIR / _BUILTIN_HASHES_FILE).write_text(
+            json.dumps(hashes, ensure_ascii=False, indent=1, sort_keys=True), encoding="utf-8")
+        return True
+    except OSError:
+        return False
+
+
+def _install_skill(path: Path, text: str) -> bool:
+    """原子写入：先写 .tmp 再替换，半截文件不会被当成已安装技能。"""
+    pending = path.with_suffix(".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pending.write_text(text, encoding="utf-8")
+        pending.replace(path)
+        return True
+    except (OSError, ValueError):
+        return False
+    finally:
+        try:
+            pending.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def seed_builtin_skills() -> list[str]:
-    """补齐内置技能，保留自定义内容；成功标记后尊重删除，升级版本时才补回。"""
+    """补齐并升级内置技能。
+
+    升级口径：文件内容仍是「我们当初写入的原文」时随版本覆盖成新正文；
+    用户改动过的技能一律保留（原文哈希对不上就不动），与删除后尊重不回填一致。
+    """
     marker = GLOBAL_SKILLS_DIR / ".builtin-seeded"
     if marker.is_file():
         try:
@@ -312,26 +419,41 @@ def seed_builtin_skills() -> list[str]:
                 return []
         except OSError:
             pass
+    recorded = _load_seeded_hashes()
+    hashes: dict[str, str] = dict(recorded)
     created: list[str] = []
     failed = False
     for name, (desc, body) in _BUILTIN_SKILLS.items():
+        text = _skill_file_text(name, desc, body)
+        want = _text_hash(text)
+        hashes[name] = want
         path = GLOBAL_SKILLS_DIR / name / "SKILL.md"
-        if path.is_file() or (GLOBAL_SKILLS_DIR / f"{name}.md").is_file():
+        flat = GLOBAL_SKILLS_DIR / f"{name}.md"
+        existing = path if path.is_file() else (flat if flat.is_file() else None)
+        if existing is None:
+            if _install_skill(path, text):
+                created.append(name)
+            else:
+                failed = True
             continue
-        pending = path.with_suffix(".tmp")  # 部分写入不能被误认成已安装技能。
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            pending.write_text(f"---\nname: {name}\ndescription: {desc}\n---\n\n{body}", encoding="utf-8")
-            pending.replace(path)
-            created.append(name)
-        except (OSError, ValueError):
+            current = _text_hash(existing.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
             failed = True
-        finally:
-            try:
-                pending.unlink(missing_ok=True)
-            except OSError:
-                pass
+            continue
+        if current == want:
+            continue                        # 已是最新
+        known = {recorded.get(name)} | set(_PREVIOUS_BUILTIN_HASHES.get(name, ()))
+        known.discard(None)
+        if current not in known:
+            continue                        # 用户改过 → 保留自定义内容
+        if _install_skill(existing, text):
+            created.append(name)
+        else:
+            failed = True
     if failed:
+        return created
+    if not _write_seeded_hashes(hashes):
         return created
     try:
         GLOBAL_SKILLS_DIR.mkdir(parents=True, exist_ok=True)

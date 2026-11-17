@@ -45,22 +45,6 @@ def busy() -> bool:
     return _LOCK.locked()
 
 
-def current_kind() -> str:
-    return str(_current.get("kind") or "")
-
-
-async def wait_until_idle(timeout_s: float = 0.2) -> bool:
-    """测试/诊断辅助：非阻塞确认队列是否空闲（不用来抢锁）。"""
-    if not _LOCK.locked():
-        return True
-    try:
-        await asyncio.wait_for(_LOCK.acquire(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        return False
-    _LOCK.release()
-    return True
-
-
 @asynccontextmanager
 async def media_slot(kind: str, owner: str = "") -> AsyncIterator[dict[str, Any]]:
     """占用全局生成队列；同一任务重入只加层（generate 入口/底层函数可能嵌套装饰）。

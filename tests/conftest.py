@@ -38,7 +38,7 @@ os.environ["GA_SECRET_KEY"] = "smoke-test-secret-not-for-production"
 # **已存在**的环境变量，pop 掉的键会被仓库根目录 .env 重新填上（COMFYUI_BASE_URL 等），
 # MockBrain 冒烟测试就会真的去连本机 ComfyUI / TTS，180s 超时全红（实测踩过）。
 for _k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "COMFYUI_BASE_URL", "TTS_BASE_URL",
-           "GA_ROLE_MODELS", "REDIS_URL"):
+           "GA_ROLE_MODELS"):
     os.environ[_k] = ""
 os.environ["PLACEHOLDER_ENABLED"] = "1"
 

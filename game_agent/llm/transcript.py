@@ -19,9 +19,6 @@ from game_agent.llm.context_window import IMAGE_TOKENS, estimate_tokens
 # 单轮请求原文的存储上限（字符）：正常一轮几十 KB，超限说明有巨型附件/工具结果，
 # 截断保平安，避免 LONGTEXT 行无限膨胀。
 MAX_STORE_BYTES = 400_000
-# 图片 dataURL 的替换标记里保留 MIME 与体积，够定位问题即可
-_IMAGE_PREFIX_LEN = 24
-
 
 def _redact_content(content: Any) -> tuple[Any, int]:
     """content parts 里的 image_url → 占位文本。返回 (处理后内容, 图片数)。"""

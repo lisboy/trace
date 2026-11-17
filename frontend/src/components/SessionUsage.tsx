@@ -8,7 +8,7 @@
  * 上下文占用取该角色最近一次往返的 prompt_tokens（就是压缩后模型真正看到的量），
  * 与档位窗口的 75% 预算线比较 → 用户能判断「是否已经开始丢历史了」。
  */
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { api } from "../api";
@@ -90,6 +90,9 @@ function ContextChip({ c, compressAt }: { c: ContextOccupancy; compressAt: numbe
   const { open, setOpen, pos, btnRef, toggle } = useAnchorPop();
   const tone = ctxTone(c.used_pct, c.will_compress);
   const pctShow = Math.min(999, c.used_pct);
+  // 小于 1% 时补一位小数：整数四舍五入会把 0.4% 显示成「0%」，
+  // 看起来像统计坏了（用户 2026-11-16 报「老是不精准」）。
+  const pctText = pctShow > 0 && pctShow < 1 ? pctShow.toFixed(1) : pctShow.toFixed(0);
   return (
     <span className="relative flex items-center">
       <button
@@ -105,7 +108,7 @@ function ContextChip({ c, compressAt }: { c: ContextOccupancy; compressAt: numbe
             style={{ width: `${Math.min(100, pctShow)}%` }}
           />
         </span>
-        <span className="font-medium tabular-nums">{pctShow.toFixed(0)}%</span>
+        <span className="font-medium tabular-nums">{pctText}%</span>
       </button>
       <PopOverlay open={open} onClose={() => setOpen(false)} pos={pos}>
         <div className="mb-1.5 flex items-center justify-between">
@@ -125,6 +128,7 @@ function ContextChip({ c, compressAt }: { c: ContextOccupancy; compressAt: numbe
               ["本会话峰值", `${c.peak_prompt_tokens.toLocaleString()} tok`],
               ["距预算线", c.will_compress ? "已越过（较早历史正在被丢弃）" : `还差 ${c.remaining_tokens.toLocaleString()} tok`],
               ["LLM 往返", `${c.rounds} 轮`],
+              ["统计口径", "只看主对话角色；子agent 的一次性调研调用不计入本格"],
               ...(c.skewed_usage_calls
                 ? [[`上报异常`, `${c.skewed_usage_calls} 轮（端点把累计量当成单次用量上报，已排除）`]]
                 : []),
@@ -228,6 +232,12 @@ function CacheChip({ u }: { u: Usage }) {
             ))}
           </tbody>
         </table>
+        <div className="mt-1.5 rounded bg-slate-50 px-2 py-1 text-[11px] leading-relaxed text-slate-500">
+          统计口径：只统计主对话。子agent（spawn_agents 派出的只读调研）的调用与 token
+          不计入本格{u.subagents?.count
+            ? `——本会话共 ${u.subagents.count} 个子agent，在右侧运行面板的「子agent」标签里单独看`
+            : "，在右侧运行面板的「子agent」标签里单独看"}。
+        </div>
         {!!lr && (
           <>
             <div className="mt-2 border-t border-slate-200 pt-1.5 text-[11px] font-medium text-slate-600">
@@ -282,6 +292,11 @@ function CacheChip({ u }: { u: Usage }) {
                 ))}
               </tbody>
             </table>
+            <div className="mt-1 rounded bg-slate-50 px-2 py-1 text-[11px] leading-relaxed text-slate-500">
+              子agent 是 spawn_agents 派出的一次性只读调研：它花掉的 token 计入本会话总量
+              （上表合计与「Token 用量」对得上），但不构成会话上下文——顶栏那格占用与
+              速度/首字只看主对话角色的往返。
+            </div>
           </>
         )}
         <div className="mt-2 rounded bg-slate-50 px-2 py-1 text-[11px] leading-relaxed text-slate-500">
@@ -442,13 +457,25 @@ function SpeedChip({ u }: { u: Usage }) {
   );
 }
 
-export default function SessionUsage({ sessionId, refreshKey = 0, compact = false }: {
+export default function SessionUsage({ sessionId, refreshKey = 0, compact = false, running = false }: {
   sessionId: string;
   refreshKey?: number;
   /** 顶栏窄的时候只留「总 token / 上下文」，其余（缓存命中、速度）让位给右侧操作按钮 */
   compact?: boolean;
+  /** 该会话此刻是否有 run 在跑：跑着的时候占用/token 每轮都在变，必须自己定时重拉，
+   *  否则整场执行期间顶栏停在「开始那一刻」的数，看起来像统计不刷新（用户 2026-11-16 反馈）。 */
+  running?: boolean;
 }) {
   const [u, setU] = useState<Usage | null>(null);
+
+  // 拉取逻辑单独提出去：首拉 / refreshKey 变化 / 执行中轮询 / 切回页面都复用它。
+  // 用 alive 标记防止组件卸载或会话切换后旧请求回包覆盖新数据。
+  const load = useCallback((sync?: () => boolean) => {
+    api
+      .sessionUsage(sessionId)
+      .then((r: any) => { if (!sync || sync()) setU(r); })
+      .catch(() => {});
+  }, [sessionId]);
 
   useEffect(() => {
     if (!sessionId) {
@@ -456,14 +483,35 @@ export default function SessionUsage({ sessionId, refreshKey = 0, compact = fals
       return;
     }
     let alive = true;
-    api
-      .sessionUsage(sessionId)
-      .then((r: any) => alive && setU(r))
-      .catch(() => {});
+    load(() => alive);
     return () => {
       alive = false;
     };
-  }, [sessionId, refreshKey]);
+  }, [sessionId, refreshKey, load]);
+
+  // 执行中每 3 秒跟一次：一次往返刚落库，占用/token/速度就该动，不必等 run 结束。
+  // 不跑的时候不轮询——/usage 要聚合 llm_calls + events，闲着还每 3 秒拉一遍是白烧。
+  useEffect(() => {
+    if (!sessionId || !running) return;
+    let alive = true;
+    const t = window.setInterval(() => load(() => alive), 3000);
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [sessionId, running, load]);
+
+  // 切回这个页面（含从其它标签页回来）补拉一次：后台时浏览器会节流定时器，
+  // 回来第一眼看到的应该是当前进度，而不是离开时的旧值。
+  useEffect(() => {
+    if (!sessionId) return;
+    const onVis = () => {
+      if (document.visibilityState === "visible") load();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [sessionId, load]);
+
 
   if (!u || !u.calls) return null;
   const item = (label: string, value: string, title?: string, cls = "text-slate-600") => (
@@ -476,7 +524,8 @@ export default function SessionUsage({ sessionId, refreshKey = 0, compact = fals
   return (
     <div className="flex items-center gap-2.5 text-[11px] px-2 py-1 rounded border border-slate-200 bg-slate-50 shrink-0">
       {item("本会话 token", fmtTokens(u.total_tokens),
-        `输入 ${u.prompt_tokens.toLocaleString()} + 输出 ${u.completion_tokens.toLocaleString()}`)}
+        `只算主对话：输入 ${u.prompt_tokens.toLocaleString()} + 输出 ${u.completion_tokens.toLocaleString()}`
+          + (u.subagents?.count ? `\n另有 ${u.subagents.count} 个子agent，其用量在右侧运行面板「子agent」标签里单独看` : ""))}
       {u.context ? (
         <ContextChip c={u.context} compressAt={u.compress_at_pct} />
       ) : (

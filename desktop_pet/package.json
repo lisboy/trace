@@ -1,0 +1,14 @@
+{
+  "name": "trace-pet",
+  "version": "0.1.0",
+  "private": true,
+  "description": "循迹（Trace）桌面宠物 · 3D 透明置顶小窗",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "electron": "^31.7.7",
+    "three": "^0.166.1"
+  }
+}

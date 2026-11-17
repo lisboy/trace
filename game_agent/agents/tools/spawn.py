@@ -33,8 +33,21 @@ class SpawnBatch:
     _agg: str | None = None
 
     def ready(self) -> bool:
-        """所有子agent 是否已收工（不论成败）。"""
-        return bool(self.tasks) and all(t.done() for t in self.tasks)
+        """所有子agent 是否已收工（不论成败）。
+
+        空批次也算收工：以前写成 `bool(self.tasks) and ...`，于是「0 个任务」的批次
+        永远不 ready，等的那个 while 会一直转（旧代码在 tasks 为空时不 await，
+        直接变成 100% CPU 空转，界面上永远「还有 0 个子agent」）。
+        """
+        return all(t.done() for t in self.tasks)
+
+    def pending(self) -> int:
+        """还没收工的子agent 数。
+
+        界面/心跳的「还有 N 个在跑」只能用这个数：用 len(self.tasks) 会把已经跑完的
+        也一起数进去（4 个里 3 个收工仍报 4，2026-11-15 用户实测）。
+        """
+        return sum(1 for t in self.tasks if not t.done())
 
     def aggregate(self) -> str:
         """各子agent 结论拼成交给主agent 的汇总（只在 ready() 之后调用）。"""
@@ -109,5 +122,6 @@ async def spawn_agents(args: dict, t: ToolContext) -> str:
     t.spawn_batches.append(SpawnBatch(names=names, tasks=tasks))
     return (f"已派出 {len(tasks)} 个只读子agent 并行核对（{'、'.join(names)}）。\n"
             "它们还在后台跑，结论回来后会自动送进你的对话（不需要轮询/等待）。"
-            "这期间你可以先回应用户插话、继续别的工作；收尾时会等结论回来再写总结。"
+            "但**在它们全部回收之前不要写最终结论/总结报告**：这期间只回应用户插话、"
+            "或继续别的工作；回收后系统会再给你一轮，把它们的结论汇总进最终答复。"
             "不要凭空猜测它们的发现。")

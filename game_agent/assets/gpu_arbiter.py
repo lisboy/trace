@@ -28,7 +28,6 @@ from game_agent.logging_setup import get_logger
 log = get_logger("gpu")
 
 KINDS = ("image", "voice")
-_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
 
 # 进程内全局：同一时刻只允许一个 GPU 服务在跑
 _LOCK = asyncio.Lock()
@@ -134,13 +133,6 @@ def _port_of(kind: str) -> int:
         return urlparse(url).port or (10188 if kind == "image" else 10189)
     except Exception:  # noqa: BLE001
         return 10188 if kind == "image" else 10189
-
-
-def _is_local(kind: str) -> bool:
-    url = _url(kind)
-    if not url:
-        return False
-    return (urlparse(url).hostname or "127.0.0.1") in _LOCAL_HOSTS
 
 
 async def _port_open(kind: str) -> bool:

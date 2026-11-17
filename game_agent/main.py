@@ -25,8 +25,18 @@ if sys.platform == "win32":
 def main() -> None:
     configure_logging()
     log = get_logger("main")
-    from game_agent.config import ensure_dirs
+    from game_agent.config import DATA_DIR, ensure_dirs
     ensure_dirs()
+
+    # 单实例守卫（必须在任何写库动作之前）：这套数据目录同时只允许一个进程当写入者。
+    # 第二个实例启动时会跑「僵尸 run 清理」，把第一个实例里正在跑的 run 全标成
+    # 「服务重启，本次执行被中断」——用户看到的「老是重启、我的活被中断」就是它干的
+    # （实测 2026-11-17 10:11/10:21/10:25 三次 cleaned N zombie run，主实例一直是活的）。
+    # 抢不到锁就打印人话并退出，一个字节都不写。
+    from game_agent.core.instance_lock import GUARD
+    guard = GUARD.ensure(DATA_DIR, log=log)
+    if not guard.ok:
+        raise SystemExit(2)
 
     from game_agent.core.skills import seed_builtin_skills
     try:
@@ -49,11 +59,31 @@ def main() -> None:
     finally:
         if not DEBUG_INSTANCE:
             _remove_pidfile()
+        from game_agent.core.instance_lock import GUARD, clear_instance_info
+
+        # 只清自己留下的东西：调试实例/被放行的实例从没写过 info，别把真主人的删掉。
+        if GUARD.owns_data_dir:
+            clear_instance_info(DATA_DIR)
+        GUARD.release()
 
 
 def _pidfile_path():
     from game_agent.config import DATA_DIR
     return DATA_DIR / "game_agent.pid"
+
+
+def _owns_data_dir() -> bool:
+    """本进程是不是这套数据目录的唯一写入者（启动守卫抢到锁才算）。
+
+    只有它才有资格做「清僵尸 run」「删迁移后的旧目录」这类会动到别人数据的动作。
+    调试实例、GA_ALLOW_MULTI_INSTANCE=1 放行的实例、锁文件建不出来的实例都返回 False。
+    """
+    try:
+        from game_agent.core.instance_lock import GUARD
+
+        return GUARD.owns_data_dir
+    except Exception:  # noqa: BLE001 - 守卫异常时按「不拥有」处理，宁可少做不可多做
+        return False
 
 
 def _write_pidfile() -> None:
@@ -163,8 +193,10 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, bootst
 
     # 数据目录迁移后的旧目录清理：只有「新实例用新目录把 DB 打开成功」才走到这里，
     # 才敢删旧目录——迁移期间旧数据一直保留，任何一步失败都能退回。
-    # 调试实例与主实例共用一个库，绝不能在这里删东西，直接跳过。
-    if not DEBUG_INSTANCE:
+    # 调试实例与主实例共用一个库，绝不能在这里删东西，直接跳过；
+    # 被守卫放行但没抢到锁的实例（GA_ALLOW_MULTI_INSTANCE=1 / 锁文件不可用）同样跳过，
+    # 它们不是这套数据目录的唯一主人，删东西会踩到正在跑的那个实例。
+    if not DEBUG_INSTANCE and _owns_data_dir():
         _cleanup_old_data_dir(log)
 
     services = await build_lite_services(SessionLocal, worker_id="lite-1")
@@ -188,7 +220,10 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, bootst
     from game_agent.core.notices import post_session_notice
     from game_agent.db.models import Run
     dead: list[dict] = []
-    if not DEBUG_INSTANCE:
+    # 只有「这套数据目录的唯一主人」才做启动清理。调试实例、被 GA_ALLOW_MULTI_INSTANCE 放行
+    # 的实例都跳过——它们和主实例共用同一个库，把主实例正在跑的 run 标 failed 就是
+    # 「明明没重启却收到『服务重启，本次执行被中断』」的根因（见 core/instance_lock.py）。
+    if not DEBUG_INSTANCE and _owns_data_dir():
         async with SessionLocal() as s:
             zombie = (await s.execute(select(Run).where(
                 Run.status.in_(("queued", "running", "claimed", "blocked"))))).scalars().all()
@@ -383,6 +418,12 @@ async def _start(engine, SessionLocal, build_lite_services, Orchestrator, bootst
     _bind_port = _resolve_bind_port(HOST, PORT)
     if _bind_port != PORT:
         os.environ["GA_PORT"] = str(_bind_port)
+    # 把「谁占着这套数据目录、在哪个端口」写下来：第二个实例被守卫拦下时，
+    # 报错里直接给用户可点的地址，而不是让他自己去翻日志找端口。
+    if not DEBUG_INSTANCE and _owns_data_dir():
+        from game_agent.core.instance_lock import write_instance_info
+
+        write_instance_info(DATA_DIR, pid=os.getpid(), host=HOST, port=_bind_port)
     app = create_app(frontend_dir=state.frontend_dir)
     # use_colors=False：打包版双击 start.cmd 时 stdout 是 cmd 窗口，uvicorn 默认会按
     # isatty 判定上色并插入 ANSI 转义（如 \x1b[36m、\x1b[?25l），在 GBK 控制台里会显示成

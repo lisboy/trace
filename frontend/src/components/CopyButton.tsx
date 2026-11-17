@@ -1,7 +1,9 @@
 import { useState } from "react";
-import { copyToClipboard, type CopyPayload } from "../clipboard";
+import { copyToClipboard, type CopyOutcome, type CopyPayload } from "../clipboard";
 
-/** 小复制按钮：点击后原地变「已复制 / 复制失败」再复原，不引全局 toast。 */
+/** 小复制按钮：点击后原地变「已复制 / 已复制（仅文字）/ 复制失败」再复原，不引全局 toast。
+ *  「仅文字」= 本来要连图一起复制，但图没能写进剪贴板（浏览器拒绝/不支持）——
+ *  不能把这种情况也显示成「已复制」，否则用户粘出来发现没图，以为点了没用。 */
 export default function CopyButton({
   get,
   label = "复制",
@@ -13,7 +15,7 @@ export default function CopyButton({
   title?: string;
   className?: string;
 }) {
-  const [state, setState] = useState<"" | "ok" | "fail" | "busy">("");
+  const [state, setState] = useState<"" | "ok" | "partial" | "fail" | "busy">("");
   return (
     <button
       type="button"
@@ -26,16 +28,19 @@ export default function CopyButton({
         e.stopPropagation();
         // 会话带十几张附图时，拉图 + 转 dataURL 要好几秒；不亮「复制中」看着就是点了没反应
         setState("busy");
-        let ok = false;
+        let res: CopyOutcome = false;
         try {
-          ok = await copyToClipboard(await get());
+          res = await copyToClipboard(await get());
         } finally {
-          setState(ok ? "ok" : "fail");
+          setState(res === "full" ? "ok" : res === "text" ? "partial" : "fail");
           window.setTimeout(() => setState(""), 1400);
         }
       }}
     >
-      {state === "ok" ? "已复制" : state === "fail" ? "复制失败" : state === "busy" ? "复制中…" : label}
+      {state === "ok" ? "已复制"
+        : state === "partial" ? "已复制（仅文字）"
+        : state === "fail" ? "复制失败"
+        : state === "busy" ? "复制中…" : label}
     </button>
   );
 }

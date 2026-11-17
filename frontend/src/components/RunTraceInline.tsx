@@ -14,6 +14,7 @@ import Markdown from "./Markdown";
 import CopyButton from "./CopyButton";
 import { ROLE_LABEL } from "../types";
 import { diffFromToolArgs, diffStats, lineDiff } from "../diff";
+import { elidedBadge, splitElided, decorateElided } from "../elided";
 import DiffView from "./DiffView";
 import ShotThumbs from "./ShotThumbs";
 import { parseSources, SourceChips } from "./SearchSources";
@@ -72,7 +73,7 @@ type Ev = {
 /** 子agent 分组：task_start(role=sub) 开一组，组内收该 task 的全部行，task_done 收口。
  *  渲染成一行可点击的「子agent 卡」：头像 + 名字 + 任务 + 状态 + 耗时，点开弹窗看它
  *  内部的完整执行轨迹（思考 + 每次工具调用）。 */
-type SubGroup = {
+export type SubGroup = {
   taskId: string;
   /** spawn_agents 派发时给的子任务名（如「查物料状态Map」），行标题用 */
   title: string;
@@ -574,8 +575,57 @@ function groupRows(
   return out;
 }
 
-/** 子agent 行的头像：按序号取一个稳定的柔和渐变（不依赖后端头像资源），像截图那样
- *  一眼区分「这是哪一个子agent」。 */
+/** 把「某个子agent 自己的事件流」拼成一个可直接弹窗展示的 SubGroup。
+ *
+ *  运行面板的「子agent」标签用它：那里只有 task 级元数据（名字/问题/状态/耗时），
+ *  要看"对话详情"必须再拉这个 task 的事件。走的是和聊天流子agent 卡片同一套
+ *  buildRows/groupRows，两个入口看到的轨迹不会各说各话。
+ *
+ *  兜底：一启动就失败/被停的子agent 一条行都没有（甚至拿不到 task_start），
+ *  这时用清单里的元数据造一个空组——弹窗照样能打开，标题、问题、耗时、错误都在。 */
+export function subGroupFromEvents(
+  taskId: string,
+  raw: any[],
+  fallback?: {
+    title?: string; question?: string; status?: string; error?: string | null;
+    summary?: string | null; startedAt?: string | null; finishedAt?: string | null;
+  },
+): SubGroup {
+  const norm = (v?: string | null) => String(v || "").replace(/-/g, "").toLowerCase();
+  const evs: Ev[] = (raw || []).map(mapEv);
+  const rows = buildRows(evs, [], []);
+  if (rows.length) {
+    for (const r of groupRows(rows, evs)) {
+      if (r.kind === "subgroup" && norm(r.group.taskId) === norm(taskId)) {
+        const g = r.group;
+        // 事件流拿了组但没有结论（老 run 的 task_done 不带 summary）：用清单里
+        // task.result_json.text 兜底，别让弹窗里那一栏空着。
+        if (!g.summary && fallback?.summary) g.summary = fallback.summary;
+        return g;
+      }
+    }
+  }
+  // 有行但没归出组（老 run 缺 task_start/task_done）：自己按 task_id 挑出属于它的行，
+  // 绑定到兜底元数据上——轨迹照常能看，只是少了组头的起止时刻。
+  const mine = rows.filter((r) => norm((r as any).taskId) === norm(taskId));
+  const terminal = ["done", "failed", "cancelled", "question"].includes(String(fallback?.status || ""));
+  const open = !terminal && !fallback?.finishedAt;
+  return {
+    taskId,
+    title: fallback?.title || "",
+    question: fallback?.question || undefined,
+    agent: "sub",
+    rows: mine,
+    open,
+    status: fallback?.status || (open ? undefined : "done"),
+    error: fallback?.error || undefined,
+    summary: fallback?.summary || undefined,
+    startedAt: fallback?.startedAt || undefined,
+    finishedAt: fallback?.finishedAt || undefined,
+    key: `g${taskId}`,
+    index: 0,
+  };
+}
 const SUB_AVATAR_GRADS = [
   "from-sky-200 to-sky-400", "from-violet-200 to-violet-400",
   "from-amber-200 to-amber-400", "from-pink-200 to-pink-400",
@@ -693,8 +743,16 @@ function SubAgentRow({ group, runId, wait }: {
 /** 子agent 详情弹窗一次最多渲染多少步（超出的折成「显示更早的 N 步」）。 */
 const SUB_MODAL_WINDOW = 200;
 
-/** 子agent 详情弹窗：铺开它的完整执行轨迹（思考 + 每次工具调用，均可再点开看细节）。 */
-function SubAgentModal({ group, runId, onClose }: { group: SubGroup; runId: string; onClose: () => void }) {
+/** 子agent 详情弹窗：铺开它的完整执行轨迹（思考 + 每次工具调用，均可再点开看细节）。
+ *
+ *  export 出去给运行面板的「子agent」标签复用（2026-11-16 用户要求「子agent 要能点击、
+ *  并弹窗查看对话详情」）：两个入口看的是同一份东西——同一个 task 的思考/工具流水/结论，
+ *  不各写一套弹窗，否则两处显示会慢慢跑偏。 */
+export function SubAgentModal({ group, runId, onClose, usageText }: {
+  group: SubGroup; runId: string; onClose: () => void;
+  /** 可选：这个子agent 的用量摘要（运行面板那份传 run 级 token，轨迹里不传） */
+  usageText?: string;
+}) {
   const [stopping, setStopping] = useState(false);
   const st = subState({ ...group, stopping: stopping && group.open });
   const label = (group.title || group.question || "子agent")
@@ -759,6 +817,11 @@ function SubAgentModal({ group, runId, onClose }: { group: SubGroup; runId: stri
         {group.question && group.question !== label && (
           <div className="px-4 py-2 text-[12px] text-slate-500 border-b border-slate-100 whitespace-pre-wrap break-words">
             {group.question}
+          </div>
+        )}
+        {usageText && (
+          <div className="px-4 py-1.5 text-[11px] text-slate-400 border-b border-slate-100">
+            {usageText}
           </div>
         )}
         {group.status === "failed" && group.error && (
@@ -1193,12 +1256,29 @@ function WaitBadge({ at, stalled, waitingYou }: {
   );
 }
 
+/** 后端截断留下的省略标记解析（`…[中略 1234 字]…`，旧数据是 `…[中略]…`）。
+ *  它夹在思考正文里时既不是模型说的话、也不是报错，直接当正文铺出来会让人看不懂
+ *  （现场：用户截图圈住红框问「这个是啥意思」）。这里把它拆出来单独渲染成一条
+ *  「此处中间省略 N 字」的分隔线。解析逻辑在 ../elided，ContextTrace 等视图共用。 */
+function ElidedDivider({ omitted }: { omitted: number | null }) {
+  return (
+    <div className="my-1 flex items-center gap-2 text-[11px] text-amber-600">
+      <span className="h-px flex-1 bg-amber-200" />
+      <span title="后端为防止事件表被超长文本撑爆，只保留开头一小段和结尾主体，中间这段没有存下来">
+        ⋯ 此处中间省略{omitted ? ` ${omitted} 字` : "内容"}（原始思考太长，未保存）⋯
+      </span>
+      <span className="h-px flex-1 bg-amber-200" />
+    </div>
+  );
+}
+
 function ThinkRowBase({ agent, text }: { agent: string; text: string }) {
   const [open, setOpen] = useState(false);
   const who = ROLE_LABEL[agent] || agent;
   // 长思考折叠：摘要只显示前 200 字，避免一行把整段思考全铺开；细节点开再看全文。
   const THINK_COLLAPSE = 200;
   const long = text.length > THINK_COLLAPSE * 1.6;
+  const parts = useMemo(() => splitElided(text), [text]);
   return (
     <div>
       <Line
@@ -1209,7 +1289,13 @@ function ThinkRowBase({ agent, text }: { agent: string; text: string }) {
       >
         <span className="font-medium text-violet-700">思考</span>
         <span className="text-slate-400"> · </span>
-        <span className="text-slate-700">{oneLine(text, long ? THINK_COLLAPSE : 600)}</span>
+        <span className="text-slate-700">
+          {oneLine(parts.head, long ? THINK_COLLAPSE : 600)}
+          {parts.elided && (
+            <span className="text-amber-600"> {elidedBadge(parts.omitted)} </span>
+          )}
+          {parts.elided && <span className="text-slate-500">{oneLine(parts.tail, 120)}</span>}
+        </span>
       </Line>
       {open && (
         <Detail tone="think">
@@ -1223,7 +1309,15 @@ function ThinkRowBase({ agent, text }: { agent: string; text: string }) {
             />
           </div>
           <div className="max-h-72 overflow-y-auto">
-            <Markdown text={text} />
+            {parts.elided ? (
+              <>
+                <Markdown text={parts.head} />
+                <ElidedDivider omitted={parts.omitted} />
+                <Markdown text={parts.tail} />
+              </>
+            ) : (
+              <Markdown text={text} />
+            )}
           </div>
         </Detail>
       )}
@@ -1349,7 +1443,7 @@ function ToolRowBase({ agent, step, runId, count, at, live, awaiting, interimRep
                 bad ? "text-red-600" : "text-slate-700"
               }`}
             >
-              {(isWeb ? parsed.body : step.result) || "（无输出）"}
+              {(decorateElided(isWeb ? parsed.body : (step.result as string))) || "（无输出）"}
             </pre>
           )}
           {isWeb && parsed.sources.length > 0 && <SourceChips sources={parsed.sources} />}

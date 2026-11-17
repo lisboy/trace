@@ -107,6 +107,10 @@ class AnthropicMessagesLLM(LLM):
         # 图片块会被翻成 content 数组、被内核以「content 必须是字符串」400 拒绝。命中后
         # 本轮 run 内降级为「图片用文字说明代替」，避免每轮都撞一次。
         self._allow_images = True
+        # 端点是否接受 content 数组（Anthropic 原生要数组，但「anthropic 协议」中转站背后
+        # 常是 OpenAI/SGLang 内核：它把 content 定成 str，连纯文本块数组都 400）。命中后
+        # 整轮 run 改成「每条消息 content 都是字符串」，工具调用降级成正文里的文字记录。
+        self._text_only = False
         # 当前 httpx 客户端是否正在走代理（连接层失败时据此决定「换直连」还是「普通重试」）
         self._using_proxy = False
         # 本会话 id（runtime 注入）与「本会话已改用直连」标记：见 openai_compat.mark_session_direct
@@ -114,6 +118,15 @@ class AnthropicMessagesLLM(LLM):
         self._direct_only = False
 
     # ---------- 请求体翻译 ----------
+    def _text_tool_use(self, name: str, args: Any) -> str:
+        """纯文本模式下的工具调用记录（端点不收 content 数组时用文字表达）。"""
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args or {}, ensure_ascii=False)
+            except (TypeError, ValueError):
+                args = str(args)
+        return f"[调用工具 {name}，参数 {args}]"
+
     def _content_blocks(self, content: Any) -> list[dict]:
         """把内部 content（str 或 OpenAI parts）转成 Anthropic content blocks。"""
         if isinstance(content, list):
@@ -138,6 +151,8 @@ class AnthropicMessagesLLM(LLM):
     def _to_anthropic(self, messages: list[dict], tools: list[ToolSpec]) -> dict:
         system_parts: list[str] = []
         out: list[dict] = []
+        # 纯文本模式：端点内核只收 str，所有 content 一律压成文本（工具调用/结果用文字记录）
+        text_only = self._text_only
         for m in messages:
             role = m.get("role")
             if role == "system":
@@ -148,9 +163,14 @@ class AnthropicMessagesLLM(LLM):
                     system_parts.append(str(c))
                 continue
             if role == "tool":
+                result_text = str(m.get("content", ""))
+                if text_only:
+                    out.append({"role": "user",
+                                "content": f"[工具执行结果 {m.get('tool_call_id') or ''}]\n{result_text}"})
+                    continue
                 # 连续的 tool 结果合并进同一条 user 消息（Anthropic 要求 tool_result 紧跟 tool_use）
                 block = {"type": "tool_result", "tool_use_id": m.get("tool_call_id"),
-                         "content": str(m.get("content", ""))}
+                         "content": result_text}
                 if out and out[-1]["role"] == "user" \
                         and isinstance(out[-1]["content"], list) \
                         and out[-1]["content"] and _is_tool_result(out[-1]["content"][0]):
@@ -160,11 +180,19 @@ class AnthropicMessagesLLM(LLM):
                 continue
             if role == "assistant":
                 blocks: list[dict] = []
+                texts: list[str] = []
                 c = m.get("content")
                 if isinstance(c, list):
-                    blocks.extend(self._content_blocks(c))
+                    if text_only:
+                        texts.extend(b.get("text", "") for b in self._content_blocks(c)
+                                     if b.get("type") == "text")
+                    else:
+                        blocks.extend(self._content_blocks(c))
                 elif c:
-                    blocks.append({"type": "text", "text": str(c)})
+                    if text_only:
+                        texts.append(str(c))
+                    else:
+                        blocks.append({"type": "text", "text": str(c)})
                 for tc in m.get("tool_calls") or []:
                     if not isinstance(tc, dict):
                         continue
@@ -172,6 +200,9 @@ class AnthropicMessagesLLM(LLM):
                     args = tc.get("arguments")
                     if args is None:
                         args = (tc.get("function") or {}).get("arguments")
+                    if text_only:
+                        texts.append(self._text_tool_use(name, args))
+                        continue
                     if isinstance(args, str):
                         try:
                             args = json.loads(args)
@@ -179,12 +210,21 @@ class AnthropicMessagesLLM(LLM):
                             args = {}
                     blocks.append({"type": "tool_use", "id": tc.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
                                    "name": name, "input": args or {}})
+                if text_only:
+                    out.append({"role": "assistant", "content": "\n".join(t for t in texts if t)})
+                    continue
                 if not blocks:
                     blocks = [{"type": "text", "text": ""}]
                 out.append({"role": "assistant", "content": blocks})
                 continue
             # user / 其他
-            out.append({"role": "user", "content": self._content_blocks(m.get("content"))})
+            if text_only:
+                blocks = self._content_blocks(m.get("content"))
+                out.append({"role": "user",
+                            "content": "\n".join(b.get("text", "") for b in blocks
+                                                 if b.get("type") == "text")})
+            else:
+                out.append({"role": "user", "content": self._content_blocks(m.get("content"))})
 
         body: dict[str, Any] = {
             "model": self.model,
@@ -252,18 +292,8 @@ class AnthropicMessagesLLM(LLM):
             resp = await self._request(body, headers, on_delta, t0, on_retry=retry_hook,
                                        timeout_s=timeout_s, max_attempts=max_attempts)
         except _ContentPartsUnsupported as e:
-            # 「anthropic 协议」中转站背后是 OpenAI/SGLang 内核时，图片块会被翻成
-            # content 数组、被内核 400 拒绝（content 必须是字符串）。这不是请求内容错，
-            # 是格式不兼容：把图片降级成文字说明、按纯文本重建后重发一次即可（与
-            # openai_compat 的 parts 降级同口径），不能让它把整个 run 直接打崩。
-            if not self._allow_images:
-                raise
-            self._allow_images = False
-            log.warning("端点拒绝图片块（content 必须是字符串），降级为纯文本后重试: %s", e)
-            body = self._to_anthropic(messages, tools)
-            t0 = time.monotonic()
-            resp = await self._request(body, headers, on_delta, t0, on_retry=retry_hook,
-                                       timeout_s=timeout_s, max_attempts=max_attempts)
+            resp = await self._retry_text_only(body, messages, tools, headers, on_delta, t0,
+                                               retry_hook, timeout_s, max_attempts, e)
         except LlmContextOverflow as e:
             log.warning("端点报上下文超限，按半预算重压后重试: %s", e)
             retry_report: dict[str, Any] = {"source": "endpoint_overflow",
@@ -354,6 +384,42 @@ class AnthropicMessagesLLM(LLM):
                 e, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError)):
             return _ProxyRefused(f"{type(e).__name__}: {e}")
         return _RetryableLLMError(f"{type(e).__name__}: {e}")
+
+    async def _retry_text_only(self, body: dict, messages: list[dict], tools: list[ToolSpec],
+                               headers: dict, on_delta, t0: float, retry_hook,
+                               timeout_s, max_attempts, first_err: Exception) -> LLMResponse:
+        """端点拒收 content 数组时的逐级降级重发。
+
+        背景：标称 anthropic 协议的中转站背后常是 OpenAI/SGLang 内核，它把每条消息的
+        content 定成 str，收到块数组就 400（``ChatCompletionMessageGenericParam`` /
+        ``Input should be a valid string``）。这不是请求内容错，是格式不兼容，逐级降：
+          ① 请求里真带图块 → 先只关图片（图换成文字说明），保留 tool_use/tool_result；
+          ② 仍被拒（连纯文本块数组都不收）→ 整体切成每条消息 content 都是字符串，
+             工具调用/结果改用文字记录表达。
+        每级只重发一次；否则这个 run 每轮都先撞同一个 400。
+        """
+        err = first_err
+        if self._allow_images and _body_has_image_block(body):
+            self._allow_images = False
+            log.warning("端点拒收图片块，降级为文字说明后重试: %s", err)
+            body = self._to_anthropic(messages, tools)
+            t0 = time.monotonic()
+            try:
+                return await self._request(body, headers, on_delta, t0, on_retry=retry_hook,
+                                           timeout_s=timeout_s, max_attempts=max_attempts)
+            except _ContentPartsUnsupported as e2:
+                err = e2
+                body = self._to_anthropic(messages, tools)
+        if self._text_only:
+            raise err
+        self._text_only = True
+        # 图片在纯文本模式下一律省略，别再让它占着「允许图片」的位
+        self._allow_images = False
+        log.warning("端点只收字符串 content（块数组被拒），改用纯文本消息重试: %s", err)
+        body = self._to_anthropic(messages, tools)
+        t0 = time.monotonic()
+        return await self._request(body, headers, on_delta, t0, on_retry=retry_hook,
+                                   timeout_s=timeout_s, max_attempts=max_attempts)
 
     async def _request(self, body: dict, headers: dict, on_delta, t0: float,
                        on_retry=None, timeout_s: int | None = None,
@@ -497,7 +563,10 @@ class AnthropicMessagesLLM(LLM):
                 raise _classify_http_error(resp.status_code, raw,
                                            resp.headers.get("retry-after"))
             if resp.status_code != 200:
-                raw = (await resp.aread())[:200].decode("utf-8", "ignore")
+                # 读满 2000 字符再分类：pydantic 那种「23 validation errors」正文很长，
+                # 只截 200 会把 'content'/'Input should be a valid string' 截断，导致
+                # _classify_http_error 认不出「端点只收字符串 content」，白降一次非流式。
+                raw = (await resp.aread())[:2000].decode("utf-8", "ignore")
                 raise _classify_http_error(resp.status_code, raw,
                                            resp.headers.get("retry-after"))
             try:
@@ -580,6 +649,16 @@ class AnthropicMessagesLLM(LLM):
 
 def _is_tool_result(block: Any) -> bool:
     return isinstance(block, dict) and block.get("type") == "tool_result"
+
+
+def _body_has_image_block(body: dict) -> bool:
+    """请求体里是否真有 image 块（决定降级时要不要先关图片）。"""
+    for m in body.get("messages") or []:
+        c = m.get("content")
+        if isinstance(c, list) and any(
+                isinstance(b, dict) and b.get("type") == "image" for b in c):
+            return True
+    return False
 
 
 def _safe_delta(on_delta, r: str, t: str) -> None:

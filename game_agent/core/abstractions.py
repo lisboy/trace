@@ -117,7 +117,7 @@ class Repository(ABC):
 
 
 class EventBus(ABC):
-    """事件扇出。权威源是 DB（EventBus 内部落库），实时通道可选（lite=进程内 / server=Redis）。"""
+    """事件扇出。权威源是 DB（EventBus 内部落库），实时通道走核心内实现（进程内 pub/sub）。"""
 
     @abstractmethod
     async def emit(self, env: EventEnvelope) -> int:
@@ -133,7 +133,7 @@ class EventBus(ABC):
 
 
 class Queue(ABC):
-    """run 串行队列。lite=进程内；server=PG ``SKIP LOCKED``。"""
+    """run 串行队列。核心内实现：``core/lite/queue.py`` 的进程内队列。"""
 
     @abstractmethod
     async def enqueue(self, run_id: str, priority: int = 0) -> None: ...
@@ -192,7 +192,7 @@ class FencingLost(Exception):
 
 
 class ObjectStore(ABC):
-    """素材/产物对象存储。lite=本地磁盘；server=S3/MinIO。"""
+    """素材/产物对象存储。核心内实现：本地磁盘（``DATA_DIR`` 下的 run_shots / uploads）。"""
 
     @abstractmethod
     async def put_file(self, key: str, local_path: str) -> None: ...

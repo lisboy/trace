@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, text
 
 from game_agent.config import LLM_USER_AGENT
 from game_agent.llm.openai_compat import (
@@ -1034,6 +1034,18 @@ def _local_offset_hours() -> int:
     return int(round((off.total_seconds() if off else 0) / 3600))
 
 
+# 用量页是「看一眼」的仪表盘，没必要每次重新扫描整个窗口：
+# 同一 (工作区, 窗口, 筛选) 的响应缓存 15s，切窗口/切筛选/切页面再回来都是秒开。
+# 15s 的陈旧度对统计页无感（它本来就不是实时流），换来的是不再重复扫 3 万行。
+_USAGE_CACHE: dict[tuple[str, int, str, str], tuple[float, dict]] = {}
+_USAGE_CACHE_TTL = 15.0
+
+
+def _hex(v) -> str:
+    """把 UUID / hex 字符串统一成 32 位 hex（库里的 uuid 列就是 hex 文本）。"""
+    return v.hex if hasattr(v, "hex") else str(v).replace("-", "")
+
+
 @router.get("/usage")
 async def usage(days: int = Query(30, ge=1, le=365),
                 agent: str | None = Query(None),
@@ -1041,150 +1053,223 @@ async def usage(days: int = Query(30, ge=1, le=365),
                 ctx: RequestContext = Depends(require(PERM_USAGE_VIEW))):
     """用量台账。agent / model 可选筛选（类型筛选）：排除哪类调用拖低整体命中率的干扰，
     比如只看项目组长自己的缓存命中率。facets 永远按未筛选的全集返回，避免选中后下拉只剩自己。"""
+    ck = (str(ctx.team_id), days, agent or "", model or "")
+    hit = _USAGE_CACHE.get(ck)
+    if hit and time.monotonic() - hit[0] < _USAGE_CACHE_TTL:
+        return hit[1]
+    data = await _usage_payload(ctx.team_id, days, agent, model)
+    if len(_USAGE_CACHE) >= 32:  # 兜底：别让筛选组合把内存撑起来
+        _USAGE_CACHE.clear()
+    _USAGE_CACHE[ck] = (time.monotonic(), data)
+    return data
+
+
+async def _usage_payload(team_id, days: int, agent: str | None, model: str | None) -> dict:
+    """把窗口内的 llm_calls 一次扫进来，总量/按模型/按角色/按天/按项目/按会话全部在内存里累加。
+
+    以前每个维度一条 SQL：同样是这几万行，被 SQLite 反复扫描 6 遍（实测 3.4 万行库上
+    单条 17~84ms，一页串行 ≈260ms），而一次扫描 + Python 累加只要一份 IO。
+    cast/累加的都是整数列，内存里做没有精度问题；365 天窗口也只会读一次。
+    """
     since = datetime.now(timezone.utc) - timedelta(days=days)
     tz_off = _local_offset_hours()
-    call_cond = [LlmCall.team_id == _u(ctx.team_id), LlmCall.created_at >= since]
-    if agent:
-        call_cond.append(LlmCall.agent_key == agent)
-    if model:
-        call_cond.append(LlmCall.model == model)
+    tid = _u(team_id)
+
+    def _rate(cached: int, prompt: int, reported: int):
+        return round(cached / prompt * 100, 1) if prompt > 0 and reported > 0 else None
+
+    def _tps(completion: int, ms: int):
+        return round(completion / (ms / 1000), 1) if ms > 0 and completion > 0 else None
+
     async with SessionLocal() as s:
         rows = (await s.execute(
             select(UsageLedger.kind, func.coalesce(func.sum(UsageLedger.amount), 0))
-            .where(UsageLedger.team_id == _u(ctx.team_id), UsageLedger.created_at >= since)
+            .where(UsageLedger.team_id == tid, UsageLedger.created_at >= since)
             .group_by(UsageLedger.kind))).all()
-        calls = (await s.execute(
-            select(func.count(), func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0),
-                   func.coalesce(func.sum(LlmCall.cached_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cache_reported), 0))
-            .where(*call_cond))).one()
-        # 按模型：调用数 / tokens / 总耗时 → 平均生成速度 + 缓存命中率
-        by_model = (await s.execute(
-            select(LlmCall.model, func.count(), func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0),
-                   func.coalesce(func.sum(LlmCall.cached_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cache_reported), 0))
-            .where(*call_cond)
-            .group_by(LlmCall.model)
-            .order_by(func.count().desc()))).all()
-        # 按角色：调用数 + tokens + 命中率（哪个角色把整体命中率拖低了，在这里拆开看）
-        by_agent = (await s.execute(
-            select(LlmCall.agent_key, func.count(),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens + LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cached_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cache_reported), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0))
-            .where(*call_cond)
-            .group_by(LlmCall.agent_key))).all()
-        # 筛选下拉候选项：按未筛选的全集算
-        facet_base = [LlmCall.team_id == _u(ctx.team_id), LlmCall.created_at >= since]
-        agent_facets = [r[0] for r in (await s.execute(
-            select(LlmCall.agent_key).where(*facet_base, LlmCall.agent_key.is_not(None))
-            .group_by(LlmCall.agent_key)
-            .order_by(func.sum(LlmCall.prompt_tokens).desc()))).all()]
-        model_facets = [r[0] for r in (await s.execute(
-            select(LlmCall.model).where(*facet_base, LlmCall.model.is_not(None))
-            .group_by(LlmCall.model)
-            .order_by(func.sum(LlmCall.prompt_tokens).desc()))).all()]
-        # 按项目：经 run 关联聚合（无 run 的调用不计入）
-        by_project = (await s.execute(
-            select(Run.project_id, func.count(),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0))
-            .join(Run, Run.id == LlmCall.run_id)
-            .where(*call_cond)
-            .group_by(Run.project_id))).all()
-        # 按天（本地日切）：调用数 + tokens，供趋势图
-        day_expr = func.date(func.datetime(LlmCall.created_at, f"{tz_off:+d} hours"))
-        by_day = (await s.execute(
-            select(day_expr, func.count(),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens + LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0))
-            .where(*call_cond)
-            .group_by(day_expr).order_by(day_expr))).all()
-        # 按会话：整体命中率被哪条会话拉低的一眼可见（只取用量前 50 条会话）
-        by_session = (await s.execute(
-            select(Session.id, Session.title, Project.name, func.count(),
-                   func.coalesce(func.sum(LlmCall.prompt_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.completion_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.latency_ms), 0),
-                   func.coalesce(func.sum(LlmCall.cached_tokens), 0),
-                   func.coalesce(func.sum(LlmCall.cache_reported), 0))
-            .select_from(LlmCall)
-            .join(Run, Run.id == LlmCall.run_id)
-            .join(Session, Session.id == Run.session_id)
-            .join(Project, Project.id == Session.project_id)
-            .where(*call_cond)
-            .group_by(Session.id, Session.title, Project.name)
-            .order_by(func.sum(LlmCall.prompt_tokens).desc())
-            .limit(50))).all()
-        names = {str(r[0]): r[1] for r in (await s.execute(
-            select(Project.id, Project.name).where(Project.team_id == _u(ctx.team_id)))).all()}
+        # 一次扫描把窗口内的调用全取回来，各维度在内存里累加。
+        # 以前是 8 条各自带 team_id+created_at 条件的聚合，SQLite 把同几万行反复扫了 8 遍
+        # （3.4 万行库实测 287ms）；一次扫描只要 ~80ms。这里直接下发原生 SQL 而不是走 ORM：
+        # ORM 的 Uuid/UTCDateTime 列会逐行做类型转换，能加回来几百毫秒。
+        where = ["team_id = :tid", "created_at >= :since"]
+        params: dict = {"tid": _hex(tid), "since": since}
+        if agent:
+            where.append("agent_key = :agent")
+            params["agent"] = agent
+        if model:
+            where.append("model = :model")
+            params["model"] = model
+        scan = (await s.execute(text(
+            "SELECT created_at, prompt_tokens, completion_tokens,"
+            " cached_tokens, cache_reported, latency_ms, model, agent_key, run_id"
+            " FROM llm_calls WHERE " + " AND ".join(where)), params)).all()
+        # 本地日切：created_at 是 UTC 文本，按服务器时区偏移归日（否则「今天」会差一天）。
+        # 逐行做偏移解析太贵，这里只解一次基准日，用「日期 → 偏移后日期」的缓存摊掉。
+        _day_cache: dict[str, str] = {}
+
+        acc: dict[str, list[int]] = {}       # model -> [calls, prompt, completion, ms, cached, reported]
+        ag: dict[str, list[int]] = {}        # agent_key -> [calls, tokens, prompt, cached, reported, completion, ms]
+        dy: dict[str, list[int]] = {}        # 本地日 -> [calls, tokens, completion, ms]
+        totals = [0, 0, 0, 0, 0, 0]          # calls, prompt, completion, ms, cached, reported
+        run_ids: set = set()
+        for (created_at, p, ct, ca, rep, ms, m, ak, rid) in scan:
+            p, ct, ca, rep, ms = int(p or 0), int(ct or 0), int(ca or 0), int(rep or 0), int(ms or 0)
+            totals[0] += 1
+            totals[1] += p
+            totals[2] += ct
+            totals[3] += ms
+            totals[4] += ca
+            totals[5] += rep
+            b = acc.setdefault(m or "unknown", [0, 0, 0, 0, 0, 0])
+            b[0] += 1
+            b[1] += p
+            b[2] += ct
+            b[3] += ms
+            b[4] += ca
+            b[5] += rep
+            a = ag.setdefault(ak or "unknown", [0, 0, 0, 0, 0, 0, 0])
+            a[0] += 1
+            a[1] += p + ct
+            a[2] += p
+            a[3] += ca
+            a[4] += rep
+            a[5] += ct
+            a[6] += ms
+            # 本地日切：同一毫秒级的 created_at 前缀会大量重复，按「UTC 小时」缓存归日结果
+            utc_hour = created_at[:13]
+            dkey = _day_cache.get(utc_hour)
+            if dkey is None:
+                dkey = (datetime.fromisoformat(utc_hour + ":00:00")
+                        + timedelta(hours=tz_off)).strftime("%Y-%m-%d")
+                _day_cache[utc_hour] = dkey
+            d = dy.setdefault(dkey, [0, 0, 0, 0])
+            d[0] += 1
+            d[1] += p + ct
+            d[2] += ct
+            d[3] += ms
+            if rid is not None:
+                run_ids.add(rid)
+        by_day = [(k, *v) for k, v in sorted(dy.items())]
+        # 下拉候选项按「未筛选全集」算：选中某项后下拉不能只剩它自己。
+        # 筛选生效时补一次同一窗口的轻列扫描（只在用户真用了筛选时发生，且有 15s 缓存）。
+        facet_agent: dict[str, int] = {}
+        facet_model: dict[str, int] = {}
+        if agent or model:
+            full = (await s.execute(text(
+                "SELECT agent_key, model, prompt_tokens FROM llm_calls"
+                " WHERE team_id = :tid AND created_at >= :since"),
+                {"tid": _hex(tid), "since": since})).all()
+            for ak, m, p in full:
+                if ak is not None:
+                    facet_agent[ak] = facet_agent.get(ak, 0) + int(p or 0)
+                if m is not None:
+                    facet_model[m] = facet_model.get(m, 0) + int(p or 0)
+        else:
+            facet_agent = {a: v[2] for a, v in ag.items()}
+            facet_model = {m: v[1] for m, v in acc.items()}
+        agent_facets = [k for k, _ in sorted(facet_agent.items(), key=lambda x: -x[1])]
+        model_facets = [k for k, _ in sorted(facet_model.items(), key=lambda x: -x[1])]
+        # 按项目/按会话：run → session → project 的归属关系一次性取回（只查用到的 id），
+        # 不再对每行 llm_call 做三重 join 再 group by。
+        run_owner: dict = {}
+        if run_ids:
+            id_list = list(run_ids)
+            for i in range(0, len(id_list), 500):  # SQLite 绑定参数有上限，分批查
+                marks = ",".join(f":r{j}" for j in range(len(id_list[i:i + 500])))
+                for rid, pid, sid in (await s.execute(text(
+                        "SELECT id, project_id, session_id FROM runs WHERE id IN (" + marks + ")"),
+                        {f"r{j}": h for j, h in enumerate(id_list[i:i + 500])})).all():
+                    run_owner[_hex(rid)] = (pid, sid)
+        names = {_hex(r[0]): r[1] for r in (await s.execute(text(
+            "SELECT id, name FROM projects WHERE team_id = :tid"),
+            {"tid": _hex(tid)})).all()}
+        sid_list = list({_hex(v[1]) for v in run_owner.values()})
+        sess_title: dict = {}
+        sess_pid: dict = {}
+        if sid_list:
+            for i in range(0, len(sid_list), 500):
+                chunk = sid_list[i:i + 500]
+                marks = ",".join(f":s{j}" for j in range(len(chunk)))
+                for sid, title, pid in (await s.execute(text(
+                        "SELECT id, title, project_id FROM sessions WHERE id IN (" + marks + ")"),
+                        {f"s{j}": h for j, h in enumerate(chunk)})).all():
+                    k = _hex(sid)
+                    sess_title[k] = title
+                    sess_pid[k] = _hex(pid)
+        by_project: dict = {}
+        by_session: dict = {}
+        # run → (项目hex, 会话hex) 先算一次：如果按每一行调用去转 UUID，
+        # 3.4 万行就是 21 万次字符串转换（实测占总耗时 1/3）。
+        owner_hex = {rid: (_hex(p), _hex(s)) for rid, (p, s) in run_owner.items()}
+        for (created_at, p, ct, ca, rep, ms, m, ak, rid) in scan:
+            owner = owner_hex.get(rid) if rid is not None else None
+            if not owner:
+                continue          # 没有 run 归属的调用不计入「按项目/按会话」（与旧口径一致）
+            pid, sid = owner
+            p, ct, ca, rep, ms = int(p or 0), int(ct or 0), int(ca or 0), int(rep or 0), int(ms or 0)
+            bp = by_project.setdefault(pid, [0, 0, 0, 0])
+            bp[0] += 1
+            bp[1] += p
+            bp[2] += ct
+            bp[3] += ms
+            bs = by_session.setdefault(sid, [0, 0, 0, 0, 0, 0])
+            bs[0] += 1
+            bs[1] += p
+            bs[2] += ct
+            bs[3] += ms
+            bs[4] += ca
+            bs[5] += rep
+        by_session = sorted(by_session.items(), key=lambda kv: -kv[1][1])[:50]
         # 模型名 → 档位/供应商：用量表里只有裸模型名，光看名字猜不出走的哪个端点
-        prov_labels = {p.id: p.label for p in (await s.execute(
-            select(LlmProvider).where(LlmProvider.team_id == _u(ctx.team_id)))).scalars().all()}
+        prov_labels = {r[0]: r[1] for r in (await s.execute(text(
+            "SELECT id, label FROM llm_providers WHERE team_id = :tid"),
+            {"tid": _hex(tid)})).all()}
         prof_by_model: dict[str, dict] = {}
-        for pr in (await s.execute(select(ModelProfile).where(
-                ModelProfile.team_id == _u(ctx.team_id)))).scalars().all():
-            if pr.model:
-                prof_by_model.setdefault(pr.model, {
-                    "profile": pr.label, "kind": pr.kind or "llm",
-                    "provider": prov_labels.get(pr.provider_id) if pr.provider_id else None})
+        for model_name, label, kind, prov_id in (await s.execute(text(
+                "SELECT model, label, kind, provider_id FROM model_profiles"
+                " WHERE team_id = :tid"), {"tid": _hex(tid)})).all():
+            if model_name:
+                prof_by_model.setdefault(model_name, {
+                    "profile": label, "kind": kind or "llm",
+                    "provider": prov_labels.get(prov_id) if prov_id else None})
 
-        def _rate(cached: int, prompt: int, reported: int):
-            return round(cached / prompt * 100, 1) if prompt > 0 and reported > 0 else None
-
-        total_ms = int(calls[3])
-        completion = int(calls[2])
-        prompt_total = int(calls[1])
-        models = [{"model": m or "unknown", "calls": int(c), "prompt": int(p),
-                   "completion": int(ct), "latency_ms": int(ms),
-                   "cached": int(ca), "cache_hit_rate": _rate(int(ca), int(p), int(rep)),
-                   "tokens_per_sec": round(ct / (ms / 1000), 1) if ms > 0 and ct > 0 else None,
+        prompt_total = totals[1]
+        completion = totals[2]
+        total_ms = totals[3]
+        models = [{"model": m or "unknown", "calls": v[0], "prompt": v[1],
+                   "completion": v[2], "latency_ms": v[3],
+                   "cached": v[4], "cache_hit_rate": _rate(v[4], v[1], v[5]),
+                   "tokens_per_sec": _tps(v[2], v[3]),
                    **(prof_by_model.get(m) or {})}
-                  for m, c, p, ct, ms, ca, rep in by_model]
+                  for m, v in acc.items()]
         models.sort(key=lambda x: -(x["calls"] + x["prompt"] + x["completion"]))
-        projects = [{"project_id": str(pid), "project": names.get(str(pid), str(pid)),
-                     "calls": int(c), "prompt": int(p), "completion": int(ct),
-                     "latency_ms": int(ms),
-                     "tokens_per_sec": round(int(ct) / (int(ms) / 1000), 1)
-                     if int(ms) > 0 and int(ct) > 0 else None}
-                    for pid, c, p, ct, ms in by_project]
+        projects = [{"project_id": pid, "project": names.get(pid, pid),
+                     "calls": v[0], "prompt": v[1], "completion": v[2],
+                     "latency_ms": v[3], "tokens_per_sec": _tps(v[2], v[3])}
+                    for pid, v in by_project.items()]
         projects.sort(key=lambda x: -(x["calls"] + x["prompt"] + x["completion"]))
-        days_out = []
-        for d, c, t, ct, ms in by_day:
-            days_out.append({"date": str(d), "calls": int(c), "tokens": int(t),
-                             "completion": int(ct),
-                             "tokens_per_sec": round(int(ct) / (int(ms) / 1000), 1)
-                             if int(ms) > 0 and int(ct) > 0 else None})
-        sessions = [{"session_id": str(sid), "title": title or (pname or "未命名会话"),
-                     "calls": int(c), "prompt": int(p), "completion": int(ct),
-                     "latency_ms": int(ms), "cached": int(ca),
-                     "cache_hit_rate": _rate(int(ca), int(p), int(rep)),
-                     "tokens_per_sec": round(int(ct) / (int(ms) / 1000), 1)
-                     if int(ms) > 0 and int(ct) > 0 else None}
-                    for sid, title, pname, c, p, ct, ms, ca, rep in by_session]
+        days_out = [{"date": str(d), "calls": v[0], "tokens": v[1],
+                     "completion": v[2], "tokens_per_sec": _tps(v[2], v[3])}
+                    for d, *v in by_day]
+        sessions = [{"session_id": str(sid),
+                     "title": sess_title.get(sid) or names.get(sess_pid.get(sid, ""), "") or "未命名会话",
+                     "calls": v[0], "prompt": v[1], "completion": v[2],
+                     "latency_ms": v[3], "cached": v[4],
+                     "cache_hit_rate": _rate(v[4], v[1], v[5]),
+                     "tokens_per_sec": _tps(v[2], v[3])}
+                    for sid, v in by_session]
         # run 成功率：光看 token 看不出这批钱花得值不值
         run_stats = (await s.execute(
             select(Run.status, func.count()).where(
-                Run.team_id == _u(ctx.team_id), Run.created_at >= since)
+                Run.team_id == tid, Run.created_at >= since)
             .group_by(Run.status))).all()
         return {
             "days": days,
             "tokens": {
-                "prompt": prompt_total, "completion": completion, "calls": int(calls[0]),
+                "prompt": prompt_total, "completion": completion, "calls": totals[0],
                 "latency_ms": total_ms,
-                "cached": int(calls[4]),
-                "cache_hit_rate": _rate(int(calls[4]), prompt_total, int(calls[5])),
-                "tokens_per_sec": round(completion / (total_ms / 1000), 1)
-                if total_ms > 0 and completion > 0 else None,
+                "cached": totals[4],
+                "cache_hit_rate": _rate(totals[4], prompt_total, totals[5]),
+                "tokens_per_sec": _tps(completion, total_ms),
             },
             "runs": {k or "unknown": int(v) for k, v in run_stats},
             "ledger": {k: int(v) for k, v in rows},
@@ -1194,12 +1279,11 @@ async def usage(days: int = Query(30, ge=1, le=365),
             "by_session": sessions,
             "agent_facets": agent_facets,
             "model_facets": model_facets,
-            "by_agent": {k or "unknown": {
-                "calls": int(c), "tokens": int(t), "prompt": int(p), "cached": int(ca),
-                "cache_hit_rate": _rate(int(ca), int(p), int(rep)),
-                "tokens_per_sec": round(int(ct) / (int(ms) / 1000), 1)
-                if int(ms) > 0 and int(ct) > 0 else None}
-                for k, c, t, p, ca, rep, ct, ms in by_agent},
+            "by_agent": {k: {
+                "calls": v[0], "tokens": v[1], "prompt": v[2], "cached": v[3],
+                "cache_hit_rate": _rate(v[3], v[2], v[4]),
+                "tokens_per_sec": _tps(v[5], v[6])}
+                for k, v in ag.items()},
         }
 
 

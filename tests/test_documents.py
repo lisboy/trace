@@ -219,6 +219,153 @@ def test_empty_docx(docs_ws: Path) -> None:
     assert text == "（文档为空）"
 
 
+def _build_rich_docx(ws: Path) -> Path:
+    """构造一份「文字之外还有东西」的 docx：图片/图表/内嵌 Excel/文本框/页眉页脚/批注。"""
+    import io
+    import zipfile
+
+    import docx
+    import openpyxl
+    from docx.oxml import parse_xml
+    from docx.oxml.ns import nsdecls
+    from docx.shared import Inches
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 48), (200, 30, 30)).save(buf, "PNG")
+    (ws / "pic.png").write_bytes(buf.getvalue())
+
+    doc = docx.Document()
+    doc.add_paragraph("第一段：需求说明。")
+    doc.add_picture(str(ws / "pic.png"), width=Inches(1))
+    doc.add_paragraph("图片之后。")
+    doc.element.body.append(parse_xml(
+        f'<w:p {nsdecls("w")}><w:r><w:pict xmlns:v="urn:schemas-microsoft-com:vml">'
+        '<v:shape style="width:200pt;height:40pt"><v:textbox><w:txbxContent>'
+        '<w:p><w:r><w:t>文本框：血条宽度=120</w:t></w:r></w:p>'
+        '</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>'))
+    doc.sections[0].header.paragraphs[0].text = "项目：霜尾 Demo"
+    doc.add_comment(runs=doc.paragraphs[0].runs[0], text="补充数值", author="策划A", initials="CA")
+    doc.save(ws / "rich.docx")
+
+    wb = openpyxl.Workbook()
+    wb.active.title = "敌人配置"
+    wb.active.append(["关卡", "数量"])
+    wb.active.append(["一关", 12])
+    xbuf = io.BytesIO()
+    wb.save(xbuf)
+
+    chart_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"'
+        ' xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart>'
+        '<c:title><c:tx><c:rich><a:p><a:r><a:t>通关率</a:t></a:r></a:p></c:rich></c:tx></c:title>'
+        '<c:plotArea><c:barChart><c:ser><c:idx val="0"/><c:order val="0"/>'
+        '<c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>通关率</c:v></c:pt></c:strCache></c:strRef></c:tx>'
+        '<c:cat><c:strRef><c:strCache><c:pt idx="0"><c:v>一关</c:v></c:pt></c:strCache></c:strRef></c:cat>'
+        '<c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>0.8</c:v></c:pt></c:numCache></c:numRef></c:val>'
+        '</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>')
+
+    path = ws / "rich.docx"
+    with zipfile.ZipFile(path) as src:
+        items = {n: src.read(n) for n in src.namelist()}
+    items["word/embeddings/sheet1.xlsx"] = xbuf.getvalue()
+    items["word/charts/chart1.xml"] = chart_xml.encode("utf-8")
+    items["[Content_Types].xml"] = items["[Content_Types].xml"].decode("utf-8").replace(
+        "</Types>",
+        '<Default Extension="xlsx" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"/>'
+        '<Override PartName="/word/charts/chart1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>'
+    ).encode("utf-8")
+    items["word/_rels/document.xml.rels"] = items["word/_rels/document.xml.rels"].decode("utf-8").replace(
+        "</Relationships>",
+        '<Relationship Id="rIdOle1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" '
+        'Target="embeddings/sheet1.xlsx"/>'
+        '<Relationship Id="rIdChart1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" '
+        'Target="charts/chart1.xml"/></Relationships>'
+    ).encode("utf-8")
+    ole = ('<w:p><w:r><w:object>'
+           '<v:shape xmlns:v="urn:schemas-microsoft-com:vml" style="width:100pt;height:60pt"/>'
+           '<o:OLEObject xmlns:o="urn:schemas-microsoft-com:office:office" Type="Embed" '
+           'ProgID="Excel.Sheet.12" ShapeID="_x0000_i1025" r:id="rIdOle1"/></w:object></w:r></w:p>')
+    chart = ('<w:p><w:r><w:drawing xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">'
+             '<wp:inline><wp:extent cx="5486400" cy="3200400"/><wp:docPr id="9" name="图表 1"/>'
+             '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+             '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">'
+             '<c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" '
+             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rIdChart1"/>'
+             '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>')
+    items["word/document.xml"] = items["word/document.xml"].decode("utf-8").replace(
+        "<w:sectPr", ole + chart + "<w:sectPr").encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as dst:
+        for n, b in items.items():
+            dst.writestr(n, b)
+    return path
+
+
+def test_docx_exports_images_embedded_sheet_chart_textbox_and_comments(docs_ws: Path) -> None:
+    _build_rich_docx(docs_ws)
+    text, _ = _read_all(docs_ws, "rich.docx")
+
+    # 图片导出了真实文件，并在正文原位置留了可用 view_image 的路径
+    exported = [p for p in (docs_ws / ".trace" / "docx-assets").rglob("*.png")]
+    assert exported, "图片没有导出"
+    rel = exported[0].relative_to(docs_ws).as_posix()
+    assert f"[图片 1（64×48，PNG） → {rel}]" in text
+    # 分页读完时，页脚要提示图片落在哪、怎么看（提示只在最后一页的页脚里）
+    assert "view_image" in _parse(docs_ws, "rich.docx")
+
+    # 内嵌 Excel 展开成 TSV
+    assert "[内嵌表格开始]" in text and "[内嵌表格结束]" in text
+    assert "[内嵌表格 1/1：敌人配置" in text
+    assert "关卡\t数量" in text and "一关\t12" in text
+
+    # 图表缓存值
+    assert "[图表 1：柱状图" in text and "「通关率」：一关=0.8" in text
+
+    # 文本框、批注、页眉
+    assert "[文本框 1：文本框：血条宽度=120]" in text
+    assert "[批注 1（策划A）：补充数值]" in text
+    assert "[页眉]" in text and "项目：霜尾 Demo" in text
+
+
+def test_docx_embedded_non_excel_object_is_reported(docs_ws: Path) -> None:
+    import zipfile
+
+    _build_rich_docx(docs_ws)
+    path = docs_ws / "rich.docx"
+    with zipfile.ZipFile(path) as src:
+        items = {n: src.read(n) for n in src.namelist()}
+    items["word/embeddings/blob1.bin"] = b"\x00\x01binary"
+    items["[Content_Types].xml"] = items["[Content_Types].xml"].decode("utf-8").replace(
+        '</Types>', '<Default Extension="bin" ContentType="application/octet-stream"/></Types>'
+    ).encode("utf-8")
+    items["word/_rels/document.xml.rels"] = items["word/_rels/document.xml.rels"].decode("utf-8").replace(
+        "</Relationships>",
+        '<Relationship Id="rIdOle2" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" '
+        'Target="embeddings/blob1.bin"/></Relationships>'
+    ).encode("utf-8")
+    items["word/document.xml"] = items["word/document.xml"].decode("utf-8").replace(
+        "<w:sectPr",
+        '<w:p><w:r><w:object><o:OLEObject xmlns:o="urn:schemas-microsoft-com:office:office" '
+        'Type="Embed" ProgID="Package" ShapeID="_x0000_i1026" r:id="rIdOle2"/></w:object></w:r></w:p><w:sectPr'
+    ).encode("utf-8")
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as dst:
+        for n, b in items.items():
+            dst.writestr(n, b)
+
+    text, _ = _read_all(docs_ws, "rich.docx")
+    assert "内嵌文件：blob1.bin" in text and "另存为独立文件" in text
+
+
+def test_docx_without_text_extras_has_no_empty_hint(docs_ws: Path) -> None:
+    text, _ = _read_all(docs_ws, "t.docx")
+    assert "docx-assets" not in text and "图片" not in text and "批注" not in text
+
+
 def test_pdf_no_text_layer_hint(docs_ws: Path) -> None:
     result = _parse(docs_ws, "t.pdf")
     assert "共 1 页" in result
@@ -413,6 +560,52 @@ def test_seed_preserves_custom_skills(skills_dir: Path, flat: bool) -> None:
     assert path.read_text(encoding="utf-8") == custom
     assert (skills_dir / ".builtin-seeded").read_text(encoding="utf-8") == skills._BUILTIN_SKILLS_VERSION
     assert seed_builtin_skills() == []
+
+
+def test_seeded_builtin_skill_is_upgraded_when_unchanged(skills_dir: Path) -> None:
+    """内置正文升级：用户没改过的老版本自动刷新，不用等用户手动删。"""
+    seed_builtin_skills()
+    path = skills_dir / "word" / "SKILL.md"
+    stale = "---\nname: word\ndescription: 旧\n---\n\n旧的正文内容"
+    path.write_text(stale, encoding="utf-8")
+    # 模拟「这份旧文件就是当时内置写下的」：登记它的哈希
+    skills._write_seeded_hashes({
+        **skills._load_seeded_hashes(),
+        "word": skills._text_hash(stale),
+    })
+    (skills_dir / ".builtin-seeded").write_text("0", encoding="utf-8")
+    assert "word" in seed_builtin_skills()
+    new = path.read_text(encoding="utf-8")
+    assert "内嵌表格" in new and "view_images" in new and "旧的正文内容" not in new
+
+
+def test_seeded_builtin_skill_upgrades_from_known_previous_version(skills_dir: Path) -> None:
+    """从老版本升级上来（没有哈希记录文件）也能安全刷新内置原文。"""
+    seed_builtin_skills()
+    path = skills_dir / "word" / "SKILL.md"
+    old_hash = skills._PREVIOUS_BUILTIN_HASHES["word"][0]
+    path.write_text("---\nname: word\ndescription: 旧\n---\n\n老版本内置正文", encoding="utf-8")
+    (skills_dir / ".builtin-hashes.json").unlink(missing_ok=True)   # 老版本没写过这个文件
+    (skills_dir / ".builtin-seeded").write_text("0", encoding="utf-8")
+
+    original = skills._text_hash
+    skills._text_hash = lambda text: old_hash if "老版本内置正文" in text else original(text)
+    try:
+        assert "word" in seed_builtin_skills()
+    finally:
+        skills._text_hash = original
+    new = path.read_text(encoding="utf-8")
+    assert "内嵌表格" in new and "老版本内置正文" not in new
+
+
+def test_user_modified_builtin_skill_is_never_overwritten(skills_dir: Path) -> None:
+    seed_builtin_skills()
+    path = skills_dir / "word" / "SKILL.md"
+    custom = "---\nname: word\ndescription: 我的\n---\n\n用户自己改过的正文"
+    path.write_text(custom, encoding="utf-8")
+    (skills_dir / ".builtin-seeded").write_text("0", encoding="utf-8")
+    assert "word" not in seed_builtin_skills()
+    assert path.read_text(encoding="utf-8") == custom
 
 
 @pytest.mark.parametrize("partial", [False, True])

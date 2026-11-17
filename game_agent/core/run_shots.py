@@ -34,12 +34,6 @@ def _root() -> Path:
     return DATA_DIR / "run_shots"
 
 
-def _safe_seg(v: object) -> str:
-    s = str(v or "").strip().replace("\\", "/").strip("/")
-    s = s.replace("/", "_")
-    return s or "_"
-
-
 def norm_id(v: object) -> str:
     """UUID 归一化：ORM 给带横线、裸 SQL 给 32 位 hex，两边直接比会全部落空
     （聊天附图迁移第一版一条没搬就是这个坑）。目录命名与团队校验都走这里。"""

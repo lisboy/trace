@@ -41,9 +41,11 @@
 
 ### 现状
 - `runtime.py::_make_thinking_streamer`（约 L888）：LLM 增量攒批（0.4s / 160 字符）以 `agent_thinking_delta` 实时推送；整轮完整版以 `agent_thinking` 落库，前端刷新后以完整版为准。
-- ✅ **尾部优先截断已落地**：`_tail_keep_head(text, limit, head=80)`（`runtime.py` L88）统一「前 80 字锚点 + …[中略]… + 尾部主体」，思考落库调用点 L1086（主体轮）与 L1438（收尾轮），参数 `limit=4000`。
-- ✅ **续跑摘要已取尾部**：`runs.py::_tail_head(s, limit, head=80)`（L822），`_findings_brief`（L879）对工具结果与思考均按尾部优先截断。
-- ✅ **前端长思考已折叠**：`RunTraceInline.tsx::ThinkRowBase`（L646）——思考行摘要只显示前 200 字（`THINK_COLLAPSE = 200`），点开 `<details>` 风格面板看全文（`max-h-72 overflow-y-auto`），长思考不再把整段文字铺在轨迹里。
+- ✅ **尾部优先截断已落地**：`_tail_keep_head(text, limit, head=80)`（`runtime.py` L181）统一「前 80 字锚点 + …[中略 N 字]… + 尾部主体」，思考落库调用点 L1504（主体轮）与 L1968（收尾轮），参数 `limit=4000`。
+  - 2026-11-17 补强：切点先用 `_snap_head_end` / `_snap_tail_start` 吸附到换行/句末标点（窗口 80 字），不再按字符硬切出「…传」这种半句；标记里写明中间省略了多少字。
+- ✅ **续跑摘要已取尾部**：`runs.py::_tail_head(s, limit, head=80)`（L1168），标记同样带省略字数；`_findings_brief` 对工具结果与思考均按尾部优先截断。
+- ✅ **前端长思考已折叠**：`RunTraceInline.tsx::ThinkRowBase`（L~1287）——思考行摘要只显示前 200 字（`THINK_COLLAPSE = 200`），点开面板看全文（`max-h-72 overflow-y-auto`），长思考不再把整段文字铺在轨迹里。
+  - 2026-11-17 补强：截断标记不再当正文铺出来。`frontend/src/elided.ts::splitElided` 把「头 / 中略 / 尾」拆开，折叠行显示「⋯[中间省略 N 字]⋯」，展开后中间是一条琥珀色分隔线；工具结果 `<pre>` 与 `ContextTrace` 的思考块走 `decorateElided` 换成「此处中间省略 N 字：原始内容太长，未保存全文」。
 - 子智能体（sub/artist/voice/tester）的 thinking 同样落库并走同一截断；`_findings_brief` 目前未按角色区分。
 
 ### 问题（剩余）
@@ -253,11 +255,11 @@
 ### 本次 v0.2 的验证清单
 | 项 | 验证动作 | 通过标准 |
 |---|---|---|
-| §1.1 思考尾部截断 | 跑一条会产生长思考的任务，查 `agent_thinking` 事件正文 | 超 4000 字时正文是「前 80 字 + …[中略]… + 尾部」 |
-| §1.3 思考折叠 | 前端轨迹看长思考行 | 摘要 ≤200 字，点开才显示全文 |
+| §1.1 思考尾部截断 | 跑一条会产生长思考的任务，查 `agent_thinking` 事件正文 | 超 4000 字时正文是「前 80 字 + …[中略 N 字]… + 尾部」，切点落在换行/句末 |
+| §1.3 思考折叠 | 前端轨迹看长思考行 | 摘要 ≤200 字，点开才显示全文；中略标记渲染成「⋯[中间省略 N 字]⋯」而不是原样铺出 |
 | §4.2 页面隐藏停轮询 | 浏览器 Network 面板切到后台 | `hidden` 时无 `/messages`、`/runs/.../transcript` 请求；回前台立即补一次 |
 | §5.1 签名归一化 | 连续用带时间戳参数的同一工具 | 签名一致，触发循环守卫 |
-| §5.2 工具结果尾部优先 | 超长工具结果在轨迹里 | 显示「前 80 字 + …[中略]… + 尾部」，`[Sources]` 完整 |
+| §5.2 工具结果尾部优先 | 超长工具结果在轨迹里 | 显示「前 80 字 + …[中略 N 字]… + 尾部」（展开时标记换成一句人话），`[Sources]` 完整 |
 | §10 子 agent 并行 | 对话派发 `spawn_agents` 核对多个文件 | 轨迹出现多条「子agent」行、并行完成、结论汇总 |
 | §1.1/§5.1/§5.2 单测 | `pytest tests/test_tail_and_sig.py tests/test_spawn_agents.py -q` | 15 passed（截断尾部优先/签名归一化/并行派发/失败隔离/上限截断） |
 

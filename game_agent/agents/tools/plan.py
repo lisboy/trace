@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from game_agent.agents.tools import ToolContext, ToolError
 
-# 对外暴露的三态；模型偶尔会写中文/别名，这里统一归一
-PLAN_STATUSES = ("pending", "in_progress", "completed")
+# 三态取值由 _STATUS_ALIASES / _STATUS_MARK / _STATUS_LABEL 三张表统一维护
+# （模型偶尔会写中文/别名，这里统一归一）
 _STATUS_ALIASES = {
     "pending": "pending", "todo": "pending", "wait": "pending", "waiting": "pending",
     "未开始": "pending", "待办": "pending", "待处理": "pending", "": "pending",
@@ -29,6 +29,36 @@ _STATUS_LABEL = {"completed": "已完成", "in_progress": "进行中", "pending"
 MAX_ITEMS = 20
 MAX_CONTENT = 200
 MAX_NOTE = 300
+
+# ── 「汇报项」识别 ────────────────────────────────────────────────────────────
+# 清单里「向用户汇报结论」这类项，是**收尾动作**，不是可执行的工作。
+# 它永远轮不到模型自己打勾：打勾唯一途径是 update_plan，而模型一旦把前面的活
+# 做完就直接调 report_to_user 收尾了，不会再回来补一次 update_plan。
+# 实测（2026-11-16 读库 307 份清单）：97 份清单把「汇报」列成一项，其中 34 个
+# run 收尾时就卡在这一项 → 被判「还有 1 项没打勾」→ 凭空多出一轮自动续跑，
+# 而且续跑要求它做的正是「把这次汇报做完」，新一轮照样卡同一项，直到额度烧完。
+# 所以收尾时把**纯汇报项**直接收口，只有真带别的活儿的项（「起服务截图验收并汇报」）
+# 才继续算未完成。判定器写得保守：命中任一「实际工作」词就不算纯汇报。
+_REPORT_WORDS = ("汇报", "总结", "汇总", "复盘")
+_WORK_WORDS = (
+    "起服务", "起本地服务", "启动服务", "重启", "服务", "截图", "验收", "实测", "联调",
+    "端到端", "构建", "build", "编译", "打包", "部署", "发布", "跑", "测试", "单测",
+    "校验", "验证", "分析", "核对", "对比", "排查", "定位", "梳理", "拆分", "读",
+    "写", "改", "生成", "产出", "同步", "回填", "修", "实现", "接入", "清理",
+    "删除", "安装", "迁移", "登记", "更新", "补", "查", "优化",
+)
+
+
+def is_report_only_item(item: object) -> bool:
+    """该项是不是「只汇报」（纯收尾动作，无实际工作可做）。
+
+    只认字符串项里同时满足：①含汇报类词；②不含任何实际工作动词。
+    """
+    content = str((item or {}).get("content") or "").strip() if isinstance(item, dict) \
+        else str(item or "").strip()
+    if not content or not any(w in content for w in _REPORT_WORDS):
+        return False
+    return not any(w in content for w in _WORK_WORDS)
 
 
 def norm_status(raw: object) -> str:

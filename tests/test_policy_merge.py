@@ -11,8 +11,6 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from sqlalchemy import select
-
 from game_agent.db.models import Settings
 from game_agent.db.session import SessionLocal
 from game_agent.orchestration import policy as policy_mod

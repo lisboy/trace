@@ -59,8 +59,6 @@ CHANNELS: dict[str, dict[str, Any]] = {
     },
 }
 
-_MASK = "******"
-
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
@@ -463,8 +461,3 @@ async def notify_run_finished(sf: async_sessionmaker, *, run_id: str, team_id, s
         log.exception("notify_run_finished failed")
         return []
 
-
-def mask_secret(v: str | None) -> str:
-    if not v:
-        return ""
-    return _MASK

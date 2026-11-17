@@ -22,7 +22,7 @@ from game_agent.agents.tools.question import AskUserStop
 from game_agent.config import (AUTO_CONTINUE_MAX, COMFYUI_BASE_URL, LOCK_TTL_S, LOCK_WAIT_S,
                                LLM_MODEL, MAX_CONCURRENT_RUNS, PLATFORM,
                                PROJECTS_ROOT, ROLE_MODELS, SAME_PROJECT_PARALLEL, SHELL_NAME,
-                               default_python_bin)
+                               SUBAGENT_TIMEOUT_S, default_python_bin)
 from game_agent.core.abstractions import EventEnvelope, FencingLost
 from game_agent.core.context import RunContext
 from game_agent.core.lite.container import CoreServices
@@ -572,11 +572,18 @@ class Orchestrator:
             # 的待办塞进续跑，确保这次「不判 failed」不会被理解成「这次就到此为止了」。
             # 续跑只是入队（毫秒级），留在 run_done 之前，保证「排队续跑」的提示先到、终态后到。
             ac_open = open_items
+            ac_survey_only = False
             if landed_zero and not ac_open:
+                # 这一条**不在 plan_json 里**，模型永远打不上勾，所以续跑说明不能把它
+                # 说成「清单还有 1 项没打勾」——那样下一轮开头就得先找这份不存在的清单
+                # （实测 2026-11-13：续跑那轮整轮都在找「磁盘上没有痕迹的那 1 项」，白跑）。
+                # 传 survey_only 让措辞说实话：上一轮只勘察没落地。
+                ac_survey_only = True
                 ac_open = [{"content": "把上一轮只做了勘察/定位、还没落地的活做完",
                             "status": "pending", "note": "上一轮未落地"}]
             await self._auto_continue(run_ctx, run, plan_items, ac_open,
-                                      final_summary, workspace)
+                                      final_summary, workspace,
+                                      survey_only=ac_survey_only)
             # run_done 必须紧贴「回复已落地 + 续跑已入队」发出：前端的完成提醒
             # （提示音 + 桌面通知）就是靠它触发的。以前它排在 AI 记忆合并（最长 90s）
             # 和经验沉淀（最长 60s）之后，用户看着回复早出来了、提醒却要等一两分钟——
@@ -905,6 +912,10 @@ class Orchestrator:
         # 一段说明（让主agent 继续）」。为什么不区分就必出错：子agent 被单独点掉时若直接
         # raise，CancelledError 会穿过 spawn_agents 的 asyncio.gather，把主agent 一起打断。
         cancel_scope: dict[str, str | None] = {"scope": None}
+        # 子agent 的挂钟死线：卡在一次长工具调用/长思考里时不能无限等——到点由看门狗掐掉。
+        # 只影响这一条子任务（和用户单独点停走同一条路），不连带整轮，状态记 failed/超时。
+        sub_deadline = (time.monotonic() + SUBAGENT_TIMEOUT_S
+                        if role == "sub" and SUBAGENT_TIMEOUT_S > 0 else None)
 
         async def _watch_cancel(rt_task: "asyncio.Task") -> None:
             """取消看门狗：用户点「取消」后立即把 agent 任务掐掉。
@@ -943,6 +954,16 @@ class Orchestrator:
                                             "role": role, "task_id": str(task.id)})
                             rt_task.cancel()
                             return
+                        # 挂钟超时：一条子agent 卡住不能让整批永远收不回来
+                        # （界面上就是「还有 N 个子agent 在后台跑」一直转）。
+                        if sub_deadline is not None and time.monotonic() > sub_deadline:
+                            cancel_scope["scope"] = "timeout"
+                            log.warning("subagent exceeded %ss, cancelling it",
+                                        SUBAGENT_TIMEOUT_S,
+                                        extra={"run_id": run_ctx.run_id, "role": role,
+                                               "task_id": str(task.id)})
+                            rt_task.cancel()
+                            return
                 except asyncio.CancelledError:
                     if rt_task.done():
                         return
@@ -955,12 +976,24 @@ class Orchestrator:
         try:
             result = await agent_task
         except asyncio.CancelledError:
+            _scope = cancel_scope["scope"]
+            if role == "sub" and _scope == "timeout":
+                # 子agent 超时：落成 failed（前端能看到「超时」而不是一直 running），
+                # 并把「没跑完」如实回给主agent——它可以自己接手，或把任务拆小再派。
+                await repo.update_task(str(task.id), status="failed", finished_at=_now(),
+                                      result_json={"error": f"子agent 超时（>{SUBAGENT_TIMEOUT_S}s）"})
+                await self._emit(run_ctx, "task_done",
+                                 {"task_id": str(task.id), "role": role,
+                                  "status": "failed", "error": "超时未完成"})
+                return AgentResult(text=(
+                    f"[sub] 超过 {SUBAGENT_TIMEOUT_S}s 没跑完，已超时停止（本次核对未完成）。"
+                    "别等它了：要么自己接手查这部分，要么把问题拆小、收窄范围后重新派。"))
             await repo.update_task(str(task.id), status="cancelled", finished_at=_now())
             await self._emit(run_ctx, "task_done",
                              {"task_id": str(task.id), "role": role, "status": "cancelled"})
             # 单个子agent 被用户单独点掉：不向上抛（否则会连带打断主agent），
             # 回一段「已停止」的说明给主agent，让它知道这条线索没跑完、可以自己接手或再派。
-            if role == "sub" and cancel_scope["scope"] == "task":
+            if role == "sub" and _scope == "task":
                 return AgentResult(text="[sub] 已按用户要求停止这个子agent（本次核对未完成）。")
             raise
         except FencingLost:
@@ -1228,20 +1261,46 @@ class Orchestrator:
         模型交回「128 条只写了 32 条、其余见下一步」的半成品汇报，界面却显示
         「待办清单 7/7 已完成 + 执行完毕」——用户看到的那句「做完了」是系统编的。
         现在只补一句诚实的 note，勾留给模型自己打（runtime 会打回要求它继续做）。
+
+        **例外：纯汇报项直接收口。**「向用户汇报结论」这类项没有任何可执行的工作，
+        而且模型根本打不上勾——它做完前面的活就直接 report_to_user 收尾，不会再回来
+        调一次 update_plan。实测 307 份清单里 97 份列了汇报项，其中 34 个 run 就卡在
+        这一项上被判「还没做完」，凭空多催一轮自动续跑（续跑要求它做的正是「把这次
+        汇报做完」，于是下一轮同样卡住）。这类项收尾时视为已完成并写明原因。
         """
         try:
+            from game_agent.agents.tools.plan import is_report_only_item
             run = await self.svcs.repo.get_run(run_ctx.run_id)
             items = [dict(i or {}) for i in (getattr(run, "plan_json", None) or [])]
             open_items = [i for i in items if str(i.get("status")) != "completed"]
             if not open_items:
                 return items, []
+            closed_report: list[dict] = []
+            still_open: list[dict] = []
             for it in open_items:
-                base = (it.get("note") or "").strip()
-                tail = "这次执行结束时仍未完成"
-                it["note"] = f"{base}；{tail}" if base and tail not in base else (base or tail)
-            await self.update_plan(run_ctx, items,
-                                   summary=f"这次执行结束：{len(open_items)} 项未完成")
-            return items, open_items
+                if is_report_only_item(it):
+                    # 收尾动作已由 report_to_user 完成（final_summary 就是那份汇报），
+                    # 不再挂着「未完成」去催下一轮。
+                    it["status"] = "completed"
+                    base = (it.get("note") or "").strip()
+                    tail = "本次收尾汇报已完成"
+                    it["note"] = f"{base}；{tail}" if base and tail not in base else (base or tail)
+                    closed_report.append(it)
+                else:
+                    base = (it.get("note") or "").strip()
+                    tail = "这次执行结束时仍未完成"
+                    it["note"] = f"{base}；{tail}" if base and tail not in base else (base or tail)
+                    still_open.append(it)
+            if closed_report:
+                log.info("close out plan: %s 个纯汇报项按已完成收口，剩余未完成 %s 项",
+                         len(closed_report), len(still_open),
+                         extra={"run_id": run_ctx.run_id})
+            if still_open:
+                await self.update_plan(run_ctx, items,
+                                       summary=f"这次执行结束：{len(still_open)} 项未完成")
+            elif closed_report:
+                await self.update_plan(run_ctx, items, summary="这次执行结束：清单已全部完成")
+            return items, still_open
         except Exception:  # noqa: BLE001 - 收尾失败不影响主流程
             log.exception("close out plan failed", extra={"run_id": run_ctx.run_id})
             return [], []
@@ -1272,13 +1331,17 @@ class Orchestrator:
 
     async def _auto_continue(self, run_ctx: RunContext, run, plan_items: list[dict],
                              open_items: list[dict], final_summary: str,
-                             workspace: str) -> Optional[str]:
+                             workspace: str, *, survey_only: bool = False) -> Optional[str]:
         """成功收尾但清单还有未完成项 → 自动排队一条「接着做」的新 run。
 
         为什么系统代劳：上一轮 128 条只写了 32 条，模型把剩下的写成「四、下一步
         （按这个顺序直接续）」交回来，run 却是 succeeded——用户不自己发现并点「继续」，
         活儿就永远停在那儿。这正是要消灭的「只做到一半」，所以由收尾流程直接续跑，
         而不是等人来催。未完成项、上次汇报的「下一步」原文都会塞进续跑说明。
+
+        ``survey_only``：上一轮只勘察/定位、零落地，且模型根本没立清单。此时
+        ``open_items`` 是临时造的、不在 plan_json 里，续跑说明必须按「上一轮没落地」
+        说实话，不能宣称「清单还有 N 项没打勾」——模型会去找那份不存在的清单。
         """
         if not open_items or getattr(run, "run_type", "") != "modify":
             return None
@@ -1314,9 +1377,12 @@ class Orchestrator:
                     return None  # 它在等用户拍板，不是等自己续跑
                 parts = [
                     self._AUTO_BRIEF_PREFIX,
-                    f"上一次执行结束时待办清单还有 {len(open_items)} 项没打勾，"
-                    "系统已自动接着往下做。这次的目标就是把这些做完——全部 completed 才算交付。",
-                    "上次计划进度：\n" + plan_lines,
+                    ("上一次执行只做了勘察/定位，没有任何落地（没写文件、没出产物），"
+                     "而且没有留下待办清单。这次的目标是把活真正做出来——落地了才算交付。"
+                     if survey_only else
+                     f"上一次执行结束时待办清单还有 {len(open_items)} 项没打勾，"
+                     "系统已自动接着往下做。这次的目标就是把这些做完——全部 completed 才算交付。"),
+                    "上次计划进度：\n" + (plan_lines or "（上一轮没有立清单）"),
                 ]
                 if (final_summary or "").strip():
                     parts.append("上一次执行的汇报（结尾若写「下一步」，那是派给你做的，"
@@ -1344,11 +1410,15 @@ class Orchestrator:
                     "确实做不了的保持未完成并在 note 写清卡点。"
                     "不要重新提问、不要重新勘察全局、不要交「下一步怎么做」的报告。")
                 brief = "\n\n".join(parts)
+                # survey_only 时 open_items 是临时造的、不在 plan_json 里，界面若说
+                # 「清单还有 1 项没做完」就是编的（实测用户会被这句话误导去翻清单，
+                # 而清单根本不存在）。用 survey_only 标记让前端说实话。
                 msg = Message(session_id=_u(run.session_id), run_id=None, author_type="user",
                               author_id=_u(run.triggered_by), content="继续完成任务目标",
                               meta_json={"auto_continue_from": str(run.id),
                                          "auto_continue_depth": depth + 1,
-                                         "open_count": len(open_items),
+                                         "open_count": 0 if survey_only else len(open_items),
+                                         "survey_only": survey_only,
                                          "brief": brief})
                 s.add(msg)
                 await s.flush()
@@ -1373,9 +1443,13 @@ class Orchestrator:
             await self._emit(run_ctx, "message_new", {
                 "session_id": str(run_ctx.session_id), "message_id": str(msg.id)})
             await self._emit(run_ctx, "status", {"status": "running",
-                                                "note": (f"清单还有 {len(open_items)} 项未完成，"
-                                                         f"已自动排队续跑（第 {depth + 1}/"
-                                                         f"{AUTO_CONTINUE_MAX} 次）")})
+                                                "note": (("上一轮只勘察没落地，"
+                                                          f"已自动排队续跑（第 {depth + 1}/"
+                                                          f"{AUTO_CONTINUE_MAX} 次）")
+                                                         if survey_only else
+                                                         (f"清单还有 {len(open_items)} 项未完成，"
+                                                          f"已自动排队续跑（第 {depth + 1}/"
+                                                          f"{AUTO_CONTINUE_MAX} 次）"))})
             log.info("auto-continue enqueued", extra={"run_id": str(run.id),
                                                       "next_run": new_id, "depth": depth + 1})
             return new_id

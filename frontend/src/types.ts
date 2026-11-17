@@ -90,6 +90,50 @@ export interface ContextOccupancy {
   skewed_usage_calls: number; // 端点把累计量塞进单次 usage 的轮数（比例参考价值下降）
 }
 
+/** 一份用量拆分（主对话 / 子agent） */
+export interface UsageSplit {
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+/** 本会话跑过的单个子agent（spawn_agents 派出的只读调研） */
+export interface SubagentItem {
+  task_id: string;
+  run_id: string;
+  run_created_at: string | null;
+  /** 名字（后端已去掉「子agent · 」前缀） */
+  name: string;
+  question: string;
+  status: string;
+  cancel_requested: boolean;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  elapsed_ms: number;
+  /** 该子agent 所在 run 的子agent token 合计（llm_calls 无 task_id，只能到 run 粒度） */
+  run_usage: UsageSplit & { latency_ms?: number } | null;
+  /** task.result_json.text：子agent 的收尾结论（老 run 的 task_done 没带 summary 时的兜底） */
+  summary?: string | null;
+}
+
+/** GET /sessions/{id}/subagents 的返回 */
+export interface SubagentList {
+  session_id: string;
+  totals: {
+    count: number;
+    running: number;
+    failed: number;
+    calls: number;
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  };
+  items: SubagentItem[];
+}
+
 export interface SessionUsage {
   session_id: string;
   runs: number;
@@ -127,8 +171,11 @@ export interface SessionUsage {
   cache_hit_rate: number | null; // 0-100，null=无缓存信息
   /** 端点是否上报过缓存字段：false 时候弹层写「未上报」，不把「没数据」说成 0% */
   cache_reported?: boolean;
-  context: ContextOccupancy | null; // 占用比例最高的角色
+  context: ContextOccupancy | null; // 主对话角色的占用（子agent 不占这一格）
   context_by_agent: ContextOccupancy[];
+  /** 本会话跑过的子agent 条数/在跑数：只看数量，明细走 /sessions/{id}/subagents。
+   *  本接口所有用量数字都**不含子agent**（子和主分开统计，2026-11-16 用户要求）。 */
+  subagents?: { count: number; running: number };
   compress_at_pct: number; // 到这条百分比就开始压缩历史
   /** 会话累计动作（分桶口径与执行轨迹那行摘要一致） */
   activity?: {
@@ -411,6 +458,10 @@ export interface RunUsage {
   cache_hit_rate?: number | null;
   latency_ms: number;
   tokens_per_sec: number | null;
+  /** 以上都是**主对话**口径（不含子agent）；这两格是子agent 在同一个 run 里的用量，
+   *  只用于提示「另有 N 次子agent 调用」，明细在运行面板「子agent」标签 */
+  sub_calls?: number;
+  sub_tokens?: number;
 }
 
 export interface ChangeReport {

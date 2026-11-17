@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>循迹桌宠 · 霜尾</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        /* 透明窗里不能有任何不透明底色，否则整块矩形会挡住桌面 */
+        -webkit-user-select: none;
+        user-select: none;
+        cursor: default;
+      }
+      #stage {
+        position: absolute;
+        inset: 0;
+      }
+
+      /* ---------------- 立绘 ---------------- */
+      /* 底边对齐 + 以脚底为变换原点：呼吸/跳跃/转身都绕脚底发生，
+         看起来才像「站在桌上」而不是「浮在图片里」。 */
+      #pet {
+        position: absolute;
+        left: 50%;
+        bottom: 3%;
+        transform-origin: bottom center;
+        max-height: 90%;
+        max-width: 92%;
+        will-change: transform;
+        /* 只做亚像素级位移，避免缩放时糊掉 */
+        image-rendering: auto;
+        -webkit-user-drag: none;
+        pointer-events: none; /* 命中判定由 JS 按 alpha 做，不走 DOM 事件 */
+      }
+
+      /* ---------------- 脚下光环 ---------------- */
+      /* 宽度/高度由 pet.js 每帧按窗口宽度算（见 layoutPet），这里只管样式。
+         --hover 由悬停反馈设置：0=常态 1=指针压在身体上，光环随之变亮，
+         让「鼠标放到某处有反应」这件事在不挪动立绘的前提下也看得见。 */
+      #ring {
+        position: absolute;
+        left: 50%;
+        bottom: 1.2%;
+        transform: translateX(-50%);
+        border-radius: 50%;
+        border: 2px solid rgba(143, 201, 255, 0.55);
+        box-shadow: 0 0 12px rgba(143, 201, 255, 0.45) inset,
+          0 0 10px rgba(143, 201, 255, 0.3);
+        opacity: calc(0.8 + var(--hover, 0) * 0.2);
+        transition: box-shadow 0.18s ease, border-color 0.18s ease, opacity 0.18s ease;
+        pointer-events: none;
+      }
+      /* 悬停时环变亮一点，作为「光标确实压在它身上」的视觉确认 */
+      #ring.hover {
+        border-color: rgba(186, 226, 255, 0.95);
+        box-shadow: 0 0 16px rgba(143, 201, 255, 0.7) inset,
+          0 0 16px rgba(143, 201, 255, 0.6);
+      }
+      /* 沿环跑的光点 */
+      #ring .dot {
+        position: absolute;
+        width: 7px;
+        height: 7px;
+        margin: -3.5px 0 0 -3.5px;
+        border-radius: 50%;
+        background: #eaf7ff;
+        box-shadow: 0 0 8px 2px rgba(124, 198, 255, 0.9);
+        left: 50%;
+        top: -3px;
+      }
+
+      /* ---------------- 头顶气泡 ---------------- */
+      /* 透明窗里大面积 box-shadow 会合成出一圈脏边，
+         所以只用细描边 + 一层很轻的偏移阴影。 */
+      #bubble {
+        position: absolute;
+        left: 50%;
+        top: 8px;
+        transform: translate(-50%, -6px) scale(0.92);
+        max-width: 86%;
+        padding: 7px 11px;
+        border-radius: 12px;
+        background: #ffffff;
+        border: 1px solid rgba(31, 95, 208, 0.35);
+        color: #12233d;
+        font: 500 13px/1.45 "Microsoft YaHei", system-ui, sans-serif;
+        text-align: center;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.18s ease, transform 0.18s ease;
+        box-shadow: 0 2px 6px rgba(12, 32, 66, 0.14);
+      }
+      #bubble.show {
+        opacity: 1;
+        transform: translate(-50%, 0) scale(1);
+      }
+      /* 情绪配色：同一句话，卖萌/高冷/生气读起来要不一样 */
+      #bubble[data-mood="cute"] {
+        border-color: rgba(255, 138, 178, 0.75);
+        color: #9c2050;
+      }
+      #bubble[data-mood="cool"] {
+        border-color: rgba(96, 148, 216, 0.8);
+        color: #1b3d6e;
+      }
+      #bubble[data-mood="angry"] {
+        border-color: rgba(236, 94, 94, 0.85);
+        color: #a11d1d;
+      }
+      #bubble[data-mood="shy"] {
+        border-color: rgba(240, 160, 190, 0.8);
+        color: #a2436d;
+      }
+      #bubble[data-mood="surprise"] {
+        border-color: rgba(247, 176, 74, 0.85);
+        color: #8a4b00;
+      }
+
+      /* ---------------- 情绪符号（头顶大表情） ---------------- */
+      #emote {
+        position: absolute;
+        left: 50%;
+        top: 2px;
+        transform: translate(-50%, 8px) scale(0.4);
+        font-size: 30px;
+        line-height: 1;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.14s ease, transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+        filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.25));
+      }
+      #emote.show {
+        opacity: 1;
+        transform: translate(-50%, 0) scale(1);
+      }
+
+      /* ---------------- 飘出的爱心/冰晶/火气 ---------------- */
+      /* 透明窗里不能有底色，所以只用纯 emoji + 透明度动画，不铺任何块。 */
+      #fx {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        overflow: hidden;
+      }
+      #fx .p {
+        position: absolute;
+        font-size: 16px;
+        line-height: 1;
+        will-change: transform, opacity;
+        animation: fx-float 900ms ease-out forwards;
+      }
+      @keyframes fx-float {
+        0% {
+          transform: translate(-50%, 0) scale(0.6) rotate(0deg);
+          opacity: 0;
+        }
+        20% {
+          opacity: 1;
+        }
+        100% {
+          transform: translate(calc(-50% + var(--dx, 0px)), var(--dy, -60px)) scale(1.15)
+            rotate(var(--rot, 0deg));
+          opacity: 0;
+        }
+      }
+      /* ---------------- 部位悬停提示 ---------------- */
+      /* 鼠标压在耳朵/头/脸/身/尾/脚上时，在该处显示一个小小的部位名，
+         让人一眼知道「这里可点、点的是哪里」。透明窗里不铺大色块。 */
+      #hint {
+        position: absolute;
+        left: 50%;
+        bottom: 16px;
+        transform: translate(-50%, 4px) scale(0.9);
+        padding: 2px 8px;
+        border-radius: 9px;
+        font: 600 11px/1.4 "Microsoft YaHei", system-ui, sans-serif;
+        color: #1b3d6e;
+        background: rgba(255, 255, 255, 0.92);
+        border: 1px solid rgba(31, 95, 208, 0.45);
+        opacity: 0;
+        transition: opacity 0.12s ease, transform 0.14s ease;
+        pointer-events: none;
+        white-space: nowrap;
+      }
+      #hint.show {
+        opacity: 1;
+        transform: translate(-50%, 0) scale(1);
+      }
+      #hint[data-part="tail"] {
+        border-color: rgba(150, 110, 255, 0.75);
+        color: #4b2a9c;
+      }
+      #hint[data-part="ear"] {
+        border-color: rgba(255, 92, 170, 0.75);
+        color: #9c2050;
+      }
+      #hint[data-part="feet"] {
+        border-color: rgba(90, 210, 150, 0.75);
+        color: #146a48;
+      }
+    </style>
+
+  </head>
+  <body>
+    <div id="stage">
+      <div id="ring"><span class="dot"></span></div>
+      <img id="pet" alt="" />
+    </div>
+    <div id="emote"></div>
+    <div id="fx"></div>
+    <div id="bubble"></div>
+    <div id="hint"></div>
+    <script type="module" src="pet.js"></script>
+  </body>
+</html>

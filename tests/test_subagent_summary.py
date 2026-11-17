@@ -253,3 +253,33 @@ def test_interjection_handled_while_subagents_running(session_factory) -> None:
     sub_done = [e for e in events
                 if e.type == "task_done" and (e.payload_json or {}).get("role") == "sub"]
     assert len(sub_done) == 2, sub_done
+
+
+@pytest.mark.slow
+def test_subagent_times_out_and_reports_back(session_factory) -> None:
+    """子agent 卡住不能把整批拖死。
+
+    2026-11-15 用户实测：一个子agent 卡在一次长调用里，界面就一直停在
+    「还有 N 个子agent 在后台跑」，点停止也没用。现在看门狗有挂钟死线：
+    到点掐掉这一条子agent，并把它作为「超时未完成」的结论回给主agent。
+    """
+    from unittest.mock import patch
+    import game_agent.orchestration.orchestrator as orch_mod
+
+    main_brain = _MainBrain()
+    with patch.object(orch_mod, "SUBAGENT_TIMEOUT_S", 1):
+        run, tasks, events = _run(
+            _run_with_brains(session_factory, "并行核对两个文件", main_brain, sub_delay=120),
+            timeout=RUN_TIMEOUT_S)
+
+    # 1) 整轮没被子agent 拖死
+    assert run.status == "succeeded", f"{run.status} {run.error}"
+    # 2) 子agent 任务落成 failed + 超时原因（前端看得到，不是一直 running）
+    sub_tasks = [t for t in tasks if t.agent_key == "sub"]
+    assert len(sub_tasks) == 2
+    for t in sub_tasks:
+        assert t.status == "failed", t.status
+        assert "超时" in str((t.result_json or {}).get("error") or ""), t.result_json
+    # 3) 主agent 收到了「超时未完成」的结论（可以自己接手，而不是继续干等）
+    last = "\n\n".join(str(m.get("content")) for m in main_brain.messages_seen[-1])
+    assert "超时停止" in last, last[-800:]

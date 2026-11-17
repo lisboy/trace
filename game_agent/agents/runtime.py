@@ -143,18 +143,60 @@ def _call_signature(name: str, args: Any) -> str:
         return name
 
 
+# 截断省略标记：带上「中间省略了多少字」，否则用户会以为这是模型说的话或报错
+# （现场：截图里红框圈住「…[中略]…」问「这个是啥意思」）。
+_ELIDED_TMPL = "\n…[中略 {n} 字]…\n"
+# 切点吸附窗口：在这个字数内找换行/句末标点，避免按字符硬切把词句切半截
+# （用户看到「…传」直接接「+ reviewOpinionFiled…」，像断了半句）。
+_SNAP_WINDOW = 80
+_BOUNDARY_CHARS = "\n。！？；.!?;"
+_BOUNDARY_PREFERRED = "\n"
+
+
+def _snap_head_end(text: str, end: int, window: int = _SNAP_WINDOW) -> int:
+    """头部切点向左吸附到最近的换行/句末标点之后（含该字符），不越过原切点。"""
+    stop = max(0, end - window)
+    for ch_first in (_BOUNDARY_PREFERRED, _BOUNDARY_CHARS):
+        for i in range(end - 1, stop - 1, -1):
+            if text[i] in ch_first:
+                return i + 1
+    return end
+
+
+def _snap_tail_start(text: str, start: int, window: int = _SNAP_WINDOW) -> int:
+    """尾部起点向右吸附到最近的换行/句末标点之后，避免从半句话中间起头。
+
+    只往后挪（不往前提），因此截断结果不会变长、预算仍然守得住。
+    """
+    stop = min(len(text), start + window)
+    for ch_first in (_BOUNDARY_PREFERRED, _BOUNDARY_CHARS):
+        for i in range(start, stop):
+            if text[i] in ch_first:
+                return i + 1
+    return start
+
+
 def _tail_keep_head(text: str, limit: int, head: int = 80) -> str:
     """超长文本尾部优先截断：保留开头一小段作锚点 + 末尾主体。
 
     模型/工具的关键结论（根因、行号、下一步）多在中后部；旧逻辑 [:limit] 取头
-    把最值钱的部分丢了。这里统一为「前 head 字 + …[中略]… + 尾部主体」，
+    把最值钱的部分丢了。这里统一为「前 head 字 + …[中略 N 字]… + 尾部主体」，
     供思考落库、工具结果展示、续跑摘要复用。
+
+    两个细节（2026-11-17 用户反馈）：
+    · 切点吸附到换行/句末标点，不再按字符硬切出「…传」这种半句；
+    · 标记里写明中间省略了多少字，用户能一眼看出是截断而不是模型原话。
     """
     if len(text) <= limit:
         return text
     keep = max(limit - head, 0)
-    tail = text[-keep:]
-    return (text[:head] + "\n…[中略]…\n" + tail).strip()
+    if keep <= 0:                      # 上限比头部锚点还小：只能纯取尾部，否则会一个正文字都不剩
+        return text[-limit:]
+    cut_head = _snap_head_end(text, min(head, limit, len(text)))
+    start = _snap_tail_start(text, max(len(text) - keep, 0))
+    tail = text[start:]
+    omitted = max(len(text) - cut_head - len(tail), 0)
+    return (text[:cut_head].rstrip() + _ELIDED_TMPL.format(n=omitted) + tail.lstrip()).strip()
 
 
 def _tail_with_sources(text: str) -> str:
@@ -214,7 +256,7 @@ EXPLORE_BRAKE_STEP = 30        # 之后每再这么多调用警告一次
 EXPLORE_BRAKE_MAX = 2          # 警告次数上限，超过直接中止本轮
 EXPLORE_HARD_STOP = 90         # 累计只读调用达到这个数还没改过产品代码 → 强制收尾
 
-# D 收敛守卫（创建/生成类任务，走 _is_fix_task 之外的分支）：按「连续几次往返只在读」计。
+# D 收敛守卫（创建/生成类任务）：按「连续几次往返只在读」计。
 # 只提醒、不掐停——任务没有次数上限，掐停只有用户点停止/写锁失效/死循环三种。
 CONVERGE_NUDGE_AT = 7          # 连着这么多次往返零落地，先要一句结论 + 一张清单
 CONVERGE_NUDGE_STEP = 7        # 之后再每这么多往返催一次（第二次起要它直接落笔）
@@ -901,11 +943,17 @@ class AgentRuntime:
                     messages.append(_steer_message(note))
                 got_steer = True
                 if wake_on_steer:
+                    self._woke_by_steer = True
                     return True
             pending = self._pending_spawns()
             if not pending:
+                self._woke_by_steer = got_steer
                 return got_steer
-            left = sum(len(b.tasks) for b in pending)
+            # 只数「还没收工」的子agent。以前是 sum(len(b.tasks)) = 批次总任务数，
+            # 所以 4 个里 3 个已经跑完、只剩 1 个还在跑时，界面仍报「还有 4 个在后台跑」
+            # （2026-11-15 用户实测截图）。
+            tasks = [t_ for b in pending for t_ in b.tasks if not t_.done()]
+            left = len(tasks)
             waited = int(time.monotonic() - started)
             if waited - last_beat >= 9:
                 last_beat = waited
@@ -914,8 +962,12 @@ class AgentRuntime:
                     "note": f"还有 {left} 个子agent 在后台跑，等它们回收（已等待 {waited} 秒）…",
                     "waiting": True, "waited": waited, "agent_key": self.role},
                     ephemeral=True)
-            tasks = [t_ for b in pending for t_ in b.tasks if not t_.done()]
             if not tasks:
+                # 批次既没 ready 又没有未完成任务（任务句柄被外部取消/批次异常）：
+                # 绝不能裸 continue——不 await 就把这个 while 变成 100% CPU 空转
+                # （历史 bug：界面一直挂「还有 0 个子agent」，CPU 还高）。让出一下事件循环，
+                # 下一圈 _pending_spawns() 会把已收工的批次交出去回收。
+                await asyncio.sleep(0.2)
                 continue
             await asyncio.wait(tasks, timeout=1.5,
                                return_when=asyncio.FIRST_COMPLETED)
@@ -1076,12 +1128,20 @@ class AgentRuntime:
         return f"{merged}\n\n{self._prompt_body}" if self._prompt_body else merged
 
     async def _open_plan_items(self) -> list[dict]:
-        """待办清单里没打勾的项（用于"活没做完就交卷"的打回判定）。"""
+        """待办清单里没打勾的项（用于"活没做完就交卷"的打回判定）。
+
+        纯汇报项（「向用户汇报结论」）不算未完成：它没有任何可执行的工作，模型做完
+        前面的活就直接 report_to_user 了，永远不会回来给这一项打勾。把它算进未完成，
+        就会让模型在收尾时被反复打回「还有 1 项没做完」，最后交回一份为了凑勾而写
+        的东西。判定见 ``plan.is_report_only_item``。
+        """
         try:
+            from game_agent.agents.tools.plan import is_report_only_item
             run = await self.tctx.run_ctx.repo.get_run(self.tctx.run_ctx.run_id)
             items = list(getattr(run, "plan_json", None) or [])
             return [dict(i or {}) for i in items
-                    if str((i or {}).get("status")) != "completed"]
+                    if str((i or {}).get("status")) != "completed"
+                    and not is_report_only_item(i)]
         except Exception:  # noqa: BLE001 - 读计划失败不影响主流程
             log.exception("read plan_json failed")
             return []
@@ -1386,6 +1446,10 @@ class AgentRuntime:
             # 推理强度覆盖先清空：摘要压缩（_compact 内部）与收尾调用都按默认档位，
             # 只有下面真正的主对话轮次才按「长 run 后段」策略降档。
             self.ctx.reasoning_effort_override = ""
+            # 上一轮「等子agent」是被用户插话叫醒的吗？是 → 本轮正文是对插话的回应，
+            # 可以落进聊天流；否 → 只是模型抢跑下结论，不该落成结论（见下面「不能交卷」分支）。
+            steered_this_round = bool(getattr(self, "_woke_by_steer", False))
+            self._woke_by_steer = False
             await self._assert_fencing()
             await self._check_cancel()
             # 运行中切换模型：用户在执行中改了模型选择 → 下一轮 LLM 调用换新档位。
@@ -1400,7 +1464,10 @@ class AgentRuntime:
                 # 让模型下一步就能汇总/继续——不阻塞主agent 处理插话和其他工作。
                 await self._harvest_spawns(messages)
                 # 用户插话：不取消当前执行，只是把这句话并入这一轮的上下文（模型接着做，不重来）
-                for note in steering.drain(str(self.tctx.run_ctx.run_id)):
+                _steer_notes = steering.drain(str(self.tctx.run_ctx.run_id))
+                if _steer_notes:
+                    steered_this_round = True
+                for note in _steer_notes:
                     imgs = list(note.get("images") or [])
                     self._emit("status", {"status": "running", "note":
                                           (f"收到你的插话（含图 {len(imgs)} 张），已并入当前执行"
@@ -1439,13 +1506,26 @@ class AgentRuntime:
             if resp.text:
                 self._emit("agent_message", {"agent_key": self.role, "text": resp.text})
             if not resp.tool_calls:
-                # 还有后台子agent 没回收：这不是「交卷」，是「等结果」。先把这段正文作为
-                # 临时回复落进聊天流（用户插话后尤其需要立刻看到主agent 的回应），再等
-                # 批次回收；等待期间插话到达会立刻唤醒，继续跑一轮正常处理。
+                # 还有后台子agent 没回收：这不是「交卷」，是「等结果」。两种情形必须分开：
+                #   · 这一轮是在回应用户插话 → 正文照旧落成临时回复，用户要立刻看到回应；
+                #   · 只是模型抢跑下结论 → **不落成结论**，只落一条中性的等待提示，并把
+                #     「还不能交卷」明确写回上下文。
+                # 为什么（2026-11-15 用户实测）：以前不管哪种都把正文落成临时回复，于是
+                # 父agent 先给一份结论、子agent 回来后又出一份修正，用户看到的是反复改口。
                 if self.role == "main" and self._pending_spawns():
-                    if (resp.text or "").strip():
+                    text = (resp.text or "").strip()
+                    left = sum(b.pending() for b in self._pending_spawns())
+                    if text:
                         messages.append({"role": "assistant", "content": resp.text})
+                    if text and steered_this_round:
                         await self._post_interim_reply(resp.text)
+                    else:
+                        messages.append({"role": "user", "content": (
+                            f"（系统提示）还不能交卷：还有 {left} 个子agent 在后台跑。"
+                            "它们的结论回来后系统会再给你一轮，请在那一轮再写最终结论；"
+                            "这一轮不要输出给用户的总结报告，也不要凭猜测填空。")})
+                        await self._post_interim_reply(
+                            f"还有 {left} 个子agent 在后台核对，结论回来我一并汇总。")
                     await self._wait_spawns(messages, wake_on_steer=True)
                     continue
                 # 空回复、或正文里仍残留没解析成功的调用协议（工具名不在白名单/参数畸形）：

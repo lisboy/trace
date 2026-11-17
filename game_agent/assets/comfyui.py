@@ -828,6 +828,108 @@ def _style_ref_workflow() -> dict:
     }
 
 
+def _qwen_edit_workflow(edit_model: bool = False) -> dict:
+    """双图换脸工作流（底图 latent + 两张参考图条件）。
+
+    edit_model=True：用 TextEncodeQwenImageEditPlus（image1=底图，image2=脸源），
+      需要真正的 **Qwen-Image-Edit** 权重，这才是「指令编辑/换脸」的原生链路。
+    edit_model=False：退回本项目已验证的 TextEncodeQwenImage21 多图 COMFY_AUTOGROW 通道
+      （风格参考就是靠它），两张参考图都会作为 VAE latent 拼进编码序列。
+
+    实测限制（2026-11，本机 qwen_image_2.1_int8 是**文生图**权重）：非 edit_model 档
+    重绘度从 0.55 提到 0.85，脸部区域确实有变化（像素差 2.28→6.51/255），但人物身份
+    仍然是底图那个——文生图权重没有身份迁移能力。要让脸真的换成第二张图，必须放一份
+    Qwen-Image-Edit 权重进 models/diffusion_models（函数会自动切到 edit_model 档）。
+    """
+    if edit_model:
+        return {
+            "3": {"class_type": "KSampler", "inputs": {
+                "seed": 0, "steps": 20, "cfg": 2.5,
+                "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0,
+                "model": ["10", 0], "positive": ["21", 0], "negative": ["24", 0],
+                "latent_image": ["15", 0]}},
+            "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "", "weight_dtype": "default"}},
+            "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["12", 0]}},
+            "9": {"class_type": "SaveImage", "inputs": {
+                "filename_prefix": "game_agent", "images": ["8", 0]}},
+            "10": {"class_type": "ModelSamplingAuraFlow", "inputs": {"shift": 3.1, "model": ["4", 0]}},
+            "11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "", "type": "qwen_image"}},
+            "12": {"class_type": "VAELoader", "inputs": {"vae_name": ""}},
+            "20": {"class_type": "LoadImage", "inputs": {"image": ""}},
+            "22": {"class_type": "LoadImage", "inputs": {"image": ""}},
+            "23": _target_size_node(["20", 0]),
+            "15": {"class_type": "VAEEncode", "inputs": {"pixels": ["23", 0], "vae": ["12", 0]}},
+            "21": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {
+                "clip": ["11", 0], "prompt": "", "vae": ["12", 0],
+                "image1": ["20", 0], "image2": ["22", 0]}},
+            "24": {"class_type": "CLIPTextEncode", "inputs": {"text": "", "clip": ["11", 0]}},
+        }
+    return {
+        "3": {"class_type": "KSampler", "inputs": {
+            "seed": 0, "steps": 20, "cfg": 2.5,
+            "sampler_name": "euler", "scheduler": "simple", "denoise": 0.55,
+            "model": ["10", 0], "positive": ["21", 0], "negative": ["21", 1],
+            "latent_image": ["15", 0]}},
+        "4": {"class_type": "UNETLoader", "inputs": {"unet_name": "", "weight_dtype": "default"}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["12", 0]}},
+        "9": {"class_type": "SaveImage", "inputs": {
+            "filename_prefix": "game_agent", "images": ["8", 0]}},
+        "10": {"class_type": "ModelSamplingAuraFlow", "inputs": {"shift": 3.1, "model": ["4", 0]}},
+        "11": {"class_type": "CLIPLoader", "inputs": {"clip_name": "", "type": "qwen_image"}},
+        "12": {"class_type": "VAELoader", "inputs": {"vae_name": ""}},
+        # 20=底图（画面主体/构图来源），22=脸源。节点号刻意让底图在前，
+        # 填图时按节点号升序取用，不依赖模板字典插入顺序。
+        "20": {"class_type": "LoadImage", "inputs": {"image": ""}},
+        "22": {"class_type": "LoadImage", "inputs": {"image": ""}},
+        "23": _target_size_node(["20", 0]),
+        "15": {"class_type": "VAEEncode", "inputs": {"pixels": ["23", 0], "vae": ["12", 0]}},
+        "21": {"class_type": "TextEncodeQwenImage21", "inputs": {
+            "clip": ["11", 0], "prompt": "", "negative_prompt": "",
+            "resolution": 1024,
+            # image_1 = 底图，image_2 = 人脸来源；顺序与提示词里的「参考图1 / 参考图2」对应
+            "images.image_1": ["20", 0], "images.image_2": ["22", 0],
+            "vae": ["12", 0]}},
+    }
+
+
+# 换脸指令提示词：明确两张参考图各自的作用，避免模型各画一半或只画一张。
+FACE_SWAP_EDIT_PROMPT = (
+    "参考图1 是原图，参考图2 提供人物面部。把参考图1 里人物的脸完整替换为参考图2 的脸："
+    "脸型、五官、眼睛、眉毛、鼻子、嘴型与发型都改成参考图2 的样子；"
+    "参考图1 的姿势、动作、服装、背景、画风与镜头完全保持不变。")
+
+
+async def _has_qwen_edit_model(client: httpx.AsyncClient | None, base: str) -> bool:
+    """探测 models/diffusion_models 里有没有 Qwen-Image-Edit 权重（换脸的原生链路）。
+
+    只有 Edit 版权重才真正会执行「按指令改这张图」；文生图版权重上即使给了 image1/image2，
+    也只会得到一张与底图几乎一致的图（实测见 _qwen_edit_workflow 注释）。
+    client 传 None 时自己开一条短连接（模板选择阶段还没有共享客户端）。
+    """
+    try:
+        if client is None:
+            async with httpx.AsyncClient(timeout=10, trust_env=False) as _c:
+                names = await _fetch_names(_c, base, "UNETLoader", "unet_name")
+        else:
+            names = await _fetch_names(client, base, "UNETLoader", "unet_name")
+    except Exception:  # noqa: BLE001 - 探测失败按"没有"处理，走可用的多图链路
+        return False
+    for n in names:
+        low = str(n).lower()
+        if "qwen" in low and "edit" in low:
+            return True
+    return False
+
+
+async def _pick_qwen_edit_name(client: httpx.AsyncClient, base: str) -> str:
+    names = await _fetch_names(client, base, "UNETLoader", "unet_name")
+    for n in names:
+        low = str(n).lower()
+        if "qwen" in low and "edit" in low:
+            return str(n)
+    return ""
+
+
 # 风格参考模式：参考图只用来「借鉴」画风/质感/配色，人物与构图按用户描述全新生成。
 # 注意：这里**绝不能**写死某个具体风格（如以前写死的「厚涂质感」）——那会把照片参考也
 # 强行拉成油画/厚涂（2026-11-10 用户反馈：选了写实参考图、不挂 LoRA，出来的却是油画风格）。
@@ -1415,6 +1517,7 @@ async def _generate_images_bytes_once(prompt: str, *, negative_prompt: str = "",
                                       reference: bytes | None = None,
                                       reference_mode: str = "style",
                                       reference_denoise: float = IMG2IMG_DENOISE,
+                                      reference2: bytes | None = None,
                                       workflow_mode: str = "auto",
                                       model: str = "", batch: int = 1,
                                       lora: str | None = None,
@@ -1435,26 +1538,43 @@ async def _generate_images_bytes_once(prompt: str, *, negative_prompt: str = "",
     workflow_mode = (workflow_mode or "auto").lower()
     if workflow_mode not in ("auto", "checkpoint", "diffusion"):
         workflow_mode = "auto"
+    _has_edit = False
     try:
+        # 双图换脸：第 1 张=底图/主体，第 2 张=人脸来源。只有 Qwen 三件套（DiT）模板有
+        # image2 通道，checkpoint / 自定义工作流 JSON 没有 → 明确报错，绝不静默丢掉第 2 张图
+        # （丢掉会出一张"脸没换"的图，用户以为是换脸失败）。
+        _no_two_img = ("双图换脸需要 Qwen 三件套工作流（生成方式选「Diffusion Models」或「自动探测」），"
+                       "当前生成方式不支持同时使用两张参考图")
         if COMFYUI_WORKFLOW_PATH:
+            if reference2:
+                raise ComfyUIError(_no_two_img + "（当前用的是自定义工作流 JSON）")
             wf = json.loads(Path(COMFYUI_WORKFLOW_PATH).read_text(encoding="utf-8"))
         elif workflow_mode == "checkpoint":
+            if reference2:
+                raise ComfyUIError(_no_two_img + "（当前是 Checkpoints 经典 SD 方式）")
             wf = _img2img_workflow() if reference else _default_workflow()
-        elif workflow_mode == "diffusion":
-            if reference and reference_mode == "style":
-                wf = _style_ref_workflow()
-                if STYLE_PROMPT_PREFIX not in prompt and "参考图" not in prompt:
-                    prompt = STYLE_PROMPT_PREFIX + prompt
-            else:
-                wf = _dit_img2img_workflow() if reference else _dit_workflow()
+        elif reference2:
+            # auto / diffusion 都走这里。有 Qwen-Image-Edit 权重就走原生指令编辑链路
+            # （真能换脸），否则退回多图条件近似（能保住底图/服装/构图，身份迁移能力弱）。
+            # 探测要发 HTTP，此时客户端还没建，传 None 让它自己开一个短连接。
+            _has_edit = await _has_qwen_edit_model(None, base)
+            wf = _qwen_edit_workflow(edit_model=_has_edit)
+            prompt = (FACE_SWAP_EDIT_PROMPT + "额外要求：" + prompt) if prompt else FACE_SWAP_EDIT_PROMPT
+            if not _has_edit:
+                log.warning("双图换脸：没找到 Qwen-Image-Edit 权重，改用多图条件近似"
+                            "（底图/服装/构图能保住，但脸未必真换成第 2 张）")
         elif reference and reference_mode == "style":
             wf = _style_ref_workflow()
             if STYLE_PROMPT_PREFIX not in prompt and "参考图" not in prompt:
                 prompt = STYLE_PROMPT_PREFIX + prompt
+        elif workflow_mode == "diffusion":
+            wf = _dit_img2img_workflow() if reference else _dit_workflow()
         elif reference:
             wf = _img2img_workflow()
         else:
             wf = _default_workflow()
+    except ComfyUIError:
+        raise
     except Exception as e:  # noqa: BLE001
         raise ComfyUIError(f"加载工作流模板失败：{e}") from e
 
@@ -1469,7 +1589,13 @@ async def _generate_images_bytes_once(prompt: str, *, negative_prompt: str = "",
             mode = await _resolve_models(client, base, wf)
             if (not COMFYUI_WORKFLOW_PATH and workflow_mode == "auto" and mode == "no_ckpt"):
                 # 无 checkpoint → 切 Anima/Qwen 架构 DiT 三件套工作流重新探测
-                wf = _dit_img2img_workflow() if reference else _dit_workflow()
+                # 双图换脸要保留换脸模板（普通 DiT 文生图模板没有 image2 通道，
+                # 换回它会静默丢掉人脸来源，生成一张"脸没换"的图）
+                if reference and reference2:
+                    _has_edit = await _has_qwen_edit_model(client, base)
+                    wf = _qwen_edit_workflow(edit_model=_has_edit)
+                else:
+                    wf = _dit_img2img_workflow() if reference else _dit_workflow()
                 mode = await _resolve_models(client, base, wf)
             if mode == "no_ckpt":
                 # 显式选了 checkpoint 模式但一个 checkpoint 都没有：直接给可读报错，
@@ -1479,16 +1605,36 @@ async def _generate_images_bytes_once(prompt: str, *, negative_prompt: str = "",
                     "models/checkpoints 目录下没有找到任何模型。请放入 .safetensors，"
                     "或把生成方式改成「自动探测 / Diffusion Models（DiT 三件套）」。")
             _apply_model_override(wf, model)
+            if reference and reference2 and _has_edit:
+                # 编辑模型名由探测决定（用户没手动指定 UNET 时）
+                edit_name = await _pick_qwen_edit_name(client, base)
+                if edit_name and not model:
+                    for n in wf.values():
+                        if n.get("class_type") == "UNETLoader":
+                            n.setdefault("inputs", {})["unet_name"] = edit_name
             if reference:
                 ref_name = await _upload_image(client, base, reference)
+                ref2_name = await _upload_image(client, base, reference2) if reference2 else ""
                 img2img = reference_mode != "style"
-                for n in wf.values():
-                    ct = n.get("class_type")
-                    inputs = n.setdefault("inputs", {})
-                    if ct == "LoadImage" and inputs.get("image") in ("", None):
-                        inputs["image"] = ref_name
-                    elif img2img and ct in ("KSampler", "KSamplerAdvanced"):
-                        inputs["denoise"] = reference_denoise
+                # 双图换脸：底图（节点号小的那个 LoadImage）优先，第二张填脸源。
+                # 用节点号排序而不是字典序，避免模板插入顺序变化后两张图错位。
+                empty_loads = sorted(
+                    (nid for nid, n in wf.items()
+                     if n.get("class_type") == "LoadImage"
+                     and (n.get("inputs") or {}).get("image") in ("", None)),
+                    key=lambda k: int(k) if str(k).isdigit() else 10**9)
+                names = [ref_name, ref2_name] if ref2_name else [ref_name]
+                for nid, nm in zip(empty_loads, names):
+                    wf[nid].setdefault("inputs", {})["image"] = nm
+                if img2img or ref2_name:
+                    # 换脸链路同样受重绘度控制：latent 是底图，denoise 决定"改多少"。
+                    # 实测：0.3~0.35 连脸都不变（出图≈底图）；0.55 只有眼睛/嘴微动；
+                    # 0.85 表情/眼睛明显变化、但身份仍是底图那个（文生图权重的上限）。
+                    # Edit 版权重走指令编辑，denoise 固定 1.0（整图重新生成），不套重绘度。
+                    for nid, n in wf.items():
+                        if n.get("class_type") in ("KSampler", "KSamplerAdvanced"):
+                            n.setdefault("inputs", {})["denoise"] = (
+                                1.0 if ref2_name and _has_edit else reference_denoise)
             if mode == "dit" and (not reference or reference_mode == "style") \
                     and min(width, height) < 768:
                 # 风格参考现在也走空 latent 采样，尺寸规则和文生图一致
@@ -1968,22 +2114,6 @@ def _extract_frames_to_dir(mp4_path: str, out_dir: str) -> list[str]:
     subprocess.run([_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", mp4_path,
                     os.path.join(out_dir, "%04d.png")], check=True, timeout=600)
     return [os.path.join(out_dir, f) for f in sorted(os.listdir(out_dir)) if f.endswith(".png")]
-
-
-def _last_frame_png_bytes(mp4_path: str) -> bytes:
-    """取 mp4 最后一帧的 PNG 字节（作为下一段的首帧 start_image）。"""
-    import os
-    import tempfile
-    tmp = tempfile.mkdtemp(prefix="ga_lastf_")
-    try:
-        frames = _extract_frames_to_dir(mp4_path, tmp)
-        if not frames:
-            raise ComfyUIError("无法从上一段视频提取最后一帧（接龙中断）")
-        with open(frames[-1], "rb") as fh:
-            return fh.read()
-    finally:
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def _normalize_seg_len(seconds: float, fps: int) -> int:

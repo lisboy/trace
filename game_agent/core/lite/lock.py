@@ -1,7 +1,6 @@
 """lite LockManager：进程内 asyncio.Lock 串行化 + 单调递增 fencing token + 落库记账。
 
 设计 §6.3：fencing token 每次转移 +1；所有写操作前校验当前 token；worker 失联后 token 已变则立即自杀。
-server 模式换成 Redis SET NX PX + DB 记账（同样返回 fencing token）。
 """
 from __future__ import annotations
 

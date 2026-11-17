@@ -82,8 +82,10 @@ export const api = {
   /** 该会话自己的 run 列表（新→旧）：不受「项目最近 50 条」窗口限制，
    *  老会话也能认出上一次执行是成功/失败，避免聊天页看起来一片空白 */
   sessionRuns: (sessionId: string) => request(`/sessions/${sessionId}/runs`),
-  /** 会话级用量：总 token / 缓存命中率 / 生成速度 */
+  /** 会话级用量：总 token / 缓存命中率 / 生成速度（**只算主对话**，不含子agent） */
   sessionUsage: (sessionId: string) => request(`/sessions/${sessionId}/usage`),
+  /** 本会话跑过的所有子agent 明细（运行面板「子agent」标签用；与主对话分开统计） */
+  sessionSubagents: (sessionId: string) => request(`/sessions/${sessionId}/subagents`),
   /** 上下文统计：请求构成占比、逐轮占用趋势、工具调用分布（runId 为空=整个会话） */
   contextStats: (sessionId: string, runId?: string | null) =>
     request(`/sessions/${sessionId}/context-stats${runId ? `?run_id=${runId}` : ""}`),
@@ -132,8 +134,9 @@ export const api = {
   }),
 
   // ---- events / artifacts ----
-  events: (runId: string, since: number) =>
-    request(`/runs/${runId}/events?since=${since}`),
+  /** run 的事件流。taskId 非空时只回这个子agent 自己的事件（弹窗看对话详情用） */
+  events: (runId: string, since: number, taskId?: string | null) =>
+    request(`/runs/${runId}/events?since=${since}${taskId ? `&task_id=${taskId}` : ""}`),
   /** 计划机制：读取本轮待办清单（组长 update_plan 写入） */
   plan: (runId: string) => request(`/runs/${runId}/plan`),
   /** 提问机制：会话内的问题（待回答 + 已回答记录） */
@@ -228,6 +231,41 @@ export const api = {
     }),
   artifactFile: (artifactId: string, v?: string | number) =>
     `${BASE}/artifacts/${artifactId}/file?rv=2${v ? `&v=${v}` : ""}`,
+  /** 素材原图另存到本机：带鉴权头 fetch → blob → 触发浏览器另存，
+   *  文件名沿用素材路径的最后一段（直接用 <a download> 拿到的是接口地址和空名字，扩展名也不对）。 */
+  downloadArtifact: async (a: { id: string; rel_path?: string; size?: number | null }): Promise<void> => {
+    const teamId = useAuth.getState().currentTeamId;
+    const headers: Record<string, string> = {};
+    if (teamId) headers["X-Team-Id"] = teamId;
+    const res = await fetch(
+      `${BASE}/artifacts/${a.id}/file?rv=2${a.size ? `&v=${a.size}` : ""}`, { headers });
+    if (!res.ok) throw new ApiError(`下载失败 ${res.status}`, res.status);
+    const name = (a.rel_path || "").split("/").pop() || a.id;
+    const objUrl = URL.createObjectURL(await res.blob());
+    const el = document.createElement("a");
+    el.href = objUrl;
+    el.download = name;
+    document.body.appendChild(el);
+    el.click();
+    el.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objUrl), 2000);
+  },
+  /** 素材原图转 dataURL（复制到剪贴板用：剪贴板不认相对路径，网页里又要能直接渲染出图） */
+  artifactDataUrl: async (a: { id: string; size?: number | null }): Promise<string> => {
+    const teamId = useAuth.getState().currentTeamId;
+    const headers: Record<string, string> = {};
+    if (teamId) headers["X-Team-Id"] = teamId;
+    const res = await fetch(
+      `${BASE}/artifacts/${a.id}/file?rv=2${a.size ? `&v=${a.size}` : ""}`, { headers });
+    if (!res.ok) throw new ApiError(`${res.status}`, res.status);
+    const blob = await res.blob();
+    return new Promise<string>((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(String(r.result || ""));
+      r.onerror = () => reject(new Error("读取图片失败"));
+      r.readAsDataURL(blob);
+    });
+  },
   /** 素材缩略图（长边 w）：列表/网格/消息附图都用它，点开大图才加载 artifactFile 原图。
    *  v 参数=内容版本（如重画后的 mtime），变了就破缓存。 */
   artifactThumb: (artifactId: string, w = 320, v?: string | number) =>
@@ -474,6 +512,11 @@ export const api = {
   doctorLlm: () => request("/doctor/llm"),
   /** 本机 CPU / 内存 / GPU 瞬时状态（服务端 4s 缓存，前端 5s 一轮就够新） */
   systemMetrics: () => request("/system/metrics"),
+
+  // ---- 桌宠（桌面上的小白狐，由后端拉起独立 Electron 进程） ----
+  petStatus: () => request("/pet/status"),
+  petStart: () => request("/pet/start", { method: "POST" }),
+  petStop: () => request("/pet/stop", { method: "POST" }),
 
   // ---- 技能系统（渐进式披露：清单只带名称+描述，正文按需加载） ----
   skills: (projectId?: string) =>

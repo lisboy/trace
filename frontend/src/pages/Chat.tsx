@@ -226,14 +226,20 @@ function fileKindLabel(kind?: string): string {
 
 /** 系统自动续跑那条「续跑说明」：整段是给组长的指令，几百上千字，
  *  照原样贴在气泡里会把对话冲成一堵墙（用户以为自己发了篇长文）。
- *  收起成一行说明，展开才看原文。 */
-function AutoContinueNote({ text, count }: { text: string; count: number }) {
+ *  收起成一行说明，展开才看原文。
+ *  surveyOnly：上一轮只勘察没落地、**根本没立清单**。这种续跑不能再写「清单还有
+ *  若干项」——清单不存在，用户按这句话去翻会找不到（实测 2026-11-13 续跑那轮
+ *  整轮都在找「磁盘上没有痕迹的那 1 项」）。 */
+function AutoContinueNote({ text, count, surveyOnly }:
+  { text: string; count: number; surveyOnly?: boolean }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="ga-auto-continue mx-auto max-w-2xl rounded-lg border border-amber-200 px-3 py-2">
       <div className="flex items-center justify-between gap-2">
         <span className="text-[12.5px] text-amber-800">
-          ⏩ 系统自动续跑：上一轮清单还有 {count || "若干"} 项没做完，已排队接着做
+          {surveyOnly
+            ? "⏩ 系统自动续跑：上一轮只勘察没落地，已排队接着做"
+            : `⏩ 系统自动续跑：上一轮清单还有 ${count || "若干"} 项没做完，已排队接着做`}
         </span>
         <button
           className="shrink-0 text-[11.5px] text-amber-700 underline underline-offset-2 hover:text-amber-900"
@@ -319,6 +325,7 @@ function MessageItem({
         <AutoContinueNote
           text={m.meta?.brief || m.content}
           count={Number(m.meta?.open_count) || 0}
+          surveyOnly={Boolean(m.meta?.survey_only)}
         />
       </div>
     );
@@ -427,15 +434,27 @@ function MessageItem({
           className={m.author_type === "user" ? "md-invert" : ""}
         />
       </div>
-      {/* 用户气泡：文字 + 附图一并复制（容器是 text-right，按钮自然贴右） */}
+      {/* 用户气泡：文字 + 附图一并复制（容器是 text-right，按钮自然贴右）。
+          带图时多给一个「复制图片」：很多聊天框只要剪贴板里有文字就只收文字、图直接丢掉，
+          想真正把图带过去，剪贴板里得只有图（多图会合成一张，一次粘完）。 */}
       {m.author_type === "user" &&
         (!!m.content?.trim() || msgImageSrcs(m).length > 0) && (
-        <div className="mt-1 flex justify-end">
+        <div className="mt-1 flex justify-end items-center gap-2">
           <CopyButton
             get={() => msgCopyPayload(m)}
             title="复制这条消息（含附图）"
             className="text-[11px] text-slate-400 hover:text-brand-600"
           />
+          {msgImageSrcs(m).length > 0 && (
+            <CopyButton
+              get={async () => ({ images: await msgImages(m) })}
+              label="复制图片"
+              title={`只复制附图到剪贴板（${msgImageSrcs(m).length} 张${
+                msgImageSrcs(m).length > 1 ? "，合并成一张" : ""
+              }）：粘到只收文字、不收图的应用里也能带上图`}
+              className="text-[11px] text-slate-400 hover:text-brand-600"
+            />
+          )}
         </div>
       )}
       {/* 对话消息的底部操作条：只保留复制（原「🔊 朗读」及情绪设置已按需求移除） */}
@@ -447,6 +466,16 @@ function MessageItem({
             title="复制这条回复（含附图）"
             className="text-[11px] text-slate-400 hover:text-brand-600"
           />
+          {msgImageSrcs(m).length > 0 && (
+            <CopyButton
+              get={async () => ({ images: await msgImages(m) })}
+              label="复制图片"
+              title={`只复制附图到剪贴板（${msgImageSrcs(m).length} 张${
+                msgImageSrcs(m).length > 1 ? "，合并成一张" : ""
+              }）：粘到只收文字、不收图的应用里也能带上图`}
+              className="text-[11px] text-slate-400 hover:text-brand-600"
+            />
+          )}
         </div>
       )}
       {/* 本次改动了几个文件：放在整条消息（含轨迹）的最末尾——
@@ -651,7 +680,6 @@ export default function Chat({ route }: { route: Route }) {
   const [showJump, setShowJump] = useState(false);
   // 会话用量条刷新信号（run 结束/新任务开始时 +1，触发 SessionUsage 重新拉聚合值）
   const [usageKey, setUsageKey] = useState(0);
-  // 顶栏读数区的「让位等级」：0=全显示 1=收起本机余量 2=用量条只留 token/上下文 3=只留右侧操作按钮。
   // 顶栏读数区的「让位等级」：0=全显示 1=用量条收起速度/缓存命中 2=再收起本机余量
   // 3=再收起整条用量条 4=只留右侧操作按钮。
   // 右上角面板可拖宽（最窄时中栏只剩 ~820px），读数三条加起来放不下会把「复制会话/导出记录」
@@ -2115,7 +2143,8 @@ export default function Chat({ route }: { route: Route }) {
              {/* 本机余量：跑批/配音/压上下文时先看它还顶不顶得住，不用翻系统日志 */}
              {readLevel < 2 && <SystemMetrics />}
              {session && session.id !== "__new__" && readLevel < 4 && (
-               <SessionUsage sessionId={session.id} refreshKey={usageKey} compact={readLevel >= 1} />
+               <SessionUsage sessionId={session.id} refreshKey={usageKey}
+                  compact={readLevel >= 1} running={!!(runningRunId || session.running)} />
              )}
            </div>
           {session && session.id !== "__new__" && (

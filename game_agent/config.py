@@ -58,6 +58,9 @@ def _float(key: str, default: float) -> float:
 
 # ---------- 模式 ----------
 MODE: str = _str("GA_MODE", "lite").lower()
+# 注意：server 只保留了分支判断（如 can_reveal / list_dirs 的目录限制），
+# 存储与队列**没有** server 实现——本版本只有 SQLite + core/lite 进程内实现，
+# 设 GA_MODE=server 不会变成分布式部署。
 assert MODE in ("lite", "server"), f"GA_MODE 非法: {MODE}"
 
 # ---------- 数据目录 / 路径 ----------
@@ -181,9 +184,8 @@ OPENAI_API_KEY = _str("OPENAI_API_KEY")
 OPENAI_BASE_URL = _str("OPENAI_BASE_URL", "https://api.openai.com/v1")
 LLM_MODEL = _str("GA_LLM_MODEL", "gpt-4o-mini")
 # 调用失败重试（429/5xx/超时/网络错误）：指数退避，遵循 Retry-After
-LLM_MAX_ATTEMPTS = 5                             # 单次对话请求的最大尝试次数（含首次），达标即放弃
-# 额外重试次数（总尝试 = 1 + N），默认 4 → 共 5 次；环境变量调大也会被 LLM_MAX_ATTEMPTS 夹住
-LLM_RETRIES = max(0, min(_int("GA_LLM_RETRIES", LLM_MAX_ATTEMPTS - 1), LLM_MAX_ATTEMPTS - 1))
+# 尝试次数固定为 5（含首次），不支持用环境变量调整：GA_LLM_RETRIES 曾是死配置，已删除。
+LLM_MAX_ATTEMPTS = 5
 LLM_CALL_TIMEOUT_S = _int("GA_LLM_CALL_TIMEOUT_S", 360)  # 单次 LLM 调用硬上限（防网关挂起卡死 run）
 LLM_RETRY_BASE_S = float(_str("GA_LLM_RETRY_BASE_S", "1.5") or 1.5)
 # 建连超时（只等 TCP+TLS 握手，不覆盖模型出字时间）：默认 8s。
@@ -414,16 +416,18 @@ TTS_REF_AUDIO = _str("TTS_REF_AUDIO")
 TTS_EMO_MODE = _str("TTS_EMO_MODE", "0")
 TTS_EMO_TEXT = _str("TTS_EMO_TEXT")
 TTS_EMO_WEIGHT = float(_str("TTS_EMO_WEIGHT", "0.65") or 0.65)
-# 八维情感权重（高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静），逗号分隔；配置即用 mode=2
+# 八维情感权重（高兴,愤怒,悲伤,害怕,厌恶,忧郁,惊讶,平静），逗号分隔；
+# 仅在调用方没有显式指定情绪时的兜底（会落到 mode=2）
 TTS_EMO_VECTOR = _str("TTS_EMO_VECTOR")
-# 情感参考音频文件路径（一段带目标情绪的干声；配置即用 mode=1）
+# 情感参考音频文件路径（一段带目标情绪的干声；仅在未显式指定情绪时兜底，落到 mode=1）
 TTS_EMO_AUDIO = _str("TTS_EMO_AUDIO")
-# 语速 0.5~2.0（>1 慢 <1 快；IndexTTS-2.5 的 duration_factor，2.0 服务自动忽略）
+# 语速 0.5~2.0（>1 慢 <1 快；IndexTTS-2.5 的 duration_factor，服务端只做 0.5~2.0 钳制）
 TTS_SPEED = float(_str("TTS_SPEED", "1.0") or 1.0)
 # 语言 auto/zh/en/ja/es/ar（auto=服务端按台词判定；IndexTTS-2.5 才生效）
 TTS_LANG = _str("TTS_LANG", "auto")
 # 单次合成等待上限：8G 单卡串行，首次含 30~60 秒模型加载，别设太小
-TTS_TIMEOUT_S = _int("TTS_TIMEOUT_S", 600)# 是否在界面暴露「音色设计」（文字描述造音色，需 IndexTTS2 侧装好 VoxCPM2）
+TTS_TIMEOUT_S = _int("TTS_TIMEOUT_S", 600)
+# 是否在界面暴露「音色设计」（文字描述造音色，需 IndexTTS2 侧装好 VoxCPM2）
 TTS_VOICE_DESIGN = _str("GA_TTS_VOICE_DESIGN", "true").lower() not in ("false", "0", "no")
 # 语音服务未运行时自动拉起（合成/音色设计前检查，未就绪则等待）
 TTS_AUTOSTART = _str("GA_TTS_AUTOSTART", "true").lower() not in ("false", "0", "no")
@@ -450,6 +454,11 @@ PORT = _int("GA_PORT", 18888)
 # 打开后本进程不写 pid 文件、不做启动僵尸清理、不起 worker 池（只提供 API + 静态页），
 # 避免把主实例正在执行的 run 误标成「服务重启中断」，也避免两个进程抢同一个队列。
 DEBUG_INSTANCE = _bool("GA_DEBUG_INSTANCE", False)
+# 逃生开关：明知这套数据目录已有实例在跑，还是强行再起一个。
+# 默认（False）时启动守卫会拦下并退出——因为第二个实例会跑「僵尸 run 清理」，把第一个
+# 实例里正在跑的 run 全标成「服务重启，本次执行被中断」（2026-11-17 用户实测的
+# 「老是重启、我的活被中断」）。放行的实例同样不做僵尸清理，见 core/instance_lock.py。
+ALLOW_MULTI_INSTANCE = _bool("GA_ALLOW_MULTI_INSTANCE", False)
 
 # ---------- 运行约束（设计 §6 / §7）----------
 # 一次任务跑多久、调多少次工具都没有上限。这条只是「判死线」：某个 run 连续这么久
@@ -492,10 +501,13 @@ AUTO_CONTINUE_MAX = _int("GA_AUTO_CONTINUE_MAX", 2)
 # 能跑几分钟，界面上一直挂「执行中…」，用户只能看着卡住。构建/测试需要 300s，扫描不需要：
 # 扫这么久通常说明扫的范围不对，早点掐断 + 引导去用会剪枝的内置 grep/glob/list_dir 更划算。
 SEARCH_TIMEOUT_S = max(10, min(_int("GA_SEARCH_TIMEOUT_S", 60), TOOL_TIMEOUT_S))
-CMD_IDLE_TIMEOUT_S = _int("GA_CMD_IDLE_TIMEOUT_S", 120)
-MAX_TEST_ROUNDS = _int("GA_MAX_TEST_ROUNDS", 3)      # 测试回环上限
-EVENT_MAXLEN = _int("GA_EVENT_MAXLEN", 5000)
-BRANCH_TTL_DAYS = _int("GA_BRANCH_TTL_DAYS", 30)
+# 单个子agent 的挂钟上限（秒）：spawn_agents 派出的子agent 超过这个时间还没交结论，
+# 取消看门狗直接掐掉它，并把「超时未完成」如实回给主agent。为什么必须有：子agent 卡在
+# 一次长工具调用/长思考里时没有任何上限，整批永远收不回来，界面就一直停在
+# 「还有 N 个子agent 在后台跑」（2026-11-15 用户实测）。只掐这一条子任务，不连带整轮。
+# 0 = 不限。
+SUBAGENT_TIMEOUT_S = _int("GA_SUBAGENT_TIMEOUT_S", 600)
+
 
 # 写工具受限目录（设计 §7.3.1）
 PROTECTED_PREFIXES = (".venv", "venv", "__pycache__", ".git", ".trace/events")

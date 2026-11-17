@@ -474,7 +474,7 @@ function ProvidersTab({ providers, refresh }: { providers: Provider[]; refresh: 
         </div>
         {spec && (
           <div className="mt-2 text-[11px] text-slate-400">
-            配置字段：{(spec.config_schema?.properties && Object.keys(spec.config_schema.properties).join(", ")) || "无"}
+            配置字段：{(spec.fields?.map((f: any) => f.name).join(", ")) || "无"}
           </div>
         )}
         <textarea className="w-full h-20 border rounded p-2 text-xs mono mt-2" value={conf} onChange={(e) => setConf(e.target.value)} />

@@ -1,5 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "../api";
 import { useAuth } from "../store";
 import { navigate, type Route } from "../router";
@@ -8,6 +7,7 @@ import ImageGenPanel from "../components/ImageGenPanel";
 import VoiceGenPanel from "../components/VoiceGenPanel";
 import VideoGenPanel from "../components/VideoGenPanel";
 import SearchSelect from "../components/SearchSelect";
+import { copyToClipboard } from "../clipboard";
 
 type Source = {
   id: string;
@@ -41,14 +41,15 @@ const isVideoKind = (k: string) => k === "video";
 const srcLabelOf = (a: Artifact) =>
   a.provider === "import" ? "导入" : a.provider?.startsWith("external:") ? "外置" : null;
 
-/** 单个素材卡片。抽成独立组件：网格虚拟滚动时只挂视口内的卡片，
- *  一屏上百张也不会有上百个 <img>/<audio> 同时进 DOM 解码。 */
+    /** 单个素材卡片。抽成独立组件，与网格分页解耦，便于列表整块重排。 */
 const AssetCard = function AssetCard({
   a,
   onRegen,
   onRerecord,
   onRevideo,
   onDelete,
+  onCopy,
+  onDownload,
   deleting,
 }: {
   a: Artifact;
@@ -56,11 +57,16 @@ const AssetCard = function AssetCard({
   onRerecord: (a: Artifact) => void;
   onRevideo: (a: Artifact) => void;
   onDelete: (a: Artifact) => void;
+  onCopy: (a: Artifact) => Promise<boolean>;
+  onDownload: (a: Artifact) => Promise<void>;
   deleting: boolean;
 }) {
   const isImg = isImageKind(a.asset_kind);
   const isVideo = isVideoKind(a.asset_kind);
   const srcLabel = srcLabelOf(a);
+  // 卡片内的临时反馈：复制/下载都是异步（要拉原图字节），没有「进行中/已复制」就像点了没反应
+  const [copyState, setCopyState] = useState<"" | "ok" | "fail" | "busy">("");
+  const [downloading, setDownloading] = useState(false);
   return (
     <div className="bg-white rounded border border-slate-200 p-3">
       {isVideo ? (
@@ -106,7 +112,7 @@ const AssetCard = function AssetCard({
         {srcLabel && (
           <span className="px-1 rounded bg-sky-100 text-sky-700 text-[11px]">{srcLabel}</span>
         )}
-        <div className="ml-auto flex gap-1.5">
+        <div className="ml-auto flex flex-wrap gap-1.5 justify-end">
           <a
             className="text-xs px-2 py-1 rounded border border-slate-200 hover:bg-slate-50"
             href={api.artifactFile(a.id, a.size ?? undefined)}
@@ -115,6 +121,41 @@ const AssetCard = function AssetCard({
           >
             查看
           </a>
+          {/* 复制只对图片有意义（剪贴板不认音频/视频字节），音频/视频给下载 */}
+          {isImg && (
+            <button
+              className="text-xs px-2 py-1 rounded border border-slate-200 hover:bg-slate-50 disabled:opacity-50"
+              disabled={copyState === "busy"}
+              title="把这张图复制到剪贴板，可直接粘进聊天/文档/画布"
+              onClick={async () => {
+                setCopyState("busy");
+                let ok = false;
+                try {
+                  ok = await onCopy(a);
+                } finally {
+                  setCopyState(ok ? "ok" : "fail");
+                  window.setTimeout(() => setCopyState(""), 1400);
+                }
+              }}
+            >
+              {copyState === "ok" ? "已复制" : copyState === "fail" ? "复制失败" : copyState === "busy" ? "复制中…" : "复制"}
+            </button>
+          )}
+          <button
+            className="text-xs px-2 py-1 rounded border border-slate-200 hover:bg-slate-50 disabled:opacity-50"
+            disabled={downloading}
+            title="下载原文件到本机"
+            onClick={async () => {
+              setDownloading(true);
+              try {
+                await onDownload(a);
+              } finally {
+                setDownloading(false);
+              }
+            }}
+          >
+            {downloading ? "下载中…" : "下载"}
+          </button>
           {isVideo ? (
             <button
               className="text-xs px-2 py-1 rounded border border-slate-200 hover:bg-slate-50"
@@ -317,6 +358,34 @@ export default function Assets({ route }: { route?: Route }) {
     }
   }
 
+  async function downloadOne(a: Artifact) {
+    try {
+      await api.downloadArtifact(a);
+      setMsg(`已开始下载「${a.slug}」。`);
+    } catch (e: any) {
+      setMsg("下载失败：" + (e?.message || e));
+    }
+  }
+
+  // 复制图片到剪贴板：剪贴板只认位图/PNG，得先把原图取成 dataURL 再让 clipboard.ts 转一道。
+  // 顺带带上 slug 文本，粘到文档里能看见是哪张素材。
+  async function copyOne(a: Artifact): Promise<boolean> {
+    try {
+      const dataUrl = await api.artifactDataUrl(a);
+      const res = await copyToClipboard({ text: a.slug, images: [dataUrl] });
+      const ok = res === "full";
+      setMsg(ok
+        ? `已复制「${a.slug}」到剪贴板。`
+        : res === "text"
+          ? `已复制「${a.slug}」的文字，图片没能写进剪贴板。`
+          : "复制失败：浏览器拒绝了剪贴板写入。");
+      return ok || res === "text";
+    } catch (e: any) {
+      setMsg("复制失败：" + (e?.message || e));
+      return false;
+    }
+  }
+
   async function deleteOne(a: Artifact) {
     if (!confirm(`确定删除「${a.slug}」？\n将从素材库移除，并删除工作区里的文件，不可恢复。`)) return;
     setDeletingId(a.id);
@@ -381,29 +450,31 @@ export default function Assets({ route }: { route?: Route }) {
   // 分页后服务端已经按类型/会话/占位过滤，这里直接用，不再二次筛（否则只会筛当前页）
   const shown = items;
 
-  // 素材网格虚拟滚动：一屏上百张时不再把全部卡片塞进 DOM。
-  // 用「行」做虚拟单位（列数随容器宽度变化），只在视口 ±2 行内挂真实卡片。
+  // 素材网格：整列直接渲染，不做虚拟滚动。
+  // 素材是分页追加的（每页 60 条，滚到底再续下一页），DOM 规模本来就不大；
+  // 之前那版虚拟滚动要拿「网格上方的工具栏/AI 面板高度」当 scrollMargin，
+  // 一旦估算行高和卡片真实高度对不上，行就会整段错位、滑过首屏后整片空白
+  //（用户看到的「往下滑素材就消失」），已去掉。gridRef 只用作滚动容器。
   const gridRef = useRef<HTMLDivElement>(null);
-  const [cols, setCols] = useState(2);
-  useEffect(() => {
-    const el = gridRef.current;
-    if (!el) return;
-    const calc = () => {
-      const w = el.clientWidth;
-      setCols(w >= 1024 ? 4 : w >= 640 ? 3 : 2); // 对齐 sm:3 / lg:4
+  // 网格起点：各生成面板比网格还高（AI 生图展开后大预览能顶到 900px 以上），
+  // 展开后网格会被整个推到视口下方，屏幕上只剩一片空白、看着像「素材没了」。
+  // 面板展开/收起后把网格起始处滚进视口，素材立刻回到视野。
+  const gridAnchorRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const scroller = gridRef.current;
+    const anchor = gridAnchorRef.current;
+    if (!scroller || !anchor) return;
+    const reveal = () => {
+      const gridTop =
+        anchor.getBoundingClientRect().top -
+        scroller.getBoundingClientRect().top +
+        scroller.scrollTop;
+      if (scroller.scrollTop > gridTop) {
+        scroller.scrollTop = Math.max(0, gridTop - 8);
+      }
     };
-    calc();
-    const ro = new ResizeObserver(calc);
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [projectId]);
-  const rowCount = Math.ceil(shown.length / cols);
-  const gridVirt = useVirtualizer({
-    count: rowCount,
-    getScrollElement: () => gridRef.current,
-    estimateSize: () => 260,
-    overscan: 2,
-  });
+    reveal();
+  }, [showGen, showVoice, showVideo, showSrc, projectId]);
 
   function onRerecord(a: Artifact) {
     setShowVoice(true);
@@ -543,34 +614,21 @@ export default function Assets({ route }: { route?: Route }) {
         </div>
       )}
 
-      <div
-        style={{ height: gridVirt.getTotalSize(), width: "100%", position: "relative" }}
-      >
-        {gridVirt.getVirtualItems().map((vi) => {
-          const start = vi.index * cols;
-          const rowItems = shown.slice(start, start + cols);
-          return (
-            <div
-              key={vi.key}
-              data-index={vi.index}
-              ref={gridVirt.measureElement}
-              className="absolute left-0 top-0 w-full grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3"
-              style={{ transform: `translateY(${vi.start}px)` }}
-            >
-              {rowItems.map((a) => (
-                <AssetCard
-                  key={a.id}
-                  a={a}
-                  onRegen={regen}
-                  onRerecord={onRerecord}
-                  onRevideo={onRevideo}
-                  onDelete={deleteOne}
-                  deleting={deletingId === a.id}
-                />
-              ))}
-            </div>
-          );
-        })}
+      {/* 网格：普通 grid 布局，卡片按顺序排满，不依赖虚拟行定位 */}
+      <div ref={gridAnchorRef} className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+        {shown.map((a) => (
+          <AssetCard
+            key={a.id}
+            a={a}
+            onRegen={regen}
+            onRerecord={onRerecord}
+            onRevideo={onRevideo}
+            onDelete={deleteOne}
+            onCopy={copyOne}
+            onDownload={downloadOne}
+            deleting={deletingId === a.id}
+          />
+        ))}
       </div>
       {projectId && shown.length > 0 && (
         <div className="flex justify-center py-3">

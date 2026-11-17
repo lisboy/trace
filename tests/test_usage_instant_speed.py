@@ -100,6 +100,63 @@ def test_speed_is_last_round_not_session_average(api) -> None:
     assert body["last_round"]["completion_tokens"] != 5_000
 
 
+def test_subagent_stats_are_separated_from_main(api) -> None:
+    """子agent 与主对话分开算（2026-11-16 用户要求「子和主分开，这里只统计主的」）。
+
+    同一 run 里 agent_key='sub' 的那些往返**完全不计入** /usage 的任何总量，
+    只出现在 /sessions/{id}/subagents 的清单里（运行面板的「子agent」标签）。
+    """
+    import asyncio as _asyncio
+
+    async def seed_sub():
+        async with api.session_factory() as db:
+            from game_agent.db.models import Run as _Run
+            from game_agent.db.models import Task as _Task
+            run = (await db.execute(
+                __import__("sqlalchemy").select(_Run).where(
+                    _Run.session_id == __import__("game_agent.api.deps",
+                                                 fromlist=["_u"])._u(api.ids["session_id"]))
+            )).scalars().first()
+            t1 = datetime(2026, 11, 12, 2, 0, tzinfo=timezone.utc)
+            # 子agent 的往返比主对话更晚，且 prompt 只有 800 tok（窗口的 0.3%）
+            db.add(LlmCall(team_id=run.team_id, run_id=run.id, call_id="sub-1",
+                           agent_key="sub", model="fast", prompt_tokens=800,
+                           completion_tokens=200, cached_tokens=0, cache_reported=0,
+                           latency_ms=4_000, purpose="agent", created_at=t1))
+            db.add(_Task(run_id=run.id, kind="sub", agent_key="sub", status="done",
+                         title="子agent · 核对口径",
+                         result_json={"question": "子agent 的数算进总量吗？"},
+                         created_at=t1, started_at=t1,
+                         finished_at=t1 + timedelta(seconds=4)))
+            await db.commit()
+
+    _asyncio.run(seed_sub())
+    body = _get(api, f"/api/sessions/{api.ids['session_id']}/usage").json()
+    # 主对话口径完全不受子agent 影响：仍是 5 次（摘要那次也算调用）/ 输入 5000
+    assert body["calls"] == 5
+    assert body["prompt_tokens"] == 5_000
+    assert "subagent_usage" not in body
+    assert body["subagents"] == {"count": 1, "running": 0}
+    assert body["context"]["agent_key"] == "main"
+    assert body["context"]["last_prompt_tokens"] == 1_000
+    assert body["last_round"]["agent_key"] == "main"
+    assert body["tokens_per_sec"] == 60.0
+
+    # 子agent 自己那一份在单独接口里看
+    sub = _get(api, f"/api/sessions/{api.ids['session_id']}/subagents")
+    assert sub.status_code == 200, sub.text
+    sb = sub.json()
+    assert sb["totals"]["count"] == 1
+    assert sb["totals"]["total_tokens"] == 1_000
+    item = sb["items"][0]
+    assert item["name"] == "核对口径"
+    assert item["question"] == "子agent 的数算进总量吗？"
+    assert item["status"] == "done"
+    assert item["elapsed_ms"] == 4_000
+    # llm_calls 没有 task_id，token 只能按 run 聚合：接口如实给 run 级合计
+    assert item["run_usage"]["total_tokens"] == 1_000
+
+
 def test_usage_of_other_team_session_is_404(api) -> None:
     """没有角色之分了，但 team 维度的隔离仍在：别的团队的会话照样看不见。"""
 

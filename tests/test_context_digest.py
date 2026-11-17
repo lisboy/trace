@@ -14,8 +14,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from game_agent.llm import context_window as cw
 from game_agent.llm.context_window import DIGEST_MARK, compress_messages
 
